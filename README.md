@@ -66,7 +66,8 @@ make validate  # clean, format, lint, test, cross
 ## Configuration
 
 - **`build.zig.zon` fields**, which Zig ignores and zigbuildx reads:
-  - `.clone`: where `Deps` clones a missing `.path` dependency from.
+  - `.clone`: where `Deps` clones a missing `.path` dependency from; a
+    sibling's own `.path` dependencies are cloned from its manifest's `.clone`.
   - `.sha`, `.tag`, `.branch`: pin a dependency to its own worktree under
     `deps/`; `.checkout` names the shared checkout (default `../<name>`).
   - `.bundle`: the bundle id in reverse DNS, three labels

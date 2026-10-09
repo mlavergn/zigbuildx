@@ -13,7 +13,7 @@ the workarounds behind them, are below.
   Zig outside 0.17 (it does not check the patch). Several extensions work
   around Zig 0.17.0 defects; see *Workarounds*. Version 1.x was the Zig 0.16
   release; 2.0.0 dropped 0.16; 3.0.0 made `Xcode` and `Android` take the
-  build graph at `init`.
+  build graph at `init`; 3.2.0 made `Deps` clone a sibling's own siblings.
 - **The public surface is `build.zig`.** Consumers import this package's
   `build.zig` by dependency name, so only what it re-exports (`Deps`, `Git`,
   `Xcode`, `Swift`, `Android`, `AndroidAbi`, `Apk`, `Docs`, `Pkg`) is
@@ -128,12 +128,23 @@ Beyond ZIGSTYLE:
 - **`Deps.cloneMissing`:** clones every root `.path` dependency that has a
   `.clone` and is absent, then exits 1 for a re-run; it compiles away when
   nothing is missing.
+  - **Siblings of siblings:** an unpinned `.path` outside `deps/` declared by
+    a sibling (`../tui` naming `../vaxis`) is cloned from the `.clone` in that
+    sibling's manifest, and its manifest is followed in turn (each path once,
+    so a cycle ends). Zig opens every `.path` package before the sibling's
+    own `build()` could clone it, and `Deps` runs for the root only. A
+    sibling's pinned dependencies belong to its own `deps/` and are skipped.
+  - **Detection:** `missingSibling` scans the runner's whole package table for
+    a `.path` package (keyed by its path, which equals its `build_root`; a
+    fetched one is keyed by hash) outside `deps/` with no `build_zig`, so the
+    call still compiles away in the steady state.
 - **`Deps.sync`:** the successor, and it must come first in `build()`.
   - **Pins:** `.sha` and `.tag` give a detached worktree; `.branch` gives the
     branch `<consumer>/<branch>`, created at `origin/<branch>`. `<consumer>`
     is the root's `.name`. More than one pin, or a pin on a `.path` outside
     `deps/`, is an error. An unpinned `.path` is used as is, wherever it
-    points, cloned from `.clone` when absent (root only).
+    points, cloned from `.clone` when absent: under `deps/` by the root only,
+    outside it by any sibling, as `cloneMissing` does.
   - **Create and move:** a missing worktree is created from its checkout,
     which is cloned if absent and fetched (`--tags --force`) if it lacks the
     revision. A changed pin moves a clean worktree; one with uncommitted
