@@ -69,8 +69,9 @@ make validate  # clean, format, lint, test, cross
   - `.clone`: where `Deps` clones a missing `.path` dependency from.
   - `.sha`, `.tag`, `.branch`: pin a dependency to its own worktree under
     `deps/`; `.checkout` names the shared checkout (default `../<name>`).
-  - `.org`: the organisation in reverse DNS (`com.example`), required by
-    `zig build pkg`.
+  - `.bundle`: the bundle id in reverse DNS, three labels
+    (`com.example.tool`), required by `zig build pkg`. It is the package id,
+    and its second and last labels name the install directory.
 - **`signing.zon`**, in the project root, holds the Apple signing identity and
   notarization credentials as `.apple_id`, `.apple_password`, `.apple_name`
   and `.apple_team`. It must be listed in `.gitignore`; `Pkg` refuses it
@@ -162,7 +163,10 @@ zig build pkg-notarize -Doptimize=fast                # macOS: notarize and stap
 ```
 
 Packages install to `/usr/local/<org>/<name>` (per user under
-`%LOCALAPPDATA%\<org>\<name>` on Windows) and put its `bin` on `PATH`.
+`%LOCALAPPDATA%\<org>\<name>` on Windows) and put its `bin` on `PATH`, where
+`.bundle = "com.<org>.<name>"`; `com.example.tool` installs to
+`/usr/local/example/tool`. Each program keeps its executable's name; the
+project's `.name` plays no part.
 Without `wixl`, a Windows package stops after writing its WiX source and
 programs to `zig-out/pkg/<name>-<version>-wix/`, with the command to finish it.
 
