@@ -37,11 +37,11 @@ const Escaped = struct {
 /// key path.
 pub const Msi = struct {
     const Self = @This();
-    /// The product name: the package's `.name`.
+    /// The product name: the last label of `.bundle`.
     name: []const u8,
-    /// The organisation directory and Manufacturer: the last label of `.org`.
+    /// The organisation directory and Manufacturer: the second label of `.bundle`.
     org: []const u8,
-    /// The package id, `<org>.<name>` in reverse DNS; seeds every GUID.
+    /// The package id, `.bundle` itself in reverse DNS; seeds every GUID.
     id: []const u8,
     /// The package version, `major.minor.patch` with optional suffixes.
     version: []const u8,

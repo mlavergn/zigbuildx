@@ -200,7 +200,12 @@ Beyond ZIGSTYLE:
   site and flips the two `include_private` call sites in `main.js`; each
   pattern must occur once, so a changed front end fails the build.
 - **`Pkg`:**
-  - **Identity:** id `<org>.<name>`; paths use the last label of `.org`.
+  - **Identity:** `.bundle` is the bundle id and the package id as written, and
+    must be three labels, `<domain>.<org>.<name>`; paths and the package's file
+    name use its second and last labels. The project's `.name` is not read, and
+    each program keeps its executable's name. Three exactly, because
+    `uninstall.sh` removes `/usr/local/<org>/<name>`: `com.example` alone would
+    make that the whole organisation's directory.
   - **Scripts:** macOS `preinstall`, `postinstall`, `uninstall.sh` and Linux
     `preinst`, `postrm`, `profile.sh`, embedded and filled with `{pkg_name}`,
     `{pkg_id}`, `{pkg_org}`; `PkgOptions.scripts` overrides them by name.
@@ -210,7 +215,7 @@ Beyond ZIGSTYLE:
   - **Steps:** `Pkg.add` declares; `PkgRun` (the host tool's `pkg`
     command) stages and builds the macOS and Linux packages beside the Run
     step's output, from `--key=value` options and the programs after `--`,
-    and deletes the stage. A problem (`.org` missing, mixed targets) becomes
+    and deletes the stage. A problem (`.bundle` missing, mixed targets) becomes
     a `Fail` step behind `zig build pkg`. `pkg-notarize` notarizes a copy of
     the package and installs it over the plain one.
   - **macOS:** `Pkgbuild` signs each executable with `Developer ID

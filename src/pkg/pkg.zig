@@ -50,6 +50,14 @@ pub const Signing = struct {
     }
 };
 
+/// The labels of a bundle id that a package's paths use.
+pub const PkgLabels = struct {
+    /// The organisation: the bundle id's second label, e.g. `example`.
+    org: []const u8,
+    /// The package: the bundle id's last label, e.g. `tool`.
+    name: []const u8,
+};
+
 /// What to package.
 pub const PkgOptions = struct {
     const Self = @This();
@@ -82,10 +90,10 @@ pub const PkgRun = struct {
 
     allocator: std.mem.Allocator,
     io: std.Io,
-    /// The package's `.name`.
+    /// The package's name: the last label of `.bundle`.
     name: []const u8 = "",
-    /// The package's `.org`, in reverse DNS.
-    org: []const u8 = "",
+    /// The package's `.bundle`: its bundle id, in reverse DNS.
+    bundle: []const u8 = "",
     /// The package's `.version`.
     version: []const u8 = "",
     /// One line describing the package.
@@ -126,7 +134,7 @@ pub const PkgRun = struct {
             const eq = std.mem.findScalar(u8, arg, '=') orelse return error.InvalidArguments;
             const key = arg[0..eq];
             const value = arg[eq + 1 ..];
-            inline for (.{ "name", "org", "version", "summary", "arch", "root" }) |field| {
+            inline for (.{ "name", "bundle", "version", "summary", "arch", "root" }) |field| {
                 if (std.mem.eql(u8, key, "--" ++ field)) {
                     @field(self, field) = value;
                     break;
@@ -223,24 +231,25 @@ pub const PkgRun = struct {
         return self.fail("{s} failed [{any}]:\n{s}", .{ argv[0], result.term, std.mem.trim(u8, output, " \t\r\n") });
     }
 
-    /// Returns the package id: `<org>.<name>`.
+    /// Returns the package id: `.bundle`, the bundle id.
     ///
     /// Parameters:
     /// - `self`: the run.
     ///
     /// Return: the id.
     pub fn id(self: *const Self) []const u8 {
-        return self.allocator.print("{s}.{s}", .{ self.org, self.name }) catch @panic("OOM");
+        return self.bundle;
     }
 
-    /// Returns the organisation's label for paths: the last label of `.org`.
+    /// Returns the organisation's label for paths: the second label of `.bundle`.
     ///
     /// Parameters:
     /// - `self`: the run.
     ///
-    /// Return: e.g. `example` for `com.example`.
+    /// Return: e.g. `example` for `com.example.tool`; `.bundle` itself when it is not three labels.
     pub fn orgLabel(self: *const Self) []const u8 {
-        return Pkg.label(self.org);
+        const labels = Pkg.labels(self.bundle) orelse return self.bundle;
+        return labels.org;
     }
 
     /// Logs why the package cannot be built.
@@ -336,12 +345,14 @@ pub const PkgRun = struct {
 /// `.deb` for Linux, an `.msi` for Windows, all installed to `zig-out/pkg/`.
 /// Each installs the programs in a `bin` directory under
 /// `/usr/local/<org>/<name>` (`%LOCALAPPDATA%\<org>\<name>` on Windows) and
-/// puts it on `PATH`.
+/// puts it on `PATH`; each program keeps its own executable's name.
 ///
-/// The project's `build.zig.zon` supplies `.name`, `.version` and `.org`, a
-/// reverse-DNS organisation such as `"com.example"`. The package id is
-/// `<org>.<name>`; paths use only the last label of `.org`. Without `.org`,
-/// `zig build pkg` fails; nothing else in the build is affected.
+/// The project's `build.zig.zon` supplies `.version` and `.bundle`, the bundle
+/// id in reverse DNS: three labels, such as `"com.example.tool"`. It is the
+/// package id as written, and its second and last labels are the `<org>` and
+/// `<name>` of every path, so `com.example.tool` installs to
+/// `/usr/local/example/tool`. The project's own `.name` is not used. Without
+/// a valid `.bundle`, `zig build pkg` fails; nothing else in the build is affected.
 ///
 /// The install scripts are templates embedded in zigbuildx, filled in with the
 /// package's name, id and organisation; `PkgOptions.scripts` can replace them.
@@ -354,10 +365,10 @@ pub const Pkg = struct {
 
     /// The step that installs the package into `zig-out/pkg/`, or fails with `problem`.
     step: *std.Build.Step,
-    /// The package's `.name`.
+    /// The package's name: the last label of `.bundle`.
     name: []const u8,
-    /// The package's `.org`, in reverse DNS.
-    org: []const u8,
+    /// The package's `.bundle`: its bundle id, in reverse DNS.
+    bundle: []const u8,
     /// The package's `.version`.
     version: []const u8,
     /// One line describing the package, from `.description` or the name.
@@ -372,7 +383,7 @@ pub const Pkg = struct {
 
     /// Declares `zig build pkg`, and `zig build pkg-notarize` for a macOS target.
     ///
-    /// A missing `.org` or another problem does not fail the build graph: it
+    /// A missing `.bundle` or another problem does not fail the build graph: it
     /// fails `zig build pkg` with a message, so every other step still works.
     ///
     /// Parameters:
@@ -383,11 +394,12 @@ pub const Pkg = struct {
     /// Return: the package, whose `step` builds and installs it.
     pub fn add(b: *std.Build, comptime zon: anytype, options: PkgOptions) *Self {
         const self = b.allocator.create(Self) catch @panic("OOM");
+        const bundle: []const u8 = if (@hasField(@TypeOf(zon), "bundle")) zon.bundle else "";
         self.* = .{
             // SAFETY: set below, once check() has chosen the steps.
             .step = undefined,
-            .name = @tagName(zon.name),
-            .org = if (@hasField(@TypeOf(zon), "org")) zon.org else "",
+            .name = if (Self.labels(bundle)) |split| split.name else @tagName(zon.name),
+            .bundle = bundle,
             .version = zon.version,
             .description = if (@hasField(@TypeOf(zon), "description")) zon.description else @tagName(zon.name),
             .executables = b.allocator.dupe(*std.Build.Step.Compile, options.executables) catch @panic("OOM"),
@@ -449,15 +461,20 @@ pub const Pkg = struct {
         return error.InvalidArguments;
     }
 
-    /// Returns the organisation's label for paths: the last label of `org`.
+    /// Returns the labels of a bundle id that paths use: its second and last.
     ///
     /// Parameters:
-    /// - `org`: an organisation in reverse DNS.
+    /// - `bundle`: a bundle id in reverse DNS.
     ///
-    /// Return: e.g. `example` for `com.example`.
-    pub fn label(org: []const u8) []const u8 {
-        const dot = std.mem.findScalarLast(u8, org, '.') orelse return org;
-        return org[dot + 1 ..];
+    /// Return: e.g. `example` and `tool` for `com.example.tool`; `null` unless
+    /// it is exactly three non-empty labels.
+    pub fn labels(bundle: []const u8) ?PkgLabels {
+        var parts = std.mem.splitScalar(u8, bundle, '.');
+        const domain = parts.next() orelse return null;
+        const org = parts.next() orelse return null;
+        const name = parts.next() orelse return null;
+        if (parts.next() != null or domain.len == 0 or org.len == 0 or name.len == 0) return null;
+        return .{ .org = org, .name = name };
     }
 
     /// Declares the host tool run that builds the macOS or Linux package, and its install.
@@ -526,7 +543,7 @@ pub const Pkg = struct {
             _ = stage.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{file}));
             files.append(b.allocator, file) catch @panic("OOM");
         }
-        const msi = mod.Msi{ .name = self.name, .org = Self.label(self.org), .id = b.fmt("{s}.{s}", .{ self.org, self.name }), .version = self.version, .files = files.items };
+        const msi = mod.Msi{ .name = self.name, .org = Self.labels(self.bundle).?.org, .id = self.bundle, .version = self.version, .files = files.items };
         const xml = msi.render(b.allocator) catch |err| switch (err) {
             error.InvalidVersion => return &b.addFail(b.fmt(".version = \"{s}\" is not one an MSI can carry: major.minor.patch, at most 255.255.65535", .{self.version})).step,
             error.OutOfMemory, error.WriteFailed => @panic("OOM"),
@@ -561,7 +578,7 @@ pub const Pkg = struct {
     fn addOptions(self: *Self, b: *std.Build, run: *std.Build.Step.Run) void {
         run.addArgs(&.{
             b.fmt("--name={s}", .{self.name}),
-            b.fmt("--org={s}", .{self.org}),
+            b.fmt("--bundle={s}", .{self.bundle}),
             b.fmt("--version={s}", .{self.version}),
             b.fmt("--summary={s}", .{self.summary()}),
         });
@@ -577,9 +594,9 @@ pub const Pkg = struct {
     ///
     /// Return: why the package cannot be built, or `null`.
     fn check(self: *Self, b: *std.Build) ?[]const u8 {
-        if (self.org.len == 0) return "build.zig.zon has no .org; add the organisation in reverse DNS, e.g. .org = \"com.example\"";
-        if (!Self.isSafe(self.org) or !Self.isSafe(Self.label(self.org))) return b.fmt(".org = \"{s}\" may hold only letters, digits, '.', '-' and '_'", .{self.org});
-        if (!Self.isSafe(self.name)) return b.fmt(".name = .{s} may hold only letters, digits, '.', '-' and '_' to be packaged", .{self.name});
+        if (self.bundle.len == 0) return "build.zig.zon has no .bundle; add the bundle id in reverse DNS, e.g. .bundle = \"com.example.tool\"";
+        if (!Self.isSafe(self.bundle)) return b.fmt(".bundle = \"{s}\" may hold only letters, digits, '.', '-' and '_'", .{self.bundle});
+        if (Self.labels(self.bundle) == null) return b.fmt(".bundle = \"{s}\" must be three labels, <domain>.<org>.<name>, e.g. \"com.example.tool\" for /usr/local/example/tool", .{self.bundle});
         if (self.executables.len == 0) return "Pkg.add was given no executables";
         for (self.executables, 0..) |exe, i| {
             for (self.executables[i + 1 ..]) |other| {
@@ -708,7 +725,7 @@ test "parseArgs reads options and programs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var run = try PkgRun.init(arena.allocator(), std.testing.io);
-    try run.parseArgs(&.{ "--name=tool", "--org=com.acme", "--version=1.2.3", "--summary=A tool", "--scripts=s", "--", "a/tool", "b/helper" });
+    try run.parseArgs(&.{ "--name=tool", "--bundle=com.acme.tool", "--version=1.2.3", "--summary=A tool", "--scripts=s", "--", "a/tool", "b/helper" });
     try std.testing.expectEqualStrings("tool", run.name);
     try std.testing.expectEqualStrings("com.acme.tool", run.id());
     try std.testing.expectEqualStrings("acme", run.orgLabel());
@@ -723,7 +740,12 @@ test "isSafe allows letters, digits, '.', '-' and '_'" {
     try std.testing.expect(!Pkg.isSafe(""));
 }
 
-test "label is the last label of the organisation" {
-    try std.testing.expectEqualStrings("example", Pkg.label("com.example"));
-    try std.testing.expectEqualStrings("solo", Pkg.label("solo"));
+test "labels are the bundle id's second and last, and only for three" {
+    const labels = Pkg.labels("com.example.tool").?;
+    try std.testing.expectEqualStrings("example", labels.org);
+    try std.testing.expectEqualStrings("tool", labels.name);
+    try std.testing.expectEqual(null, Pkg.labels("com.example"));
+    try std.testing.expectEqual(null, Pkg.labels("com.example.tools.tool"));
+    try std.testing.expectEqual(null, Pkg.labels("com..tool"));
+    try std.testing.expectEqual(null, Pkg.labels("solo"));
 }
