@@ -12,7 +12,8 @@ the workarounds behind them, are below.
 - **Zig 0.17.0 only.** `build.zig` has a `comptime` guard that refuses any
   Zig outside 0.17 (it does not check the patch). Several extensions work
   around Zig 0.17.0 defects; see *Workarounds*. Version 1.x was the Zig 0.16
-  release; 2.0.0 dropped 0.16.
+  release; 2.0.0 dropped 0.16; 3.0.0 made `Xcode` and `Android` take the
+  build graph at `init`.
 - **The public surface is `build.zig`.** Consumers import this package's
   `build.zig` by dependency name, so only what it re-exports (`Deps`, `Git`,
   `Xcode`, `Swift`, `Android`, `AndroidAbi`, `Apk`, `Docs`, `Pkg`) is
@@ -26,9 +27,8 @@ the workarounds behind them, are below.
 
 ## Commands
 
-- **`ZIG`:** the Makefile runs `$(ZIG)`, default `zig`. On this machine `zig`
-  is 0.16 and `zig17` is 0.17, so run `make ZIG=zig17 ...`, and `zig17` by
-  hand.
+- **`ZIG`:** the Makefile runs `$(ZIG)`, default `zig`, which is 0.17 on
+  this machine.
 - `make`: format and test.
 - One test: `zig build test -Dtest-filter=<substring>`.
 - `make validate`: **the gate**. It runs clean, format, lint, test and cross,
@@ -169,7 +169,9 @@ Beyond ZIGSTYLE:
 - **`Xcode`:**
   - `standardTargetOptions` adds `-Dmacos-min` on a macOS host; `-Dtarget`
     overrides it, carrying its own floor (`aarch64-macos.26.0`).
-  - `resolve(b)` asks `xcrun` for the Apple Silicon SDK and is idempotent.
+  - `init(b)` keeps the build graph and takes its allocator and io from it;
+    the unit tests, which have no graph, use the private `initWith`.
+  - `resolve()` asks `xcrun` for the Apple Silicon SDK and is idempotent.
     `xcrun` names a versioned path (`MacOSX27.0.sdk`), so it makes the SDK's
     `SDKSettings.json` a configure input; an Xcode update removes the path.
   - `linkFramework` adds the SDK's `System/Library/Frameworks`, which a
@@ -179,7 +181,8 @@ Beyond ZIGSTYLE:
   build cache (for tests) and `@executable_path/../lib` (added as a special
   rpath, since normalising collapses it); `-target` from the Zig target. It
   returns null off macOS. `fromDependency` finds a dependency's dylib.
-- **`Android`:** `resolve` takes the SDK from `ANDROID_HOME`,
+- **`Android`:** `init(b)` keeps the build graph, as `Xcode` does, so
+  `resolve()` and `configure(lib)` take no `b`. `resolve` takes the SDK from `ANDROID_HOME`,
   `ANDROID_SDK_ROOT` or Android Studio's default; the NDK from
   `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT` or the newest under the SDK; the
   newest build-tools and platform; and the host's NDK prebuilt. `resolve`
@@ -281,30 +284,32 @@ contents.
 
 ## Adopters
 
-All four reference zigbuildx with a local `.url = "../zigbuildx"` and
-`.hash`. Nothing is committed in any of them.
+Every Zig project under `~/src/inferise` and `~/src/mlavergn` that lists
+zigbuildx (about 27) pins `git+https://github.com/mlavergn/zigbuildx#v3.0.0`
+with its `.hash`. Their Zig 0.17 ports are uncommitted. Nearly all use
+`Xcode` and `Deps.cloneMissing`; beyond that:
 
 | Repo | Uses |
 |---|---|
-| zigclaude | `Deps.sync` (all dependencies unpinned), `Xcode` |
-| zigstorage | `Archive`, `Xcode` floor 26.0 and `linkFramework`, `Docs` |
-| zigwebrtc | `Archive`, `Xcode` floor 26.0 |
-| zigafm | `Deps`, `Xcode` floor 26.0, `Swift`, `Archive` |
+| zigclaude | `Deps.sync` (all dependencies unpinned) |
+| zigstorage | `Xcode` floor 26.0 and `linkFramework`, `Docs` |
+| zigwebrtc, dropbox | `Xcode` floor |
+| zigafm | `Xcode` floor 26.0, `Swift` |
+| zigagent | `Swift.fromDependency` (zigafm's dylib) |
+| zlintpre | `Pkg` |
 
-- **Pins have diverged.** All four pin version `1.0.0` (Zig 0.16), but with
-  different contents: zigclaude's includes `Deps.sync`, and zigstorage's is
-  newer than the other two. Bump the version on a change, then re-fetch in
-  each adopter that needs it.
-- **None is on 2.0.0 yet.** Moving one to Zig 0.17 and zigbuildx 2.0.0 means:
-  - **`Archive`:** `Archive.install(b, lib)` becomes `b.installArtifact(lib)`,
-    and `Archive.addInstall(b, lib)` becomes
-    `&b.addInstallArtifact(lib, .{}).step`.
-  - **`Xcode`:** `xcode.resolve()` becomes `xcode.resolve(b)`.
-  - **Its own 0.17 port:** `ZIGMIGRATE.md`'s 0.16-to-0.17 section, e.g.
-    `.ReleaseFast` to `.fast` and `b.build_root` to `b.root`.
-- **After pushing**, change each adopter's `.url` to
-  `git+https://github.com/mlavergn/zigbuildx#<commit>`. The hash is unchanged
-  if the pushed files match.
+- **Version bumps:** bump `.version` on any change, push the tag, then in each
+  adopter run `zig fetch --save-exact=zigbuildx
+  git+https://github.com/mlavergn/zigbuildx#v<x.y.z>`, which keeps the tag in
+  the URL. Before the tag is pushed, `zig fetch .` from this repo puts the
+  same hash in the global cache, so adopters build against it locally.
+- **From 2.0.0 to 3.0.0:** `Xcode.init(b.allocator, b.graph.io)` becomes
+  `Xcode.init(b)` and `resolve(b)` becomes `resolve()`; `Android` likewise,
+  with `configure(b, lib)` becoming `configure(lib)`.
+- **From 1.x (Zig 0.16):** `Archive.install(b, lib)` becomes
+  `b.installArtifact(lib)`, `Archive.addInstall(b, lib)` becomes
+  `&b.addInstallArtifact(lib, .{}).step`, plus the project's own port
+  (`ZIGMIGRATE.md`'s 0.16-to-0.17 section).
 
 ## Deferred
 
