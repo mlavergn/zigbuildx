@@ -1,0 +1,13 @@
+#!/bin/bash
+
+if [ ! -d "/usr/local/{pkg_org}" ]; then
+	sudo mkdir -p /usr/local/{pkg_org}
+fi
+
+if [ ! -d "/etc/{pkg_org}/{pkg_name}" ]; then
+	sudo mkdir -p /etc/{pkg_org}/{pkg_name}
+fi
+
+if [ -f "/usr/local/{pkg_org}/{pkg_name}/uninstall.sh" ]; then
+	sudo /usr/local/{pkg_org}/{pkg_name}/uninstall.sh
+fi

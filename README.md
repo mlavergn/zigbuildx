@@ -1,0 +1,183 @@
+# zigbuildx
+
+> Zig build system extensions for `build.zig` and `build.zig.zon`.
+
+## Overview
+
+zigbuildx holds build logic that `std.Build` does not provide, so it lives in
+one place instead of being copied from one project's `build.zig` to the next,
+where the copies drift. It is imported, not run: nothing acts unless a
+`build.zig` calls it, and it has no opinion about a project's layout or steps.
+
+| Extension | What it does |
+|---|---|
+| `Deps` | Clones missing sibling checkouts, and gives pinned dependencies their own git worktree |
+| `Git` | Runs `git` commands for the build |
+| `Xcode` | Finds the macOS SDK, sets a macOS deployment floor, links frameworks and libc++ |
+| `Archive` | Installs static libraries that Apple's linker accepts |
+| `Swift` | Builds a Swift dylib that a Zig package links against |
+| `Android` | Builds Android native libraries against the NDK |
+| `Apk` | Packages Android native libraries into a signed APK, with no Java or Kotlin |
+| `Docs` | Includes private declarations in Zig's generated documentation |
+| `Pkg` | Builds an installable package: `.pkg` (macOS), `.deb` (Linux), `.msi` (Windows) |
+
+Several extensions work around defects in Zig 0.16.0 or the macOS 27 SDK;
+each is written to be deleted on its own once the cause goes away.
+
+## Requirements
+
+- **Zig 0.16.** `build.zig` refuses any other minor release; the workarounds
+  were written against 0.16.0.
+- **Hosts:** macOS (Apple Silicon), Linux (arm64, x86_64) and Windows (x86_64,
+  arm64). Apple-only extensions fall back to plain behaviour elsewhere.
+- **Per extension:**
+  - `Deps`: `git`.
+  - `Xcode`, `Swift`, `Archive`: Xcode or the Command Line Tools.
+  - `Android`, `Apk`: the Android SDK and NDK; a JDK's `keytool` for the debug
+    keystore.
+  - `Pkg`: `pkgbuild` and `codesign` for macOS; `wixl` (`apt install wixl`, or
+    Homebrew's `msitools`) for Windows. Linux packages need no tools.
+
+## Setup
+
+Add zigbuildx to a project:
+
+```sh
+zig fetch --save git+https://github.com/mlavergn/zigbuildx
+```
+
+It must stay a `.url` + `.hash` dependency, never a `.path`: a missing `.path`
+dependency fails to compile before `Deps` could clone it. Then, in `build.zig`:
+
+```zig
+const zon = @import("build.zig.zon");
+const zigbuildx = @import("zigbuildx");
+```
+
+To work on zigbuildx itself:
+
+```sh
+git clone git@github.com:mlavergn/zigbuildx.git
+cd zigbuildx
+make subpull   # the styleguide submodule, for linting
+make validate  # clean, format, lint, test, cross
+```
+
+## Configuration
+
+- **`build.zig.zon` fields**, which Zig ignores and zigbuildx reads:
+  - `.clone`: where `Deps` clones a missing `.path` dependency from.
+  - `.sha`, `.tag`, `.branch`: pin a dependency to its own worktree under
+    `deps/`; `.checkout` names the shared checkout (default `../<name>`).
+  - `.org`: the organisation in reverse DNS (`com.example`), required by
+    `zig build pkg`.
+- **`signing.zon`**, in the project root, holds the Apple signing identity and
+  notarization credentials as `.apple_id`, `.apple_password`, `.apple_name`
+  and `.apple_team`. It must be listed in `.gitignore`; `Pkg` refuses it
+  otherwise. Without it, macOS packages are built unsigned.
+- **Environment:** `ANDROID_HOME` or `ANDROID_SDK_ROOT`, `ANDROID_NDK_HOME` or
+  `ANDROID_NDK_ROOT`, and `JAVA_HOME`. Each falls back to Android Studio's
+  defaults or `PATH`. A release APK's keystore password is best passed as
+  `env:VAR`, keeping it off the command line.
+- **Build options:** `-Dmacos-min` (from `Xcode.standardTargetOptions`) and
+  `-Dupdate` (for `zig build deps`).
+- **Ignore `deps/`** in a project that pins dependencies, and keep it out of
+  `zig fmt` and linting.
+
+## Usage
+
+Call `Deps` first in `build()`; `sync` also handles everything `cloneMissing`
+does:
+
+```zig
+pub fn build(b: *std.Build) !void {
+    zigbuildx.Deps.sync(b, zon);
+    // ...
+}
+```
+
+Pin a dependency to its own worktree, and list or update the worktrees:
+
+```zig
+.zigstorage = .{ .path = "deps/zigstorage", .clone = "git@github.com:org/zigstorage.git", .tag = "1.6.7" },
+```
+
+```sh
+zig build deps            # each worktree: pin, commit, clean or dirty
+zig build deps -Dupdate   # fetch, and fast-forward branch pins
+```
+
+Target macOS with a floor, link frameworks and C++, and install a static
+library Apple's linker accepts:
+
+```zig
+const target = try zigbuildx.Xcode.standardTargetOptions(b, "26.0");
+if (b.graph.host.result.os.tag == .macos) {
+    var xcode = try zigbuildx.Xcode.init(b.allocator, b.graph.io);
+    try xcode.resolve();
+    xcode.linkFramework(lib.root_module, "CoreFoundation");
+    try xcode.linkLibCpp(b, exe);
+}
+zigbuildx.Archive.install(b, lib); // plain install off Apple targets
+```
+
+Build and link a Swift dylib:
+
+```zig
+const shim = zigbuildx.Swift.addDylib(b, .{ .name = "afm", .sources = &.{b.path("swift/AFM.swift")}, .bridging_header = b.path("swift/afm.h"), .target = target, .optimize = optimize });
+zigbuildx.Swift.link(exe.root_module, "afm", shim);
+```
+
+Build an Android library and package it as an APK:
+
+```zig
+var android = try zigbuildx.Android.init(b.allocator, b.graph.io);
+try android.resolve(b);
+const lib = b.addLibrary(.{ .name = "main", .linkage = .dynamic, .root_module = b.createModule(.{
+    .root_source_file = b.path("src/main.zig"),
+    .target = zigbuildx.Android.resolveTarget(b, .arm64V8a, 30),
+}) });
+try android.configure(b, lib);
+const apk = try zigbuildx.Apk.add(&android, b, .{ .name = "app", .manifest = b.path("AndroidManifest.xml"), .resources = b.path("res"), .libraries = &.{lib} });
+```
+
+Document private declarations:
+
+```zig
+const docs = zigbuildx.Docs.includePrivate(b, lib.getEmittedDocs());
+```
+
+Build an installable package of a project's executables:
+
+```zig
+_ = zigbuildx.Pkg.add(b, zon, .{ .executables = &.{exe} });
+```
+
+```sh
+zig build pkg -Doptimize=ReleaseFast                        # zig-out/pkg/<name>-<version>.pkg
+zig build pkg -Doptimize=ReleaseFast -Dtarget=aarch64-linux # <name>_<version>_arm64.deb
+zig build pkg -Doptimize=ReleaseFast -Dtarget=x86_64-windows # <name>-<version>-x64.msi
+zig build pkg-notarize -Doptimize=ReleaseFast               # macOS: notarize and staple
+```
+
+Packages install to `/usr/local/<org>/<name>` (per user under
+`%LOCALAPPDATA%\<org>\<name>` on Windows) and put its `bin` on `PATH`.
+
+## Architecture
+
+```
+build.zig        the public surface: re-exports each extension
+src/module.zig   the barrel the tests compile
+src/             build-side extensions: deps, git, xcode, archive, swift, android, docs
+src/pkg/         packaging: pkg.zig (zig build pkg), one folder per platform
+  macos/         pkgbuild.zig and the install scripts
+  linux/         deb.zig (a host tool) and the maintainer scripts
+  windows/       msi.zig (WiX source for wixl)
+  android/       apk.zig and apk_zip.zig (a host tool)
+```
+
+Code that compiles lives at the top of `src/`; code that assembles an
+installable package lives under `src/pkg/`. Each extension is one struct per
+file, re-exported from `build.zig`, whose `pub` declarations are the package's
+whole surface. Work that would otherwise need a platform-specific shell tool
+(`zip`, `dpkg-deb`, `sed -i`) is done by small Zig programs built for the host.
