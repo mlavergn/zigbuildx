@@ -92,6 +92,9 @@ pub const Android = struct {
 
     arena: std.heap.ArenaAllocator,
     io: std.Io,
+    /// The build graph `resolve` reads and `configure` adds steps to.
+    // SAFETY: set by init(b); a handle from initWith (unit tests) never calls resolve or configure.
+    b: *std.Build = undefined,
     loaded: bool = false,
     /// What `resolve` looked for and did not find, for its error message.
     missing: []const u8 = "",
@@ -115,14 +118,29 @@ pub const Android = struct {
     /// The Android Studio debug keystore, when one exists.
     debug_keystore: ?[]const u8 = null,
 
-    /// Creates an unresolved handle.
+    /// Creates an unresolved handle for build graph `b`.
+    ///
+    /// The resolved paths come from `b.allocator` and the SDK is inspected
+    /// through `b.graph.io`.
+    ///
+    /// Parameters:
+    /// - `b`: the build graph; must outlive the handle.
+    ///
+    /// Return: the handle.
+    pub fn init(b: *std.Build) !Self {
+        var self = Self.initWith(b.allocator, b.graph.io);
+        self.b = b;
+        return self;
+    }
+
+    /// Creates an unresolved handle with no build graph, for the unit tests.
     ///
     /// Parameters:
     /// - `allocator`: backs the resolved paths; must outlive the handle.
-    /// - `io`: IO for inspecting the SDK during `resolve`.
+    /// - `io`: IO for inspecting the SDK.
     ///
-    /// Return: the handle.
-    pub fn init(allocator: std.mem.Allocator, io: std.Io) !Self {
+    /// Return: the handle, usable with `resolveFrom` but not `resolve` or `configure`.
+    fn initWith(allocator: std.mem.Allocator, io: std.Io) Self {
         return Self{ .arena = std.heap.ArenaAllocator.init(allocator), .io = io };
     }
 
@@ -146,13 +164,13 @@ pub const Android = struct {
     /// every build that resolves Android configures again.
     ///
     /// Parameters:
-    /// - `self`: the handle to populate.
-    /// - `b`: the build graph, whose environment and host are read.
+    /// - `self`: the handle to populate; its build graph's environment and host
+    ///   are read.
     ///
     /// Return: nothing; `error.AndroidSdkNotFound` naming what is missing.
-    pub fn resolve(self: *Self, b: *std.Build) !void {
-        b.graph.poisonCache();
-        self.resolveFrom(&b.graph.environ_map, b.graph.host.result.os.tag) catch |err| {
+    pub fn resolve(self: *Self) !void {
+        self.b.graph.poisonCache();
+        self.resolveFrom(&self.b.graph.environ_map, self.b.graph.host.result.os.tag) catch |err| {
             log.err("{s} not found: {s} (set ANDROID_HOME and ANDROID_NDK_HOME)", .{ @errorName(err), self.missing });
             return err;
         };
@@ -174,11 +192,10 @@ pub const Android = struct {
     ///
     /// Parameters:
     /// - `self`: a resolved handle.
-    /// - `b`: the build graph.
     /// - `lib`: a library whose target came from `resolveTarget`.
     ///
     /// Return: nothing; `error.NotAndroid` when `lib`'s target is not Android.
-    pub fn configure(self: *Self, b: *std.Build, lib: *std.Build.Step.Compile) !void {
+    pub fn configure(self: *Self, lib: *std.Build.Step.Compile) !void {
         std.debug.assert(self.loaded);
         const target = (lib.root_module.resolved_target orelse return error.NotAndroid).result;
         const abi = AndroidAbi.fromTarget(target) orelse {
@@ -187,7 +204,7 @@ pub const Android = struct {
         };
         const api = target.os.version_range.linux.android;
         lib.root_module.link_libc = true;
-        lib.setLibCFile(b.addWriteFiles().add(b.fmt("libc-{s}-{d}.txt", .{ abi.dirName(), api }), try self.libCText(abi, api)));
+        lib.setLibCFile(self.b.addWriteFiles().add(self.b.fmt("libc-{s}-{d}.txt", .{ abi.dirName(), api }), try self.libCText(abi, api)));
         lib.link_z_max_page_size = page_size;
     }
 
@@ -454,7 +471,7 @@ test "resolve picks the newest of each, and the sysroot for every host" {
     try environ.put("ANDROID_HOME", sdk);
 
     for ([_]std.Target.Os.Tag{ .macos, .linux, .windows }) |host| {
-        var android = try Android.init(allocator, io);
+        var android = Android.initWith(allocator, io);
         defer android.deinit();
         try android.resolveFrom(&environ, host);
         try std.testing.expect(std.mem.endsWith(u8, android.build_tools, "35.0.1"));
@@ -505,12 +522,12 @@ test "an explicit NDK wins over the SDK's newest" {
     try environ.put("ANDROID_HOME", sdk);
     try environ.put("ANDROID_NDK_HOME", ndk);
 
-    var android = try Android.init(allocator, io);
+    var android = Android.initWith(allocator, io);
     defer android.deinit();
     try android.resolveFrom(&environ, .macos);
     try std.testing.expect(std.mem.find(u8, android.sysroot, "26.3.11579264") != null);
     // Only the darwin sysroot exists in the older NDK.
-    var linux = try Android.init(allocator, io);
+    var linux = Android.initWith(allocator, io);
     defer linux.deinit();
     try std.testing.expectError(error.AndroidNdkNotFound, linux.resolveFrom(&environ, .linux));
 }
@@ -520,7 +537,7 @@ test "a missing SDK is reported, with the path looked for" {
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
     try environ.put("ANDROID_HOME", "/nonexistent/zigbuildx/sdk");
-    var android = try Android.init(allocator, std.testing.io);
+    var android = Android.initWith(allocator, std.testing.io);
     defer android.deinit();
     try std.testing.expectError(error.AndroidSdkNotFound, android.resolveFrom(&environ, .linux));
     try std.testing.expectEqualStrings("/nonexistent/zigbuildx/sdk", android.missing);

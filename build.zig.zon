@@ -1,7 +1,7 @@
 .{
     .name = .zigbuildx,
     .description = "Zig build system extensions for build.zig and build.zig.zon",
-    .version = "2.0.0",
+    .version = "3.0.0",
     .fingerprint = 0x2e938890840f4af6,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},

@@ -26,7 +26,8 @@ each is written to be deleted on its own once the cause goes away.
 ## Requirements
 
 - **Zig 0.17.** `build.zig` refuses any other minor release; the workarounds
-  were checked against 0.17.0. zigbuildx 1.x is the Zig 0.16 release.
+  were checked against 0.17.0. zigbuildx 1.x is the Zig 0.16 release; 3.0.0
+  changed `Xcode.init` and `Android.init` to take `b`.
 - **Hosts:** macOS (Apple Silicon), Linux (arm64, x86_64) and Windows (x86_64,
   arm64). Apple-only extensions fall back to plain behaviour elsewhere.
 - **Per extension:**
@@ -115,8 +116,8 @@ Target macOS with a floor and link frameworks:
 ```zig
 const target = try zigbuildx.Xcode.standardTargetOptions(b, "26.0");
 if (b.graph.host.result.os.tag == .macos) {
-    var xcode = try zigbuildx.Xcode.init(b.allocator, b.graph.io);
-    try xcode.resolve(b);
+    var xcode = try zigbuildx.Xcode.init(b);
+    try xcode.resolve();
     xcode.linkFramework(lib.root_module, "CoreFoundation");
 }
 ```
@@ -131,13 +132,13 @@ zigbuildx.Swift.link(exe.root_module, "afm", shim);
 Build an Android library and package it as an APK:
 
 ```zig
-var android = try zigbuildx.Android.init(b.allocator, b.graph.io);
-try android.resolve(b);
+var android = try zigbuildx.Android.init(b);
+try android.resolve();
 const lib = b.addLibrary(.{ .name = "main", .linkage = .dynamic, .root_module = b.createModule(.{
     .root_source_file = b.path("src/main.zig"),
     .target = zigbuildx.Android.resolveTarget(b, .arm64V8a, 30),
 }) });
-try android.configure(b, lib);
+try android.configure(lib);
 const apk = try zigbuildx.Apk.add(&android, b, .{ .name = "app", .manifest = b.path("AndroidManifest.xml"), .resources = b.path("res"), .libraries = &.{lib} });
 ```
 

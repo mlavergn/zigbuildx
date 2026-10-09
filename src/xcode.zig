@@ -7,6 +7,9 @@ pub const Xcode = struct {
     const Self = @This();
     allocator: std.mem.Allocator,
     io: std.Io,
+    /// The build graph `resolve` records the SDK on.
+    // SAFETY: set by init(b); a handle from initWith (unit tests) never calls resolve.
+    b: *std.Build = undefined,
     loaded: bool = false,
     /// The target the SDK was resolved for; valid only after `resolve`.
     // SAFETY: populated by resolve() before first read, guarded by `loaded`.
@@ -18,21 +21,36 @@ pub const Xcode = struct {
     // SAFETY: populated by resolve() before first read, guarded by `loaded`.
     frameworks: []const u8 = undefined,
 
-    /// Creates an unresolved `Xcode` handle.
+    /// Creates an unresolved `Xcode` handle for build graph `b`.
+    ///
+    /// The SDK paths come from `b.allocator` and `xcrun` runs through
+    /// `b.graph.io`.
+    ///
+    /// Parameters:
+    /// - `b`: the build graph; must outlive the handle.
+    ///
+    /// Return: the handle; `target`, `sdk` and `frameworks` are unset until `resolve`.
+    pub fn init(b: *std.Build) !Self {
+        var self = Self.initWith(b.allocator, b.graph.io);
+        self.b = b;
+        return self;
+    }
+
+    /// Creates an unresolved handle with no build graph, for the unit tests.
     ///
     /// Parameters:
     /// - `allocator`: allocator for the SDK paths; must outlive the handle.
-    /// - `io`: IO for querying the host during `resolve`.
+    /// - `io`: IO for querying the host.
     ///
-    /// Return: the handle; `target`, `sdk` and `frameworks` are unset until `resolve`.
-    pub fn init(allocator: std.mem.Allocator, io: std.Io) !Self {
+    /// Return: the handle, usable with `resolveSdk` but not `resolve`.
+    fn initWith(allocator: std.mem.Allocator, io: std.Io) Self {
         return Self{ .allocator = allocator, .io = io };
     }
 
     /// Frees the SDK paths when they were resolved.
     ///
-    /// A handle made with `b.allocator` need not call this: the build's arena
-    /// frees everything at once.
+    /// A handle from `init` need not call this: `b.allocator` is the build's
+    /// arena, which frees everything at once.
     ///
     /// Parameters:
     /// - `self`: the handle to release.
@@ -55,15 +73,15 @@ pub const Xcode = struct {
     /// the path, and the next build configures again.
     ///
     /// Parameters:
-    /// - `self`: the handle to populate.
-    /// - `b`: the build graph, which records the SDK as a configure input.
+    /// - `self`: the handle to populate; its build graph records the SDK as a
+    ///   configure input.
     ///
     /// Return: nothing on success; `error.FailedToResolveSDK` when no SDK is
     /// found, or target-resolution errors.
-    pub fn resolve(self: *Self, b: *std.Build) !void {
+    pub fn resolve(self: *Self) !void {
         if (self.loaded) return;
         try self.resolveSdk();
-        b.dependOnFileMetadata(b.graph.cwdRelativePath(b.pathJoin(&.{ self.sdk, "SDKSettings.json" })));
+        self.b.dependOnFileMetadata(self.b.graph.cwdRelativePath(self.b.pathJoin(&.{ self.sdk, "SDKSettings.json" })));
     }
 
     /// Asks `xcrun` for the SDK and fills in the handle; `resolve` without the build graph.
@@ -177,7 +195,7 @@ pub const Xcode = struct {
 test "resolve finds the SDK and its frameworks" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var xcode = try Xcode.init(allocator, std.testing.io);
+    var xcode = Xcode.initWith(allocator, std.testing.io);
     defer xcode.deinit();
     try xcode.resolveSdk();
     try xcode.resolveSdk();
@@ -198,7 +216,7 @@ test "parseVersion accepts one to three components" {
 }
 
 test "deinit on an unresolved handle frees nothing" {
-    var xcode = try Xcode.init(std.testing.allocator, std.testing.io);
+    var xcode = Xcode.initWith(std.testing.allocator, std.testing.io);
     xcode.deinit();
     try std.testing.expect(!xcode.loaded);
 }
