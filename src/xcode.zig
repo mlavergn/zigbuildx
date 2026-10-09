@@ -48,12 +48,32 @@ pub const Xcode = struct {
     /// Idempotent: a resolved handle returns at once, so one handle can serve
     /// every module in a build without spawning `xcrun` again.
     ///
+    /// Zig 0.17 reuses a configured build graph until something it was told
+    /// about changes, and `xcrun`'s answer is not something it can see. The
+    /// SDK's path carries its version (`MacOSX27.0.sdk`), so the SDK's
+    /// `SDKSettings.json` is made a configure input: an Xcode update removes
+    /// the path, and the next build configures again.
+    ///
+    /// Parameters:
+    /// - `self`: the handle to populate.
+    /// - `b`: the build graph, which records the SDK as a configure input.
+    ///
+    /// Return: nothing on success; `error.FailedToResolveSDK` when no SDK is
+    /// found, or target-resolution errors.
+    pub fn resolve(self: *Self, b: *std.Build) !void {
+        if (self.loaded) return;
+        try self.resolveSdk();
+        b.dependOnFileMetadata(b.graph.cwdRelativePath(b.pathJoin(&.{ self.sdk, "SDKSettings.json" })));
+    }
+
+    /// Asks `xcrun` for the SDK and fills in the handle; `resolve` without the build graph.
+    ///
     /// Parameters:
     /// - `self`: the handle to populate.
     ///
     /// Return: nothing on success; `error.FailedToResolveSDK` when no SDK is
     /// found, or target-resolution errors.
-    pub fn resolve(self: *Self) !void {
+    fn resolveSdk(self: *Self) !void {
         if (self.loaded) return;
         // Always aarch64-macos, whatever the build target: the SDK is looked up for
         // the primary platform, and `getSdk` needs a fully resolved target.
@@ -69,7 +89,7 @@ pub const Xcode = struct {
         errdefer self.allocator.free(sdk);
         // getSdk returns the SDK root; frameworks live in a subdirectory of it,
         // and a framework search path pointed at the root finds nothing.
-        self.frameworks = try std.fs.path.join(self.allocator, &.{ sdk, "System", "Library", "Frameworks" });
+        self.frameworks = try std.Io.Dir.path.join(self.allocator, &.{ sdk, "System", "Library", "Frameworks" });
         self.sdk = sdk;
         self.loaded = true;
     }
@@ -111,7 +131,7 @@ pub const Xcode = struct {
     /// - `module`: the module that links system frameworks.
     pub fn addFrameworkPath(self: *const Self, module: *std.Build.Module) void {
         std.debug.assert(self.loaded);
-        module.addFrameworkPath(.{ .cwd_relative = self.frameworks });
+        module.addFrameworkPath(module.owner.graph.cwdRelativePath(self.frameworks));
     }
 
     /// Links `module` against SDK framework `name`, adding the frameworks directory it is found in.
@@ -129,80 +149,6 @@ pub const Xcode = struct {
         if (self.loaded) self.addFrameworkPath(module);
         module.linkFramework(name, .{});
     }
-
-    /// Links `compile` against Zig's libc++, working around macOS SDK 27's `<math.h>` where needed.
-    ///
-    /// Zig builds its bundled libc++ as C++23, and SDK 27's `<math.h>` defines
-    /// neither `INFINITY` nor `NAN` under C++20 and later, leaving them to
-    /// `<float.h>` — which Zig 0.16's clang does not supply that way — so every
-    /// C++ link fails in `clamp_to_integral.h` with "use of undeclared identifier
-    /// 'INFINITY'". For a macOS target, a libc file puts a `<math.h>` ahead of
-    /// the SDK's that includes it and defines whichever of the two is missing;
-    /// the libc file is the only setting that reaches Zig's own libc++ build. It
-    /// is guarded, so on an SDK that defines both it changes nothing.
-    ///
-    /// Anywhere else — another target, or an unresolved handle off a macOS host
-    /// — this is `link_libcpp` alone.
-    ///
-    /// Parameters:
-    /// - `self`: the handle, resolved where the host allows it.
-    /// - `b`: the build graph, whose cache holds the overlay.
-    /// - `compile`: the step that links C++; the libc file is set on it, not its module.
-    ///
-    /// Return: nothing; errors writing the overlay.
-    pub fn linkLibCpp(self: *Self, b: *std.Build, compile: *std.Build.Step.Compile) !void {
-        compile.root_module.link_libcpp = true;
-        const target = compile.root_module.resolved_target orelse return;
-        if (!self.loaded or target.result.os.tag != .macos) return;
-        compile.setLibCFile(.{ .cwd_relative = try self.libCFile(b) });
-    }
-
-    /// Writes the `<math.h>` overlay and a libc file naming it into the build cache.
-    ///
-    /// Written while the graph is declared, not by a step: the libc file must
-    /// state the overlay's absolute path, which a generated file cannot know
-    /// until it runs. The directory is named for its contents, so every build
-    /// with the same SDK shares one, and rewriting it is harmless.
-    ///
-    /// Parameters:
-    /// - `self`: a resolved handle.
-    /// - `b`: the build graph.
-    ///
-    /// Return: the libc file's absolute path; errors writing either file.
-    fn libCFile(self: *Self, b: *std.Build) ![]const u8 {
-        const key = std.hash.Wyhash.hash(0, Self.math_overlay) ^ std.hash.Wyhash.hash(1, self.sdk);
-        const sub_path = b.fmt("zigbuildx/apple-libc/{x:0>16}", .{key});
-        const cache = b.cache_root.handle;
-        try cache.createDirPath(self.io, b.fmt("{s}/include", .{sub_path}));
-        const root = try cache.realPathFileAlloc(self.io, sub_path, b.allocator);
-        try cache.writeFile(self.io, .{ .sub_path = b.fmt("{s}/include/math.h", .{sub_path}), .data = Self.math_overlay });
-        const include = try std.fs.path.join(b.allocator, &.{ root, "include" });
-        const sys_include = try std.fs.path.join(b.allocator, &.{ self.sdk, "usr", "include" });
-        try cache.writeFile(self.io, .{ .sub_path = b.fmt("{s}/libc.txt", .{sub_path}), .data = b.fmt(
-            \\include_dir={s}
-            \\sys_include_dir={s}
-            \\crt_dir=
-            \\msvc_lib_dir=
-            \\kernel32_lib_dir=
-            \\gcc_dir=
-            \\
-        , .{ include, sys_include }) });
-        return std.fs.path.join(b.allocator, &.{ root, "libc.txt" });
-    }
-
-    /// The `<math.h>` `linkLibCpp` puts ahead of the SDK's.
-    const math_overlay =
-        \\// zigbuildx: macOS SDK 27's <math.h> leaves INFINITY and NAN to <float.h>
-        \\// under C++20 and later, and Zig 0.16's clang does not supply them that way.
-        \\#include_next <math.h>
-        \\#ifndef INFINITY
-        \\#define INFINITY HUGE_VALF
-        \\#endif
-        \\#ifndef NAN
-        \\#define NAN __builtin_nanf("0x7fc00000")
-        \\#endif
-        \\
-    ;
 
     /// Parses a `major[.minor[.patch]]` version, defaulting absent components to 0.
     ///
@@ -233,8 +179,8 @@ test "resolve finds the SDK and its frameworks" {
     const allocator = std.testing.allocator;
     var xcode = try Xcode.init(allocator, std.testing.io);
     defer xcode.deinit();
-    try xcode.resolve();
-    try xcode.resolve();
+    try xcode.resolveSdk();
+    try xcode.resolveSdk();
     try std.testing.expect(std.mem.startsWith(u8, xcode.frameworks, xcode.sdk));
     try std.testing.expect(std.mem.endsWith(u8, xcode.frameworks, "System/Library/Frameworks"));
     var dir = try std.Io.Dir.cwd().openDir(std.testing.io, xcode.frameworks, .{});

@@ -44,38 +44,39 @@ pub const Apk = struct {
         link.setName(b.fmt("aapt2 link {s}", .{options.name}));
         link.addFileArg(options.manifest);
         link.addArg("-o");
-        const base = link.addOutputFileArg("base.apk");
+        const base = link.addOutputFileArg2("base.apk", .{});
         if (options.resources) |resources| {
             const compile = b.addSystemCommand(&.{ android.tool("aapt2"), "compile", "--dir" });
             compile.setName(b.fmt("aapt2 compile {s}", .{options.name}));
-            compile.addDirectoryArg(resources);
+            compile.addDirectoryArg2(resources, .{});
             try Self.addDirectoryInputs(b, compile, resources);
             compile.addArg("-o");
-            link.addFileArg(compile.addOutputFileArg("resources.zip"));
+            link.addFileArg(compile.addOutputFileArg2("resources.zip", .{}));
         }
 
         const staging = b.addWriteFiles();
         for (options.libraries) |lib| {
             const target = (lib.root_module.resolved_target orelse return error.NotAndroid).result;
             const abi = mod.AndroidAbi.fromTarget(target) orelse return error.NotAndroid;
-            _ = staging.addCopyFile(lib.getEmittedBin(), b.fmt("lib/{s}/{s}", .{ abi.dirName(), lib.out_filename }));
+            _ = staging.addCopyFile(lib.getEmittedBin(), b.fmt("lib/{s}/{s}", .{ abi.dirName(), try Self.fileName(b, lib) }));
         }
-        const zip = b.addRunArtifact(mod.HostTool.add(b, "apk-zip", "apk_zip.zig", @embedFile("apk_zip.zig")));
+        const zip = b.addRunArtifact(mod.HostTool.add(b));
         zip.setName(b.fmt("apk-zip {s}", .{options.name}));
+        zip.addArg("apk-zip");
         zip.addFileArg(base);
-        const unaligned = zip.addOutputFileArg("unaligned.apk");
-        zip.addDirectoryArg(staging.getDirectory());
+        const unaligned = zip.addOutputFileArg2("unaligned.apk", .{});
+        zip.addDirectoryArg2(staging.getDirectory(), .{});
 
         const align_step = b.addSystemCommand(&.{ android.tool("zipalign"), "-P", "16", "-f", "4" });
         align_step.setName(b.fmt("zipalign {s}", .{options.name}));
         align_step.addFileArg(unaligned);
-        const aligned = align_step.addOutputFileArg("aligned.apk");
+        const aligned = align_step.addOutputFileArg2("aligned.apk", .{});
 
         const sign = b.addSystemCommand(&.{ android.tool("apksigner"), "sign", "--ks" });
         sign.setName(b.fmt("apksigner {s}", .{options.name}));
         sign.addFileArg(options.keystore orelse Self.debugKeystore(android, b));
         sign.addArgs(&.{ "--ks-pass", options.keystore_password, "--out" });
-        const apk = sign.addOutputFileArg(b.fmt("{s}.apk", .{options.name}));
+        const apk = sign.addOutputFileArg2(b.fmt("{s}.apk", .{options.name}), .{});
         sign.addFileArg(aligned);
         return apk;
     }
@@ -92,10 +93,10 @@ pub const Apk = struct {
     ///
     /// Return: the keystore, password `android`, alias `androiddebugkey`.
     pub fn debugKeystore(android: *mod.Android, b: *std.Build) std.Build.LazyPath {
-        if (android.debug_keystore) |path| return .{ .cwd_relative = path };
+        if (android.debug_keystore) |path| return b.graph.cwdRelativePath(path);
         const keytool = b.addSystemCommand(&.{ android.javaTool("keytool"), "-genkeypair", "-keystore" });
         keytool.setName("keytool debug.keystore");
-        const keystore = keytool.addOutputFileArg("debug.keystore");
+        const keystore = keytool.addOutputFileArg2("debug.keystore", .{});
         keytool.addArgs(&.{ "-storepass", "android", "-keypass", "android", "-alias", "androiddebugkey", "-keyalg", "RSA", "-validity", "10000", "-dname", "CN=Android Debug,O=Android,C=US" });
         return keystore;
     }
@@ -105,8 +106,9 @@ pub const Apk = struct {
     /// A Run step hashes a directory argument's path, not its contents, so an
     /// edited `res/` would leave the cached `aapt2 compile` output in place. A
     /// generated directory needs nothing: its path changes with its contents.
-    /// The walk happens while the graph is declared, so an added or removed
-    /// file changes the inputs too.
+    /// The walk happens while the graph is declared, so every directory walked
+    /// is also a configure input: Zig 0.17 reuses a configured graph, and an
+    /// added or removed file must configure again to change the inputs.
     ///
     /// Parameters:
     /// - `b`: the build graph.
@@ -118,17 +120,47 @@ pub const Apk = struct {
         const io = b.graph.io;
         const root = switch (dir) {
             .generated => return,
-            .src_path => |source| source.owner.pathFromRoot(source.sub_path),
+            .src_path => |source| try source.owner.root.joinString(b.allocator, source.sub_path),
+            .dependency => |dep| try dep.dependency.builder.root.joinString(b.allocator, dep.sub_path),
             .cwd_relative => |path| path,
-            .dependency => |dep| dep.dependency.builder.pathFromRoot(dep.sub_path),
+            .relative => |relative| if (relative.base == .cwd) relative.sub_path else return,
         };
         var handle = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
         defer handle.close(io);
+        b.dependOnDirectoryContents(dir);
         var walker = try handle.walk(b.allocator);
         defer walker.deinit();
         while (try walker.next(io)) |entry| {
-            if (entry.kind == .file) run.addFileInput(.{ .cwd_relative = b.pathJoin(&.{ root, entry.path }) });
+            switch (entry.kind) {
+                .file => run.addFileInput(dir.path(b, entry.path)),
+                .directory => b.dependOnDirectoryContents(dir.path(b, entry.path)),
+                else => {},
+            }
         }
+    }
+
+    /// Returns the file name `lib` is emitted as, e.g. `libmain.so`.
+    ///
+    /// `Compile.out_filename` is deprecated in Zig 0.17; this is how Zig itself
+    /// derives it.
+    ///
+    /// Parameters:
+    /// - `b`: the build graph, whose arena holds the name.
+    /// - `lib`: the library.
+    ///
+    /// Return: the name; allocation errors.
+    fn fileName(b: *std.Build, lib: *std.Build.Step.Compile) ![]const u8 {
+        const target = lib.rootModuleTarget();
+        return std.zig.binNameAlloc(b.allocator, .{
+            .root_name = lib.name,
+            .cpu_arch = target.cpu.arch,
+            .os_tag = target.os.tag,
+            .ofmt = target.ofmt,
+            .abi = target.abi,
+            .output_mode = .Lib,
+            .link_mode = lib.linkage,
+            .version = lib.version,
+        });
     }
 };
 

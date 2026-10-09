@@ -4,6 +4,9 @@ const std = @import("std");
 const parent = @import("../module.zig");
 
 pub const Pkg = @import("pkg.zig").Pkg;
+pub const PkgOptions = @import("pkg.zig").PkgOptions;
+pub const PkgRun = @import("pkg.zig").PkgRun;
+pub const Signing = @import("pkg.zig").Signing;
 pub const Pkgbuild = @import("macos/pkgbuild.zig").Pkgbuild;
 pub const Deb = @import("linux/deb.zig").Deb;
 pub const Msi = @import("windows/msi.zig").Msi;

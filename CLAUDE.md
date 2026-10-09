@@ -9,13 +9,14 @@ lacks, imported from other projects' `build.zig` instead of being copied into
 each one. `README.md` covers setup and usage; how each extension works, and
 the workarounds behind them, are below.
 
-- **Zig 0.16.0 only.** `build.zig` has a `comptime` guard that refuses any
-  Zig outside 0.16 (it does not check the patch). Several extensions work
-  around Zig 0.16.0 defects; see *Workarounds*.
+- **Zig 0.17.0 only.** `build.zig` has a `comptime` guard that refuses any
+  Zig outside 0.17 (it does not check the patch). Several extensions work
+  around Zig 0.17.0 defects; see *Workarounds*. Version 1.x was the Zig 0.16
+  release; 2.0.0 dropped 0.16.
 - **The public surface is `build.zig`.** Consumers import this package's
   `build.zig` by dependency name, so only what it re-exports (`Deps`, `Git`,
-  `Xcode`, `Archive`, `Swift`, `Android`, `AndroidAbi`, `Apk`, `Docs`, `Pkg`)
-  is reachable.
+  `Xcode`, `Swift`, `Android`, `AndroidAbi`, `Apk`, `Docs`, `Pkg`) is
+  reachable. It also declares the host tool, so it has a `build()`.
   `src/module.zig` is the barrel for tests.
 - **It runs on every host.** The code executes inside other projects' build
   runners on macOS, Linux and Windows. Host-specific behaviour is a runtime
@@ -25,13 +26,16 @@ the workarounds behind them, are below.
 
 ## Commands
 
+- **`ZIG`:** the Makefile runs `$(ZIG)`, default `zig`. On this machine `zig`
+  is 0.16 and `zig17` is 0.17, so run `make ZIG=zig17 ...`, and `zig17` by
+  hand.
 - `make`: format and test.
 - One test: `zig build test -Dtest-filter=<substring>`.
 - `make validate`: **the gate**. It runs clean, format, lint, test and cross,
   and must pass before a change is done. `zlint` and `zlintpre` exit 0 even
   when they find something, so read the whole output rather than trusting the
   exit code.
-- `make cross`: compiles the test suite and the host tools for x86_64 and
+- `make cross`: compiles the test suite and the host tool for x86_64 and
   aarch64 Windows and Linux, without running them.
 - `make lint`: needs the `styleguide` submodule; run `make subpull` after a
   fresh clone.
@@ -64,13 +68,21 @@ Beyond ZIGSTYLE:
   types they need (`Git`, `HostTool`, `Android`). A folder with several
   `.zig` files gets its own barrel too (`pkg/android/`, reached as
   `mod.pkg.android`); a folder with one does not.
-- **Host tools** (`docs.zig`, `pkg/android/apk_zip.zig`, `pkg/linux/deb.zig`):
-  single-file programs that import only `std`. They are embedded with `@embedFile` and compiled for the
-  host through `HostTool.add`, and they are the way to avoid shell tools that
-  differ between platforms (`sed -i`, `zip`). Each also exposes a type that
-  the tests exercise. `docs.zig` is also the `Docs` extension: Zig loads every
-  `@import` eagerly, so it cannot import `module.zig` and compiles itself
-  for the host instead of calling `HostTool.add`.
+- **The host tool** (`src/tool.zig`): one program, `zigbuildx <command>`,
+  that does every job a step must do while the build runs. A Zig 0.17 step
+  cannot run code of its own (`Step` has a closed set of tags and no
+  `makeFn`), and a program also avoids shell tools that differ between
+  platforms (`sed -i`, `zip`). Each command is a `command(process_init, args)`
+  method on the struct it serves (`ApkZip`, `Deb`, `Deps`, `Docs`, `Pkg`),
+  with `args[0]` the command's name; `Tool.dispatch` maps names to them. Name
+  the `std.process.Init` parameter `process_init`, since `init` shadows the
+  struct's `init`.
+- **Reaching the host tool:** `build.zig` installs it as the artifact
+  `zigbuildx`, and `HostTool.add(b)` finds this zigbuildx among the build
+  runner's packages by type identity (its `build.zig`'s `Deps` is this
+  `Deps`), then calls `dependencyFromBuildZig(...).artifact("zigbuildx")`.
+  So the consumer may name the dependency anything, and two zigbuildx
+  versions in one build each use their own tool.
 
 ## Gotchas
 
@@ -80,16 +92,33 @@ Beyond ZIGSTYLE:
 - **Tests and error logs:** the test runner fails any test that logs at error
   level, so test a failure path through a function that returns the error and
   let its caller log it (see `Android.resolveFrom` and `Android.resolve`).
-- **Paths needed at configure time.** `Xcode.linkLibCpp` writes its overlay
-  into `b.cache_root` while the graph is declared, because the libc file must
-  hold the overlay's absolute path. A `WriteFiles` output path is not known
-  until it runs.
+- **Configure is cached (Zig 0.17).** `build()` runs in a separate
+  configurer process, and Zig skips it when nothing it tracks changed: the
+  `-D` options, the build scripts and manifests, and files named with
+  `b.dependOn*`. Anything else `build()` observes (environment, `xcrun`,
+  directory listings, git state) must be declared: `b.dependOnFileMetadata`
+  and friends where a path captures it, else `b.graph.poisonCache()`, which
+  makes every build configure again. `Xcode.resolve` depends on the SDK's
+  `SDKSettings.json`; `Android.resolve`, `Deps.sync` (while worktrees exist)
+  and `Pkg` for Windows (`b.findProgram`) poison.
+- **No concrete paths at configure time.** `b.cache_root`,
+  `b.getInstallPath`, `b.pathFromRoot` and `LazyPath.getPath*` are gone; the
+  package root is `b.root` (a `Cache.Path`), and cache and install paths
+  exist only when a step runs. Work that needs them belongs in the host tool.
 - **`Deps` and the re-run.** `Deps` runs for the root package only (see
   `isPresent`), and its exit-and-re-run is required: a dependency cloned
   mid-`build()` resolves, but its own `build()` never runs.
 - **Run steps hash a directory argument's path, not its contents.** A
-  directory whose path never changes needs `has_side_effects` (the `.deb`
-  pack) or each file added with `addFileInput` (`Apk`'s `res/`).
+  directory whose path never changes needs `has_side_effects` (the `pkg`
+  run) or each file added with `addFileInput` (`Apk`'s `res/`, whose walk
+  also registers each directory with `dependOnDirectoryContents`).
+- **Deprecated in 0.17, and not to be used:** `Run.add*Arg` without `2`
+  (`addOutputFileArg2`, `addDirectoryArg2`, ...), `Compile.out_filename`
+  (`std.zig.binNameAlloc`, or the artifact's name), `LazyPath.cwd_relative`
+  (`b.graph.cwdRelativePath`), `std.fs.path` (`std.Io.Dir.path`, with
+  `resolveAlloc` and `relativeAlloc`), `std.fmt.allocPrint`
+  (`allocator.print`), `std.mem.indexOf*` (`std.mem.find*`), `std.builtin`
+  (`std.lang`). See `styleguide/ZIGMIGRATE.md`.
 - **A `.path` dependency is a compile error while missing.** So zigbuildx
   itself must be a `.url` + `.hash` dependency, and a top-level `@import` of
   a missing dependency's `build.zig` must be guarded with `Deps.isPresent`.
@@ -128,20 +157,23 @@ Beyond ZIGSTYLE:
     runner's table, so code after the call is not compiled; that lets a
     transitive top-level `@import` wait. A worktree dependency must have a
     `build.zig`, since Zig cannot tell one without from a missing one.
+  - **0.17:** the configurer still runs with a `.path` dependency missing,
+    and its `@import("root").dependencies` table still reports it. Its
+    `exit(1)` shows as `error: configure command exited with code 1`. `sync`
+    poisons the configure cache while worktrees or orphans exist; a root with
+    only unpinned dependencies keeps the cache. The `deps` step runs the host
+    tool's `deps` command, which reads the manifests again (no `git` in the
+    steady state) before `status` and `update`.
 - **`Git`:** one thin wrapper per command, given the directory git runs in;
   no manifest knowledge. `Deps` owns the policy.
 - **`Xcode`:**
   - `standardTargetOptions` adds `-Dmacos-min` on a macOS host; `-Dtarget`
     overrides it, carrying its own floor (`aarch64-macos.26.0`).
-  - `resolve` asks `xcrun` for the Apple Silicon SDK and is idempotent.
+  - `resolve(b)` asks `xcrun` for the Apple Silicon SDK and is idempotent.
+    `xcrun` names a versioned path (`MacOSX27.0.sdk`), so it makes the SDK's
+    `SDKSettings.json` a configure input; an Xcode update removes the path.
   - `linkFramework` adds the SDK's `System/Library/Frameworks`, which a
     floored (non-native) target otherwise never searches.
-  - `linkLibCpp` gives a macOS target a libc file whose include directory
-    holds a guarded `<math.h>` overlay; a libc file is the only setting that
-    reaches Zig's libc++ build. Elsewhere it is `link_libcpp` alone.
-- **`Archive`:** `install`, `addInstall` and `repack` extract the members and
-  re-archive them with `libtool`, and install headers as `installArtifact`
-  does. Off Apple targets they install unchanged.
 - **`Swift.addDylib`:** an `@rpath` install name; every source and the
   bridging header as file arguments, so edits rebuild it; two rpaths, the
   build cache (for tests) and `@executable_path/../lib` (added as a special
@@ -150,16 +182,20 @@ Beyond ZIGSTYLE:
 - **`Android`:** `resolve` takes the SDK from `ANDROID_HOME`,
   `ANDROID_SDK_ROOT` or Android Studio's default; the NDK from
   `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT` or the newest under the SDK; the
-  newest build-tools and platform; and the host's NDK prebuilt. `configure`
-  adds a libc file and 16 KB pages. Windows tools are `aapt2.exe`,
+  newest build-tools and platform; and the host's NDK prebuilt. `resolve`
+  poisons the configure cache (it reads the environment). `configure` adds a
+  libc file and 16 KB pages. Zig 0.17's libc file needs every field, including
+  `darwin_sdk_dir`, and takes a Linux target's `crtbegin`/`crtend` from
+  `cc_dir`, which is the NDK's per-API library directory, like `crt_dir`; a
+  test parses the file with `std.zig.LibCInstallation.parse`. Windows tools are `aapt2.exe`,
   `zipalign.exe`, `apksigner.bat`; `keytool` comes from `JAVA_HOME` or `PATH`.
-- **`Apk.add`:** `aapt2 compile` and `link`, then `apk-zip` adds each library
+- **`Apk.add`:** `aapt2 compile` and `link`, then the host tool's `apk-zip` adds each library
   under `lib/<abi>/` stored (Android maps them from the APK), `zipalign -P 16`
   and `apksigner`. Without a keystore it signs with Android Studio's debug
   keystore, else one generated into the cache.
-- **`Docs.includePrivate`:** copies the autodoc site and flips the two
-  `include_private` call sites in `main.js`; each pattern must occur once, so
-  a changed front end fails the build.
+- **`Docs.includePrivate`:** the host tool's `docs-patch` copies the autodoc
+  site and flips the two `include_private` call sites in `main.js`; each
+  pattern must occur once, so a changed front end fails the build.
 - **`Pkg`:**
   - **Identity:** id `<org>.<name>`; paths use the last label of `.org`.
   - **Scripts:** macOS `preinstall`, `postinstall`, `uninstall.sh` and Linux
@@ -168,34 +204,32 @@ Beyond ZIGSTYLE:
     The macOS scripts come from `~/src/inferise/pkg/zlintpre`, with one fix
     (`postinstall` tested `-d` on a file). The preinstall that runs the old
     `uninstall.sh`, wiping `/etc/<org>/<name>` on upgrade, is intended.
+  - **Steps:** `Pkg.add` declares; `PkgRun` (the host tool's `pkg`
+    command) stages and builds the macOS and Linux packages beside the Run
+    step's output, from `--key=value` options and the programs after `--`,
+    and deletes the stage. A problem (`.org` missing, mixed targets) becomes
+    a `Fail` step behind `zig build pkg`. `pkg-notarize` notarizes a copy of
+    the package and installs it over the plain one.
   - **macOS:** `Pkgbuild` signs each executable with `Developer ID
     Application` (hardened runtime, timestamp) and the `.pkg` with
     `Developer ID Installer`; `pkg-notarize` runs `notarytool --wait`
     (password visible in `ps` while it runs) and `stapler`.
   - **Linux:** the `deb` host tool writes the archive; entries are root-owned
     and dated 0. Unsigned; signing belongs to the apt repository.
-  - **Windows:** `Msi` renders WiX for `wixl`: per-user under
-    `%LOCALAPPDATA%`, the user `PATH`, GUIDs derived from the id. `wixl` has
-    no arm64 platform, so arm64 ships in an x86 installer. Without `wixl`,
-    the `.wxs` is written to `zig-out/pkg/` with the command to finish it.
+  - **Windows:** `Msi` renders WiX for `wixl` while the graph is declared:
+    per-user under `%LOCALAPPDATA%`, the user `PATH`, GUIDs derived from the
+    id. A `WriteFiles` step stages `bin/` and `product.wxs`, and `wixl` runs
+    in it. `wixl` has no arm64 platform, so arm64 ships in an x86 installer.
+    Without `wixl`, the stage is installed to
+    `zig-out/pkg/<name>-<version>-wix/` and the step fails with the command to
+    finish it.
 
 ## Workarounds
 
-Six exist only because of Zig 0.16.0 or the macOS 27 SDK. Each can be deleted
+Four remain, because of Zig 0.17.0 or the macOS 27 SDK. Each can be deleted
 on its own when the cause goes away; a release for a later Zig starts by
 re-checking every one.
 
-- **Misaligned archive members (`Archive`).** Zig 0.16.0 does not 8-byte-align
-  members; Apple's `ld` skips a misaligned one ("64-bit mach-o not 8-byte
-  aligned") and the link fails on missing symbols, coming and going as the
-  library grows. `libtool -static -o out.a in.a` silently drops the member,
-  hence the extraction. Remove when an installed archive's member offsets are
-  aligned.
-- **`INFINITY` undeclared in libc++ (`Xcode.linkLibCpp`).** On a macOS 27
-  host every C++ link fails in Zig's libc++: Zig builds it as C++23, and SDK
-  27's `<math.h>` leaves `INFINITY` and `NAN` to `<float.h>` from C++20 on,
-  which Zig 0.16's clang does not supply. Remove when a C++20
-  `std::uniform_real_distribution` program links with plain `link_libcpp`.
 - **A floor loses the SDK's frameworks (`Xcode.linkFramework`).** Any
   `os_version_min` makes the target non-native, and Zig then searches no SDK
   framework directory ("searched paths: none"); `--sysroot` does not help.
@@ -204,11 +238,17 @@ re-checking every one.
   A native build on macOS 27 is stamped 27.0, so older consumers' linkers warn
   "built for newer 'macOS' version" and Swift shims see 27-only deprecations.
   Never removed on its own: it is how a deployment target is stated.
-- **No Android C library (`Android.configure`).** Zig 0.16.0 ships no bionic;
+- **No Android C library (`Android.configure`).** Zig 0.17.0 ships no bionic;
   a libc file points at the NDK sysroot. Remove when Zig ships it.
 - **Autodoc hides private declarations (`Docs.includePrivate`).** The front
   end passes `include_private = false` at two call sites. Remove when `zig
   build docs` gains an option, or at once if the patch reports a change.
+
+Removed in 2.0.0, both checked on 0.17.0 before removal: `Archive`, since Zig
+now 8-byte-aligns archive members (a 0.16 archive of seven objects had three
+misaligned, a 0.17 one none); and `Xcode.linkLibCpp`, since a C++20
+`std::uniform_real_distribution` program links with plain `link_libcpp` on
+SDK 27, native and floored at 26.0.
 
 ## Verifying
 
@@ -216,7 +256,7 @@ Unit tests cannot cover how the build graph is wired. Use a scratch consumer
 package outside this repo:
 
 ```sh
-zig fetch --save=zigbuildx ../zigbuildx   # from the scratch package; local url + hash
+zig17 fetch --save=zigbuildx ../zigbuildx   # from the scratch package; local url + hash
 ```
 
 Re-run that fetch after every change to zigbuildx, because the hash pins the
@@ -230,14 +270,14 @@ contents.
   linking libc needs the real NDK, so check `configure` from the failing link
   command instead, which shows `--libc` and `-z max-page-size=16384`.
 - **Linux:** run it in podman with Debian, installing `xz-utils curl git` and
-  extracting `https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz`
-  into `/opt`. Two tests are skipped there by design: the `xcrun` SDK lookup
-  and the `libtool` repack.
+  extracting `https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz`
+  into `/opt`. One test is skipped there by design: the `xcrun` SDK lookup.
+  `zig build pkg` in a scratch consumer there gives a `.deb` that `dpkg -i`
+  installs.
 - **Windows:** compile only, via `make cross`. Nothing here runs Windows
   binaries.
-- **The macOS 27 C++ failure:** a C++20 program using
-  `std::uniform_real_distribution` reproduces it. It fails with plain
-  `link_libcpp` and links with `xcode.linkLibCpp`.
+- **Configure caching:** run `zig build` twice; the second skips `build()`.
+  A `std.debug.print` in the scratch `build.zig` shows whether it ran.
 
 ## Adopters
 
@@ -251,10 +291,17 @@ All four reference zigbuildx with a local `.url = "../zigbuildx"` and
 | zigwebrtc | `Archive`, `Xcode` floor 26.0 |
 | zigafm | `Deps`, `Xcode` floor 26.0, `Swift`, `Archive` |
 
-- **Pins have diverged.** All four pin version `1.0.0`, but with different
-  contents: zigclaude's includes `Deps.sync`, and zigstorage's is newer than
-  the other two. Bump the version on a change, then re-fetch in each adopter
-  that needs it.
+- **Pins have diverged.** All four pin version `1.0.0` (Zig 0.16), but with
+  different contents: zigclaude's includes `Deps.sync`, and zigstorage's is
+  newer than the other two. Bump the version on a change, then re-fetch in
+  each adopter that needs it.
+- **None is on 2.0.0 yet.** Moving one to Zig 0.17 and zigbuildx 2.0.0 means:
+  - **`Archive`:** `Archive.install(b, lib)` becomes `b.installArtifact(lib)`,
+    and `Archive.addInstall(b, lib)` becomes
+    `&b.addInstallArtifact(lib, .{}).step`.
+  - **`Xcode`:** `xcode.resolve()` becomes `xcode.resolve(b)`.
+  - **Its own 0.17 port:** `ZIGMIGRATE.md`'s 0.16-to-0.17 section, e.g.
+    `.ReleaseFast` to `.fast` and `b.build_root` to `b.root`.
 - **After pushing**, change each adopter's `.url` to
   `git+https://github.com/mlavergn/zigbuildx#<commit>`. The hash is unchanged
   if the pushed files match.
@@ -282,9 +329,10 @@ All four reference zigbuildx with a local `.url = "../zigbuildx"` and
 - **zigagent:** adopt `Xcode.standardTargetOptions(b, "26.0")`. Without a
   floor, the `libafm.dylib` it builds through zigafm is stamped macOS 27.0, and
   `swiftc` warns about an API deprecated in 27.
-- **llama.cpp.zmake** (`~/src/mlavergn/llamazig`) could replace its Apple
-  libc++ workaround with `xcode.linkLibCpp`. Output is identical, but the C++
-  runtime changes from Apple's dylib to Zig's static libc++. The owner's call.
+- **llama.cpp.zmake** (`~/src/mlavergn/llamazig`) could drop its Apple
+  libc++ workaround once on Zig 0.17, where plain `link_libcpp` links on SDK
+  27. The C++ runtime then changes from Apple's dylib to Zig's static libc++.
+  The owner's call.
 - **Other repos** could adopt `Docs.includePrivate`, a one-line change on each
   docs install step.
 - **zigstorage's `make lint`** walks `zig-pkg/`. Give it an explicit file list,

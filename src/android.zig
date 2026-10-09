@@ -140,12 +140,18 @@ pub const Android = struct {
     /// Studio's default for the host. The NDK is `$ANDROID_NDK_HOME`, else
     /// `$ANDROID_NDK_ROOT`, else the newest under the SDK's `ndk/`.
     ///
+    /// Zig 0.17 reuses a configured build graph until something it was told
+    /// about changes, and it is told nothing about the environment or about a
+    /// newer build-tools or NDK appearing, so this poisons the configure cache:
+    /// every build that resolves Android configures again.
+    ///
     /// Parameters:
     /// - `self`: the handle to populate.
     /// - `b`: the build graph, whose environment and host are read.
     ///
     /// Return: nothing; `error.AndroidSdkNotFound` naming what is missing.
     pub fn resolve(self: *Self, b: *std.Build) !void {
+        b.graph.poisonCache();
         self.resolveFrom(&b.graph.environ_map, b.graph.host.result.os.tag) catch |err| {
             log.err("{s} not found: {s} (set ANDROID_HOME and ANDROID_NDK_HOME)", .{ @errorName(err), self.missing });
             return err;
@@ -197,7 +203,7 @@ pub const Android = struct {
         // apksigner is a Java launcher script, a batch file on Windows.
         const ext = if (self.host != .windows) "" else if (std.mem.eql(u8, name, "apksigner")) ".bat" else ".exe";
         const file = std.mem.concat(allocator, u8, &.{ name, ext }) catch @panic("OOM");
-        return std.fs.path.join(allocator, &.{ self.build_tools, file }) catch @panic("OOM");
+        return std.Io.Dir.path.join(allocator, &.{ self.build_tools, file }) catch @panic("OOM");
     }
 
     /// Returns JDK program `name`: under `$JAVA_HOME/bin` when set, else bare, for `PATH` to find.
@@ -211,7 +217,7 @@ pub const Android = struct {
         const allocator = self.arena.allocator();
         const file = if (self.host == .windows) std.mem.concat(allocator, u8, &.{ name, ".exe" }) catch @panic("OOM") else name;
         const bin = self.java_bin orelse return file;
-        return std.fs.path.join(allocator, &.{ bin, file }) catch @panic("OOM");
+        return std.Io.Dir.path.join(allocator, &.{ bin, file }) catch @panic("OOM");
     }
 
     /// Populates the handle from `environ` for a `host` build.
@@ -232,34 +238,34 @@ pub const Android = struct {
         cwd.access(self.io, sdk, .{}) catch return error.AndroidSdkNotFound;
         self.sdk = try allocator.dupe(u8, sdk);
 
-        const build_tools = try std.fs.path.join(allocator, &.{ sdk, "build-tools" });
+        const build_tools = try std.Io.Dir.path.join(allocator, &.{ sdk, "build-tools" });
         self.missing = build_tools;
-        self.build_tools = try std.fs.path.join(allocator, &.{ build_tools, try self.newest(build_tools) orelse return error.AndroidBuildToolsNotFound });
+        self.build_tools = try std.Io.Dir.path.join(allocator, &.{ build_tools, try self.newest(build_tools) orelse return error.AndroidBuildToolsNotFound });
 
-        const platforms = try std.fs.path.join(allocator, &.{ sdk, "platforms" });
+        const platforms = try std.Io.Dir.path.join(allocator, &.{ sdk, "platforms" });
         self.missing = platforms;
         const platform = try self.newest(platforms) orelse return error.AndroidPlatformNotFound;
-        self.android_jar = try std.fs.path.join(allocator, &.{ platforms, platform, "android.jar" });
+        self.android_jar = try std.Io.Dir.path.join(allocator, &.{ platforms, platform, "android.jar" });
         self.missing = self.android_jar;
         cwd.access(self.io, self.android_jar, .{}) catch return error.AndroidPlatformNotFound;
 
         const ndk = environ.get("ANDROID_NDK_HOME") orelse environ.get("ANDROID_NDK_ROOT") orelse ndk: {
-            const ndks = try std.fs.path.join(allocator, &.{ sdk, "ndk" });
+            const ndks = try std.Io.Dir.path.join(allocator, &.{ sdk, "ndk" });
             self.missing = ndks;
-            break :ndk try std.fs.path.join(allocator, &.{ ndks, try self.newest(ndks) orelse return error.AndroidNdkNotFound });
+            break :ndk try std.Io.Dir.path.join(allocator, &.{ ndks, try self.newest(ndks) orelse return error.AndroidNdkNotFound });
         };
         self.ndk = try allocator.dupe(u8, ndk);
         const prebuilt = Self.hostTag(host) orelse {
             self.missing = @tagName(host);
             return error.UnsupportedHost;
         };
-        self.sysroot = try std.fs.path.join(allocator, &.{ ndk, "toolchains", "llvm", "prebuilt", prebuilt, "sysroot" });
+        self.sysroot = try std.Io.Dir.path.join(allocator, &.{ ndk, "toolchains", "llvm", "prebuilt", prebuilt, "sysroot" });
         self.missing = self.sysroot;
         cwd.access(self.io, self.sysroot, .{}) catch return error.AndroidNdkNotFound;
 
-        if (environ.get("JAVA_HOME")) |java_home| self.java_bin = try std.fs.path.join(allocator, &.{ java_home, "bin" });
+        if (environ.get("JAVA_HOME")) |java_home| self.java_bin = try std.Io.Dir.path.join(allocator, &.{ java_home, "bin" });
         if (Self.home(environ, host)) |user_home| {
-            const keystore = try std.fs.path.join(allocator, &.{ user_home, ".android", "debug.keystore" });
+            const keystore = try std.Io.Dir.path.join(allocator, &.{ user_home, ".android", "debug.keystore" });
             if (cwd.access(self.io, keystore, .{})) |_| self.debug_keystore = keystore else |_| {}
         }
         self.missing = "";
@@ -267,6 +273,10 @@ pub const Android = struct {
     }
 
     /// Returns the libc file that points Zig at the NDK sysroot for `abi` at `api`.
+    ///
+    /// Zig 0.17 takes a Linux target's `crtbegin` and `crtend` from `cc_dir`;
+    /// the NDK keeps `crtbegin_so.o` and `crtend_so.o` beside the other
+    /// startup objects, so `cc_dir` is `crt_dir`.
     ///
     /// Parameters:
     /// - `self`: a resolved handle.
@@ -276,18 +286,19 @@ pub const Android = struct {
     /// Return: the file's text, owned by the handle.
     fn libCText(self: *Self, abi: AndroidAbi, api: u32) ![]const u8 {
         const allocator = self.arena.allocator();
-        const include = try std.fs.path.join(allocator, &.{ self.sysroot, "usr", "include" });
-        const sys_include = try std.fs.path.join(allocator, &.{ include, abi.triple() });
-        const crt = try std.fs.path.join(allocator, &.{ self.sysroot, "usr", "lib", abi.triple(), try std.fmt.allocPrint(allocator, "{d}", .{api}) });
-        return std.fmt.allocPrint(allocator,
+        const include = try std.Io.Dir.path.join(allocator, &.{ self.sysroot, "usr", "include" });
+        const sys_include = try std.Io.Dir.path.join(allocator, &.{ include, abi.triple() });
+        const crt = try std.Io.Dir.path.join(allocator, &.{ self.sysroot, "usr", "lib", abi.triple(), try allocator.print("{d}", .{api}) });
+        return allocator.print(
             \\include_dir={s}
             \\sys_include_dir={s}
             \\crt_dir={s}
             \\msvc_lib_dir=
             \\kernel32_lib_dir=
-            \\gcc_dir=
+            \\cc_dir={s}
+            \\darwin_sdk_dir=
             \\
-        , .{ include, sys_include, crt });
+        , .{ include, sys_include, crt, crt });
     }
 
     /// Returns the newest entry of directory `path`, comparing the numbers in each name.
@@ -362,11 +373,11 @@ pub const Android = struct {
     fn defaultSdk(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, host: std.Target.Os.Tag) ![]const u8 {
         if (host == .windows) {
             const local = environ.get("LOCALAPPDATA") orelse return error.AndroidSdkNotFound;
-            return std.fs.path.join(allocator, &.{ local, "Android", "Sdk" });
+            return std.Io.Dir.path.join(allocator, &.{ local, "Android", "Sdk" });
         }
         const user_home = Self.home(environ, host) orelse return error.AndroidSdkNotFound;
-        if (host == .macos) return std.fs.path.join(allocator, &.{ user_home, "Library", "Android", "sdk" });
-        return std.fs.path.join(allocator, &.{ user_home, "Android", "Sdk" });
+        if (host == .macos) return std.Io.Dir.path.join(allocator, &.{ user_home, "Library", "Android", "sdk" });
+        return std.Io.Dir.path.join(allocator, &.{ user_home, "Android", "Sdk" });
     }
 
     /// Returns the user's home directory.
@@ -436,7 +447,7 @@ test "resolve picks the newest of each, and the sysroot for every host" {
     try makeFakeSdk(io, tmp.dir);
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
-    const sdk = try std.fs.path.join(allocator, &.{ root, "sdk" });
+    const sdk = try std.Io.Dir.path.join(allocator, &.{ root, "sdk" });
     defer allocator.free(sdk);
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
@@ -447,9 +458,9 @@ test "resolve picks the newest of each, and the sysroot for every host" {
         defer android.deinit();
         try android.resolveFrom(&environ, host);
         try std.testing.expect(std.mem.endsWith(u8, android.build_tools, "35.0.1"));
-        try std.testing.expect(std.mem.indexOf(u8, android.android_jar, "android-35") != null);
-        try std.testing.expect(std.mem.indexOf(u8, android.ndk, "27.2.12479018") != null);
-        try std.testing.expect(std.mem.indexOf(u8, android.sysroot, Android.hostTag(host).?) != null);
+        try std.testing.expect(std.mem.find(u8, android.android_jar, "android-35") != null);
+        try std.testing.expect(std.mem.find(u8, android.ndk, "27.2.12479018") != null);
+        try std.testing.expect(std.mem.find(u8, android.sysroot, Android.hostTag(host).?) != null);
         const aapt2 = android.tool("aapt2");
         const apksigner = android.tool("apksigner");
         if (host == .windows) {
@@ -461,8 +472,15 @@ test "resolve picks the newest of each, and the sysroot for every host" {
         }
 
         const text = try android.libCText(.arm64V8a, 30);
-        try std.testing.expect(std.mem.indexOf(u8, text, "sys_include_dir=") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "aarch64-linux-android") != null);
+        try std.testing.expect(std.mem.find(u8, text, "sys_include_dir=") != null);
+        // Zig's own parser: it rejects a file missing any field its release expects.
+        try tmp.dir.writeFile(io, .{ .sub_path = "libc.txt", .data = text });
+        const libc_path = try std.Io.Dir.path.join(allocator, &.{ root, "libc.txt" });
+        defer allocator.free(libc_path);
+        const target = try std.zig.system.resolveTargetQuery(io, AndroidAbi.arm64V8a.query(30));
+        var libc = try std.zig.LibCInstallation.parse(allocator, io, libc_path, &target);
+        libc.deinit(allocator);
+        try std.testing.expect(std.mem.find(u8, text, "aarch64-linux-android") != null);
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
             if (std.mem.startsWith(u8, line, "crt_dir=")) try std.testing.expect(std.mem.endsWith(u8, line, "30"));
@@ -478,9 +496,9 @@ test "an explicit NDK wins over the SDK's newest" {
     try makeFakeSdk(io, tmp.dir);
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
-    const sdk = try std.fs.path.join(allocator, &.{ root, "sdk" });
+    const sdk = try std.Io.Dir.path.join(allocator, &.{ root, "sdk" });
     defer allocator.free(sdk);
-    const ndk = try std.fs.path.join(allocator, &.{ sdk, "ndk", "26.3.11579264" });
+    const ndk = try std.Io.Dir.path.join(allocator, &.{ sdk, "ndk", "26.3.11579264" });
     defer allocator.free(ndk);
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
@@ -490,7 +508,7 @@ test "an explicit NDK wins over the SDK's newest" {
     var android = try Android.init(allocator, io);
     defer android.deinit();
     try android.resolveFrom(&environ, .macos);
-    try std.testing.expect(std.mem.indexOf(u8, android.sysroot, "26.3.11579264") != null);
+    try std.testing.expect(std.mem.find(u8, android.sysroot, "26.3.11579264") != null);
     // Only the darwin sysroot exists in the older NDK.
     var linux = try Android.init(allocator, io);
     defer linux.deinit();

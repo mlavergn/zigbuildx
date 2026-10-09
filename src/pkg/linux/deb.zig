@@ -178,7 +178,7 @@ pub const Deb = struct {
     ///
     /// Return: the mode.
     fn fileMode(path: []const u8, permissions: std.Io.File.Permissions) u32 {
-        if (std.mem.startsWith(u8, path, "bin/") or std.mem.indexOf(u8, path, "/bin/") != null) return 0o755;
+        if (std.mem.startsWith(u8, path, "bin/") or std.mem.find(u8, path, "/bin/") != null) return 0o755;
         for (Self.scripts) |script| {
             if (std.mem.eql(u8, path, script)) return 0o755;
         }
@@ -196,9 +196,9 @@ pub const Deb = struct {
     /// Return: the control file with the field, owned by the caller.
     fn withInstalledSize(allocator: std.mem.Allocator, control: []const u8, kib: u64) ![]u8 {
         const trimmed = std.mem.trimEnd(u8, control, "\n");
-        const field = try std.fmt.allocPrint(allocator, "Installed-Size: {d}\n", .{kib});
+        const field = try allocator.print("Installed-Size: {d}\n", .{kib});
         defer allocator.free(field);
-        const at = if (std.mem.indexOf(u8, trimmed, "\nDescription:")) |i| i + 1 else trimmed.len + 1;
+        const at = if (std.mem.find(u8, trimmed, "\nDescription:")) |i| i + 1 else trimmed.len + 1;
         if (at > trimmed.len) return std.mem.concat(allocator, u8, &.{ trimmed, "\n", field });
         return std.mem.concat(allocator, u8, &.{ trimmed[0..at], field, trimmed[at..], "\n" });
     }
@@ -222,7 +222,7 @@ pub const Deb = struct {
         try tar.writeDir("./", .{ .mode = 0o755 });
         var buffer: [1 << 16]u8 = undefined;
         for (entries) |entry| {
-            const name = try std.fmt.allocPrint(self.allocator, "./{s}", .{entry.path});
+            const name = try self.allocator.print("./{s}", .{entry.path});
             defer self.allocator.free(name);
             switch (entry.kind) {
                 .directory => try tar.writeDir(name, .{ .mode = entry.mode }),
@@ -256,30 +256,30 @@ pub const Deb = struct {
         try writer.writeAll(data);
         if (data.len % 2 == 1) try writer.writeByte('\n');
     }
-};
 
-/// `deb <staging> <out.deb>`: packs a staged tree into a `.deb`.
-///
-/// Parameters:
-/// - `init`: the process's allocator, IO and arguments.
-///
-/// Return: nothing; `error.InvalidArguments` on a bad command line, or IO errors.
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    const io = init.io;
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 3) {
-        log.err("usage: deb <staging> <out.deb>", .{});
-        return error.InvalidArguments;
+    /// `zigbuildx deb <staging> <out.deb>`: packs a staged tree into a `.deb`.
+    ///
+    /// Parameters:
+    /// - `process_init`: the process's allocator and IO.
+    /// - `args`: the command line after the program's path; `args[0]` is the command.
+    ///
+    /// Return: nothing; `error.InvalidArguments` on a bad command line, or IO errors.
+    pub fn command(process_init: std.process.Init, args: []const [:0]const u8) !void {
+        const allocator = process_init.gpa;
+        const io = process_init.io;
+        if (args.len != 3) {
+            log.err("usage: zigbuildx deb <staging> <out.deb>", .{});
+            return error.InvalidArguments;
+        }
+        const cwd = std.Io.Dir.cwd();
+        var staging = try cwd.openDir(io, args[1], .{});
+        defer staging.close(io);
+        const packer = try Self.init(allocator, io);
+        const deb = try packer.pack(staging);
+        defer allocator.free(deb);
+        try cwd.writeFile(io, .{ .sub_path = args[2], .data = deb });
     }
-    const cwd = std.Io.Dir.cwd();
-    var staging = try cwd.openDir(io, args[1], .{});
-    defer staging.close(io);
-    const packer = try Deb.init(allocator, io);
-    const deb = try packer.pack(staging);
-    defer allocator.free(deb);
-    try cwd.writeFile(io, .{ .sub_path = args[2], .data = deb });
-}
+};
 
 // -----------------------------------------------------------------------------
 // Unit Tests

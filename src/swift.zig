@@ -14,7 +14,7 @@ pub const SwiftDylib = struct {
     bridging_header: ?std.Build.LazyPath = null,
     /// The target: its architecture and macOS floor become `swiftc`'s `-target`.
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     swift_version: []const u8 = "6",
 };
 
@@ -55,9 +55,9 @@ pub const Swift = struct {
             "-swift-version",
             options.swift_version,
             switch (options.optimize) {
-                .Debug => "-Onone",
-                .ReleaseSmall => "-Osize",
-                .ReleaseSafe, .ReleaseFast => "-O",
+                .debug => "-Onone",
+                .small => "-Osize",
+                .safe, .fast => "-O",
             },
             "-Xlinker",
             "-install_name",
@@ -70,7 +70,7 @@ pub const Swift = struct {
             swiftc.addFileArg(header);
         }
         swiftc.addArg("-o");
-        const dylib = swiftc.addOutputFileArg(file_name);
+        const dylib = swiftc.addOutputFileArg2(file_name, .{});
         for (options.sources) |source| swiftc.addFileArg(source);
         b.addNamedLazyPath(b.fmt("lib{s}", .{options.name}), dylib);
         return dylib;
@@ -143,7 +143,7 @@ pub const Swift = struct {
             else => @tagName(target.cpu.arch),
         };
         const min = target.os.version_range.semver.min;
-        return std.fmt.allocPrint(allocator, "{s}-apple-macos{d}.{d}", .{ arch, min.major, min.minor });
+        return allocator.print("{s}-apple-macos{d}.{d}", .{ arch, min.major, min.minor });
     }
 };
 
