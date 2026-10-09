@@ -1,5 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zigbuildx_docs);
+const mod = @import("module.zig");
 
 /// Extends Zig's generated documentation.
 ///
@@ -9,15 +10,12 @@ const log = std.log.scoped(.zigbuildx_docs);
 /// `--symbol-graph-minimum-access-level internal` does. Only the emitted copy
 /// is changed, never the toolchain.
 ///
-/// This file is both the extension and the program that does the patching:
-/// `includePrivate` compiles this same file for the build host and runs it as
-/// `docs-patch <in-dir> <out-dir>`, which copies an autodoc site, patching its
-/// `main.js`. Compiled alone, it has no `module.zig` beside it, so it imports
-/// only `std`.
+/// The patching is done by the host tool's `docs-patch` command, which copies
+/// an autodoc site, patching its `main.js`.
 pub const Docs = struct {
     const Self = @This();
 
-    /// The two call sites in Zig 0.16.0's `lib/docs/main.js`, and what each becomes.
+    /// The two call sites in Zig 0.17.0's `lib/docs/main.js`, and what each becomes.
     pub const replacements = [_][2][]const u8{
         .{ "type_fn_members(decl_index, false)", "type_fn_members(decl_index, true)" },
         .{ "namespaceMembers(decl_index, false)", "namespaceMembers(decl_index, true)" },
@@ -36,18 +34,11 @@ pub const Docs = struct {
     ///
     /// Return: the patched site's directory, for `b.addInstallDirectory`.
     pub fn includePrivate(b: *std.Build, docs: std.Build.LazyPath) std.Build.LazyPath {
-        // This file, compiled for the host: the same thing HostTool.add does,
-        // which this file cannot import when it is compiled alone.
-        const source = b.addWriteFiles().add("docs.zig", @embedFile("docs.zig"));
-        const tool = b.addExecutable(.{ .name = "docs-patch", .root_module = b.createModule(.{
-            .root_source_file = source,
-            .target = b.graph.host,
-            .optimize = .ReleaseSafe,
-        }) });
-        const run = b.addRunArtifact(tool);
+        const run = b.addRunArtifact(mod.HostTool.add(b));
         run.setName("docs include private");
-        run.addDirectoryArg(docs);
-        return run.addOutputDirectoryArg("docs");
+        run.addArg("docs-patch");
+        run.addDirectoryArg2(docs, .{});
+        return run.addOutputDirectoryArg2("docs", .{});
     }
 
     /// Returns `js` with each replacement applied.
@@ -76,56 +67,56 @@ pub const Docs = struct {
         }
         return current;
     }
-};
 
-/// `docs-patch <in-dir> <out-dir>`: copies the autodoc site at `in-dir`, patching `main.js`.
-///
-/// Parameters:
-/// - `init`: the process's allocator, IO and arguments.
-///
-/// Return: nothing; `error.InvalidArguments` on a bad command line,
-/// `error.AutodocChanged` when the site has no patchable `main.js`, or IO errors.
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    const io = init.io;
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 3) {
-        log.err("usage: docs-patch <in-dir> <out-dir>", .{});
-        return error.InvalidArguments;
-    }
-    const cwd = std.Io.Dir.cwd();
-    var in = try cwd.openDir(io, args[1], .{ .iterate = true });
-    defer in.close(io);
-    try cwd.createDirPath(io, args[2]);
-    var out = try cwd.openDir(io, args[2], .{});
-    defer out.close(io);
+    /// `zigbuildx docs-patch <in-dir> <out-dir>`: copies the autodoc site at `in-dir`, patching `main.js`.
+    ///
+    /// Parameters:
+    /// - `process_init`: the process's allocator and IO.
+    /// - `args`: the command line after the program's path; `args[0]` is the command.
+    ///
+    /// Return: nothing; `error.InvalidArguments` on a bad command line,
+    /// `error.AutodocChanged` when the site has no patchable `main.js`, or IO errors.
+    pub fn command(process_init: std.process.Init, args: []const [:0]const u8) !void {
+        const allocator = process_init.gpa;
+        const io = process_init.io;
+        if (args.len != 3) {
+            log.err("usage: zigbuildx docs-patch <in-dir> <out-dir>", .{});
+            return error.InvalidArguments;
+        }
+        const cwd = std.Io.Dir.cwd();
+        var in = try cwd.openDir(io, args[1], .{ .iterate = true });
+        defer in.close(io);
+        try cwd.createDirPath(io, args[2]);
+        var out = try cwd.openDir(io, args[2], .{});
+        defer out.close(io);
 
-    var patched = false;
-    var walker = try in.walk(allocator);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        switch (entry.kind) {
-            .directory => try out.createDirPath(io, entry.path),
-            .file => {
-                const data = try in.readFileAlloc(io, entry.path, allocator, .unlimited);
-                defer allocator.free(data);
-                if (!std.mem.eql(u8, entry.path, "main.js")) {
-                    try out.writeFile(io, .{ .sub_path = entry.path, .data = data });
-                    continue;
-                }
-                const js = try Docs.patch(allocator, data);
-                defer allocator.free(js);
-                try out.writeFile(io, .{ .sub_path = entry.path, .data = js });
-                patched = true;
-            },
-            else => {},
+        var patched = false;
+        var walker = try in.walk(allocator);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            switch (entry.kind) {
+                .directory => try out.createDirPath(io, entry.path),
+                .file => {
+                    const data = try in.readFileAlloc(io, entry.path, allocator, .unlimited);
+                    defer allocator.free(data);
+                    if (!std.mem.eql(u8, entry.path, "main.js")) {
+                        try out.writeFile(io, .{ .sub_path = entry.path, .data = data });
+                        continue;
+                    }
+                    const js = try Self.patch(allocator, data);
+                    defer allocator.free(js);
+                    try out.writeFile(io, .{ .sub_path = entry.path, .data = js });
+                    patched = true;
+                },
+                else => {},
+            }
+        }
+        if (!patched) {
+            log.err("{s} has no main.js: not an autodoc site", .{args[1]});
+            return error.AutodocChanged;
         }
     }
-    if (!patched) {
-        log.err("{s} has no main.js: not an autodoc site", .{args[1]});
-        return error.AutodocChanged;
-    }
-}
+};
 
 // -----------------------------------------------------------------------------
 // Unit Tests
@@ -139,8 +130,8 @@ test "patch flips both call sites" {
     ;
     const out = try Docs.patch(allocator, js);
     defer allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "type_fn_members(decl_index, true)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "namespaceMembers(decl_index, true)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "decl_index, false") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "function namespaceMembers(decl_index, include_private)") != null);
+    try std.testing.expect(std.mem.find(u8, out, "type_fn_members(decl_index, true)") != null);
+    try std.testing.expect(std.mem.find(u8, out, "namespaceMembers(decl_index, true)") != null);
+    try std.testing.expect(std.mem.find(u8, out, "decl_index, false") == null);
+    try std.testing.expect(std.mem.find(u8, out, "function namespaceMembers(decl_index, include_private)") != null);
 }

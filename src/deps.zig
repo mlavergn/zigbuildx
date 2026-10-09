@@ -80,7 +80,7 @@ const Stamp = struct {
     ///
     /// Return: the text, owned by the caller.
     fn serialize(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(allocator, "{t}\n{s}\n{s}\n{s}\n{s}\n", .{ self.pin.kind, self.pin.value, self.sha, self.branch, self.checkout });
+        return allocator.print("{t}\n{s}\n{s}\n{s}\n{s}\n", .{ self.pin.kind, self.pin.value, self.sha, self.branch, self.checkout });
     }
 };
 
@@ -116,27 +116,27 @@ const Manifest = struct {
     ///
     /// Return: the manifest; `error.InvalidManifest` when it is not ZON of the expected shape.
     fn parse(allocator: std.mem.Allocator, source: [:0]const u8) !Self {
-        var ast = try std.zig.Ast.parse(allocator, source, .zon);
+        var ast = try std.zig.Ast.parse(allocator, source, .{ .mode = .zon });
         defer ast.deinit(allocator);
         if (ast.errors.len > 0) return error.InvalidManifest;
         const zoir = try std.zig.ZonGen.generate(allocator, ast, .{});
         defer zoir.deinit(allocator);
         if (zoir.hasCompileErrors()) return error.InvalidManifest;
-        const top = switch (std.zig.Zoir.Node.Index.root.get(zoir)) {
+        const top = switch (std.zig.Zoir.Node.Index.root.get(&zoir)) {
             .struct_literal => |fields| fields,
             else => return error.InvalidManifest,
         };
         var self = Self{ .name = "", .entries = &.{} };
         for (top.names, 0..) |key, i| {
-            const value = top.vals.at(@intCast(i)).get(zoir);
-            if (std.mem.eql(u8, key.get(zoir), "name")) {
+            const value = top.vals.at(@intCast(i)).get(&zoir);
+            if (std.mem.eql(u8, key.get(&zoir), "name")) {
                 self.name = try allocator.dupe(u8, switch (value) {
-                    .enum_literal => |name| name.get(zoir),
+                    .enum_literal => |name| name.get(&zoir),
                     .string_literal => |name| name,
                     else => return error.InvalidManifest,
                 });
-            } else if (std.mem.eql(u8, key.get(zoir), "dependencies")) {
-                self.entries = try Self.parseEntries(allocator, zoir, value);
+            } else if (std.mem.eql(u8, key.get(&zoir), "dependencies")) {
+                self.entries = try Self.parseEntries(allocator, &zoir, value);
             }
         }
         return self;
@@ -150,7 +150,7 @@ const Manifest = struct {
     /// - `node`: the `.dependencies` value.
     ///
     /// Return: the entries; `error.InvalidManifest` when a dependency is not a struct literal.
-    fn parseEntries(allocator: std.mem.Allocator, zoir: std.zig.Zoir, node: std.zig.Zoir.Node) ![]const Entry {
+    fn parseEntries(allocator: std.mem.Allocator, zoir: *const std.zig.Zoir, node: std.zig.Zoir.Node) ![]const Entry {
         const deps = switch (node) {
             .struct_literal => |fields| fields,
             .empty_literal => return &.{},
@@ -257,11 +257,11 @@ const Sync = struct {
         const manifest = try self.readManifest(self.root) orelse return self.fail("no build.zig.zon in {s}", .{self.root});
         self.consumer = manifest.name;
         try self.collect(manifest, self.root, self.root);
-        const deps = try std.fs.path.join(self.allocator, &.{ self.root, "deps" });
+        const deps = try std.Io.Dir.path.join(self.allocator, &.{ self.root, "deps" });
         if (self.worktrees.items.len == 0 and !try self.exists(deps)) return;
-        const state = try std.fs.path.join(self.allocator, &.{ deps, ".zigbuildx" });
+        const state = try std.Io.Dir.path.join(self.allocator, &.{ deps, ".zigbuildx" });
         try std.Io.Dir.cwd().createDirPath(self.io, state);
-        const lock_path = try std.fs.path.join(self.allocator, &.{ state, "lock" });
+        const lock_path = try std.Io.Dir.path.join(self.allocator, &.{ state, "lock" });
         // Serialises concurrent builds of this consumer; released when the file closes.
         const lock = try std.Io.Dir.cwd().createFile(self.io, lock_path, .{ .lock = .exclusive });
         defer lock.close(self.io);
@@ -301,13 +301,13 @@ const Sync = struct {
                 if (pin != null and is_root) return self.fail("{s} pins {s}, which is not a worktree dependency (its .path must be under deps/)", .{ manifest.name, entry.name });
                 continue;
             };
-            const resolved = try std.fs.path.resolve(self.allocator, &.{ dir, path });
+            const resolved = try std.Io.Dir.path.resolveAlloc(self.allocator, &.{ dir, path });
             const pinnable = self.isWorktreePath(resolved);
             if (pin != null and !pinnable) {
                 if (is_root) return self.fail("{s} pins {s}, but a pinned dependency's .path must be under deps/", .{ manifest.name, entry.name });
                 continue;
             }
-            const rel = try std.fs.path.relative(self.allocator, self.root, null, self.root, resolved);
+            const rel = try std.Io.Dir.path.relativeAlloc(self.allocator, self.root, null, self.root, resolved);
             // The first declaration of a path wins, pinned or not.
             if (self.find(resolved)) |existing| {
                 if (pin) |wanted| if (!existing.pin.satisfies(wanted)) log.warn("{s} pins {s} to {t} {s}; using {s}'s {t} {s}", .{ manifest.name, existing.rel, wanted.kind, wanted.value, existing.declared_by, existing.pin.kind, existing.pin.value });
@@ -328,7 +328,7 @@ const Sync = struct {
                 .dir = resolved,
                 .rel = rel,
                 .pin = wanted,
-                .checkout = try std.fs.path.resolve(self.allocator, &.{ home, entry.checkout orelse try std.fmt.allocPrint(self.allocator, "../{s}", .{entry.name}) }),
+                .checkout = try std.Io.Dir.path.resolveAlloc(self.allocator, &.{ home, entry.checkout orelse try self.allocator.print("../{s}", .{entry.name}) }),
                 .clone = entry.clone,
                 .declared_by = manifest.name,
                 .branch_prefix = try self.branchPrefix(rel),
@@ -365,9 +365,9 @@ const Sync = struct {
     ///
     /// Return: `true` for a worktree dependency's path.
     fn isWorktreePath(self: *const Self, path: []const u8) bool {
-        const parent = std.fs.path.dirname(path) orelse return false;
-        if (!std.mem.eql(u8, std.fs.path.basename(parent), "deps")) return false;
-        return std.mem.startsWith(u8, parent, self.root) and parent.len > self.root.len and std.fs.path.isSep(parent[self.root.len]);
+        const parent = std.Io.Dir.path.dirname(path) orelse return false;
+        if (!std.mem.eql(u8, std.Io.Dir.path.basename(parent), "deps")) return false;
+        return std.mem.startsWith(u8, parent, self.root) and parent.len > self.root.len and std.Io.Dir.path.isSep(parent[self.root.len]);
     }
 
     /// Builds the branch prefix for a worktree at `rel`.
@@ -383,7 +383,7 @@ const Sync = struct {
     fn branchPrefix(self: *const Self, rel: []const u8) ![]const u8 {
         var prefix: std.ArrayList(u8) = .empty;
         try prefix.appendSlice(self.allocator, self.consumer);
-        var parts = std.mem.tokenizeAny(u8, std.fs.path.dirname(rel) orelse "", "/\\");
+        var parts = std.mem.tokenizeAny(u8, std.Io.Dir.path.dirname(rel) orelse "", "/\\");
         while (parts.next()) |part| {
             if (std.mem.eql(u8, part, "deps")) continue;
             try prefix.append(self.allocator, '/');
@@ -456,7 +456,7 @@ const Sync = struct {
         } else {
             return self.fail("{s} exists but zigbuildx did not create it (it has no stamp); move it aside and re-run", .{worktree.rel});
         }
-        const build_zig = try std.fs.path.join(self.allocator, &.{ worktree.dir, "build.zig" });
+        const build_zig = try std.Io.Dir.path.join(self.allocator, &.{ worktree.dir, "build.zig" });
         if (!try self.exists(build_zig)) return self.fail("{s} has no build.zig; a worktree dependency must be a Zig package", .{worktree.rel});
     }
 
@@ -474,7 +474,7 @@ const Sync = struct {
         }
         const target = try self.resolve(worktree);
         try mod.Git.worktreePrune(self.allocator, self.io, worktree.checkout);
-        try std.Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(worktree.dir).?);
+        try std.Io.Dir.cwd().createDirPath(self.io, std.Io.Dir.path.dirname(worktree.dir).?);
         if (target.branch.len == 0) {
             try mod.Git.worktreeAdd(self.allocator, self.io, worktree.checkout, worktree.dir, .{ .detached = target.sha });
         } else {
@@ -527,7 +527,7 @@ const Sync = struct {
             try mod.Git.fetch(self.allocator, self.io, worktree.checkout);
             break :blk try self.lookup(worktree.checkout, pin);
         } orelse return self.fail("{s}: {t} {s} is not in {s}, even after git fetch", .{ worktree.rel, pin.kind, pin.value, worktree.checkout });
-        const branch = if (pin.follows()) try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ worktree.branch_prefix, pin.value }) else "";
+        const branch = if (pin.follows()) try self.allocator.print("{s}/{s}", .{ worktree.branch_prefix, pin.value }) else "";
         return .{ .sha = sha, .pin = pin, .branch = branch };
     }
 
@@ -544,9 +544,9 @@ const Sync = struct {
     fn lookup(self: *const Self, checkout: []const u8, pin: Pin) !?[]const u8 {
         return switch (pin.kind) {
             .sha => mod.Git.revParse(self.allocator, self.io, checkout, pin.value),
-            .tag => mod.Git.revParse(self.allocator, self.io, checkout, try std.fmt.allocPrint(self.allocator, "refs/tags/{s}", .{pin.value})),
-            .branch => try mod.Git.revParse(self.allocator, self.io, checkout, try std.fmt.allocPrint(self.allocator, "refs/remotes/origin/{s}", .{pin.value})) orelse
-                try mod.Git.revParse(self.allocator, self.io, checkout, try std.fmt.allocPrint(self.allocator, "refs/heads/{s}", .{pin.value})),
+            .tag => mod.Git.revParse(self.allocator, self.io, checkout, try self.allocator.print("refs/tags/{s}", .{pin.value})),
+            .branch => try mod.Git.revParse(self.allocator, self.io, checkout, try self.allocator.print("refs/remotes/origin/{s}", .{pin.value})) orelse
+                try mod.Git.revParse(self.allocator, self.io, checkout, try self.allocator.print("refs/heads/{s}", .{pin.value})),
         };
     }
 
@@ -558,15 +558,15 @@ const Sync = struct {
     /// Return: nothing; IO errors. Git failures are logged and leave the orphan in place.
     fn removeOrphans(self: *Self) !void {
         var dirs: std.ArrayList([]const u8) = .empty;
-        try dirs.append(self.allocator, try std.fs.path.join(self.allocator, &.{ self.root, "deps" }));
+        try dirs.append(self.allocator, try std.Io.Dir.path.join(self.allocator, &.{ self.root, "deps" }));
         for (self.worktrees.items) |worktree| {
-            const parent = std.fs.path.dirname(worktree.dir).?;
+            const parent = std.Io.Dir.path.dirname(worktree.dir).?;
             for (dirs.items) |dir| {
                 if (std.mem.eql(u8, dir, parent)) break;
             } else try dirs.append(self.allocator, parent);
         }
         for (dirs.items) |deps| {
-            const state = try std.fs.path.join(self.allocator, &.{ deps, ".zigbuildx" });
+            const state = try std.Io.Dir.path.join(self.allocator, &.{ deps, ".zigbuildx" });
             var dir = std.Io.Dir.cwd().openDir(self.io, state, .{ .iterate = true }) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
@@ -578,7 +578,7 @@ const Sync = struct {
                 if (item.kind == .file and std.mem.endsWith(u8, item.name, ".rev")) try names.append(self.allocator, try self.allocator.dupe(u8, item.name));
             }
             for (names.items) |name| {
-                const path = try std.fs.path.join(self.allocator, &.{ deps, name[0 .. name.len - ".rev".len] });
+                const path = try std.Io.Dir.path.join(self.allocator, &.{ deps, name[0 .. name.len - ".rev".len] });
                 // A path still declared unpinned keeps what is there; its old stamp is left alone.
                 if (self.find(path) == null and !self.isUnpinned(path)) try self.removeOrphan(path);
             }
@@ -593,7 +593,7 @@ const Sync = struct {
     ///
     /// Return: nothing; IO errors.
     fn removeOrphan(self: *Self, path: []const u8) !void {
-        const rel = try std.fs.path.relative(self.allocator, self.root, null, self.root, path);
+        const rel = try std.Io.Dir.path.relativeAlloc(self.allocator, self.root, null, self.root, path);
         const stamp = try self.readStamp(path) orelse {
             log.warn("{s} is no longer a dependency, but its stamp is unreadable; left in place", .{rel});
             try self.orphans.append(self.allocator, rel);
@@ -703,7 +703,7 @@ const Sync = struct {
     /// Return: the manifest, or `null` when there is none; `error.DepsFailed`
     /// when it does not parse, or IO errors.
     fn readManifest(self: *Self, dir: []const u8) !?Manifest {
-        const path = try std.fs.path.join(self.allocator, &.{ dir, "build.zig.zon" });
+        const path = try std.Io.Dir.path.join(self.allocator, &.{ dir, "build.zig.zon" });
         const source = std.Io.Dir.cwd().readFileAllocOptions(self.io, path, self.allocator, .limited(1 << 20), .of(u8), 0) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
@@ -722,8 +722,8 @@ const Sync = struct {
     ///
     /// Return: the stamp's absolute path.
     fn stampPath(self: *const Self, dir: []const u8) ![]const u8 {
-        const name = try std.fmt.allocPrint(self.allocator, "{s}.rev", .{std.fs.path.basename(dir)});
-        return std.fs.path.join(self.allocator, &.{ std.fs.path.dirname(dir).?, ".zigbuildx", name });
+        const name = try self.allocator.print("{s}.rev", .{std.Io.Dir.path.basename(dir)});
+        return std.Io.Dir.path.join(self.allocator, &.{ std.Io.Dir.path.dirname(dir).?, ".zigbuildx", name });
     }
 
     /// Reads the stamp for the worktree at `dir`.
@@ -753,7 +753,7 @@ const Sync = struct {
         const head = try mod.Git.revParse(self.allocator, self.io, worktree.dir, "HEAD") orelse target.sha;
         const stamp = Stamp{ .pin = target.pin, .sha = head, .branch = target.branch, .checkout = worktree.checkout };
         const path = try self.stampPath(worktree.dir);
-        try std.Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(path).?);
+        try std.Io.Dir.cwd().createDirPath(self.io, std.Io.Dir.path.dirname(path).?);
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = try stamp.serialize(self.allocator) });
         worktree.stamp = stamp;
     }
@@ -792,34 +792,8 @@ const Sync = struct {
     ///
     /// Return: always `error.DepsFailed`, or `error.OutOfMemory`.
     fn fail(self: *Self, comptime fmt: []const u8, args: anytype) error{ DepsFailed, OutOfMemory } {
-        self.problem = try std.fmt.allocPrint(self.allocator, fmt, args);
+        self.problem = try self.allocator.print(fmt, args);
         return error.DepsFailed;
-    }
-};
-
-/// The `deps` step: lists the worktree dependencies and, with `-Dupdate`, fast-forwards those that follow a branch.
-const DepsStep = struct {
-    const Self = @This();
-    step: std.Build.Step,
-    sync: Sync,
-    update: bool,
-
-    /// Runs the step.
-    ///
-    /// Parameters:
-    /// - `step`: the `step` field of a `DepsStep`.
-    /// - `options`: unused.
-    ///
-    /// Return: nothing; `error.MakeFailed` when `-Dupdate` skipped or failed a worktree.
-    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
-        _ = options;
-        const self: *Self = @fieldParentPtr("step", step);
-        const failed = if (self.update) try self.sync.update() else 0;
-        var buffer: [1024]u8 = undefined;
-        var stdout = std.Io.File.stdout().writer(self.sync.io, &buffer);
-        try self.sync.status(&stdout.interface);
-        try stdout.interface.flush();
-        if (failed > 0) return step.fail("{d} worktree dependencies were not updated; see the warnings above", .{failed});
     }
 };
 
@@ -853,10 +827,10 @@ pub const Deps = struct {
         const io = b.graph.io;
         var missing: usize = 0;
         var cloned: usize = 0;
-        inline for (@typeInfo(@TypeOf(zon.dependencies)).@"struct".fields) |field| {
-            if (comptime Self.isCloneable(zon, field.name) and !Self.isPresent(field.name)) {
-                const dep = @field(zon.dependencies, field.name);
-                const dest = b.pathFromRoot(dep.path);
+        inline for (@typeInfo(@TypeOf(zon.dependencies)).@"struct".field_names) |field_name| {
+            if (comptime Self.isCloneable(zon, field_name) and !Self.isPresent(field_name)) {
+                const dep = @field(zon.dependencies, field_name);
+                const dest = b.root.joinString(b.allocator, dep.path) catch @panic("OOM");
                 missing += 1;
                 if (std.Io.Dir.cwd().access(io, dest, .{})) |_| {
                     log.err("{s} exists but is not a Zig package", .{dep.path});
@@ -890,6 +864,11 @@ pub const Deps = struct {
     /// fail to compile before `sync` could create it. An unchanged build reads
     /// stamp files and runs no `git`.
     ///
+    /// Zig 0.17 skips `build()` when nothing it tracks has changed, and a
+    /// worktree deleted by hand or a stamp left behind is nothing it tracks; so
+    /// while there are worktrees this poisons the configure cache, and
+    /// `build()` runs on every build, as it did before 0.17.
+    ///
     /// Also declares the `deps` step, which lists the worktrees, and its
     /// `-Dupdate` option, which fetches and fast-forwards those that follow a branch.
     ///
@@ -907,29 +886,23 @@ pub const Deps = struct {
             std.process.exit(1);
         }
         const io = b.graph.io;
-        const root = b.build_root.handle.realPathFileAlloc(io, ".", b.allocator) catch |err| {
+        const root = Self.rootPath(b) catch |err| {
             log.err("cannot resolve the build root [{any}]", .{err});
             std.process.exit(1);
         };
-        const deps_step = b.allocator.create(DepsStep) catch @panic("OOM");
-        const run = Sync.init(b.allocator, io, root) catch |err| {
+        var run = Sync.init(b.allocator, io, root) catch |err| {
             log.err("cannot sync dependencies [{any}]", .{err});
             std.process.exit(1);
         };
-        deps_step.* = .{
-            .step = .init(.{ .id = .custom, .name = "deps", .owner = b, .makeFn = DepsStep.make }),
-            .sync = run,
-            .update = b.option(bool, "update", "With the deps step: fetch and fast-forward worktree dependencies that follow a branch") orelse false,
-        };
-        deps_step.sync.run() catch |err| {
+        run.run() catch |err| {
             if (err == error.DepsFailed) {
-                log.err("{s}", .{deps_step.sync.problem});
+                log.err("{s}", .{run.problem});
             } else {
                 log.err("cannot sync dependencies [{any}]", .{err});
             }
             std.process.exit(1);
         };
-        if (deps_step.sync.changed) {
+        if (run.changed) {
             log.info("dependencies changed; re-run zig build", .{});
             std.process.exit(1);
         }
@@ -937,8 +910,65 @@ pub const Deps = struct {
             log.err("{s} is still missing; an unpinned .path is used as is, so put it there or give it a .clone", .{comptime Self.missingWorktree() orelse "a .path dependency"});
             std.process.exit(1);
         }
+        if (run.worktrees.items.len > 0 or run.orphans.items.len > 0) b.graph.poisonCache();
+        const update = b.option(bool, "update", "With the deps step: fetch and fast-forward worktree dependencies that follow a branch") orelse false;
+        const list = b.addRunArtifact(mod.HostTool.add(b));
+        list.setName("deps");
+        list.addArg("deps");
+        list.addDirectoryArg2(b.path("."), .{});
+        if (update) list.addArg("--update");
+        // It reads and moves worktrees: never cached.
+        list.has_side_effects = true;
         const top = b.step("deps", "List worktree dependencies; -Dupdate fast-forwards those that follow a branch");
-        top.dependOn(&deps_step.step);
+        top.dependOn(&list.step);
+    }
+
+    /// `zigbuildx deps <root> [--update]`: lists the worktree dependencies and, with `--update`, fast-forwards those that follow a branch.
+    ///
+    /// Runs as the `deps` step. It reads the manifests again, which in the
+    /// steady state runs no `git`, then reports each worktree's state.
+    ///
+    /// Parameters:
+    /// - `process_init`: the process's allocator and IO.
+    /// - `args`: the command line after the program's path; `args[0]` is the command.
+    ///
+    /// Return: nothing; `error.InvalidArguments` on a bad command line,
+    /// `error.DepsFailed` when the worktrees are not in line or `--update`
+    /// skipped or failed one, or IO errors.
+    pub fn command(process_init: std.process.Init, args: []const [:0]const u8) !void {
+        const io = process_init.io;
+        const update = args.len == 3 and std.mem.eql(u8, args[2], "--update");
+        if (args.len != 2 and !update) {
+            log.err("usage: zigbuildx deps <root> [--update]", .{});
+            return error.InvalidArguments;
+        }
+        const allocator = process_init.arena.allocator();
+        const root = try std.Io.Dir.cwd().realPathFileAlloc(io, args[1], allocator);
+        var run = try Sync.init(allocator, io, root);
+        run.run() catch |err| {
+            if (err == error.DepsFailed) log.err("{s}", .{run.problem});
+            return err;
+        };
+        if (run.changed) log.info("dependencies changed; re-run zig build", .{});
+        const failed = if (update) try run.update() else 0;
+        var buffer: [1024]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(io, &buffer);
+        try run.status(&stdout.interface);
+        try stdout.interface.flush();
+        if (failed > 0) {
+            log.err("{d} worktree dependencies were not updated; see the warnings above", .{failed});
+            return error.DepsFailed;
+        }
+    }
+
+    /// Returns the absolute, resolved path of `b`'s package.
+    ///
+    /// Parameters:
+    /// - `b`: the build graph.
+    ///
+    /// Return: the path, owned by `b`'s arena; IO errors.
+    fn rootPath(b: *std.Build) ![]const u8 {
+        return b.root.root_dir.handle.realPathFileAlloc(b.graph.io, b.root.subPathOrDot(), b.allocator);
     }
 
     /// Reports whether every cloneable dependency is present.
@@ -948,8 +978,8 @@ pub const Deps = struct {
     ///
     /// Return: `true` when none is missing.
     pub fn allPresent(comptime zon: anytype) bool {
-        inline for (@typeInfo(@TypeOf(zon.dependencies)).@"struct".fields) |field| {
-            if (Self.isCloneable(zon, field.name) and !Self.isPresent(field.name)) return false;
+        inline for (@typeInfo(@TypeOf(zon.dependencies)).@"struct".field_names) |field_name| {
+            if (Self.isCloneable(zon, field_name) and !Self.isPresent(field_name)) return false;
         }
         return true;
     }
@@ -1006,9 +1036,9 @@ pub const Deps = struct {
         const root = @import("root");
         if (!@hasDecl(root, "dependencies")) return null;
         const packages = root.dependencies.packages;
-        for (@typeInfo(packages).@"struct".decls) |decl| {
-            const under_deps = std.mem.startsWith(u8, decl.name, "deps/") or std.mem.startsWith(u8, decl.name, "deps\\");
-            if (under_deps and !@hasDecl(@field(packages, decl.name), "build_zig")) return decl.name;
+        for (@typeInfo(packages).@"struct".decl_names) |decl_name| {
+            const under_deps = std.mem.startsWith(u8, decl_name, "deps/") or std.mem.startsWith(u8, decl_name, "deps\\");
+            if (under_deps and !@hasDecl(@field(packages, decl_name), "build_zig")) return decl_name;
         }
         return null;
     }
@@ -1130,7 +1160,7 @@ const TestTree = struct {
     ///
     /// Return: the absolute path.
     fn path(self: *Self, sub: []const u8) ![]const u8 {
-        return std.fs.path.join(self.allocator(), &.{ self.root, sub });
+        return std.Io.Dir.path.join(self.allocator(), &.{ self.root, sub });
     }
 
     /// Creates upstream package `name` with the given dependencies, committed on `main` and tagged `v1`.
@@ -1142,10 +1172,10 @@ const TestTree = struct {
     ///
     /// Return: nothing; IO and spawn errors.
     fn upstream(self: *Self, name: []const u8, dependencies: []const u8) !void {
-        const dir = try self.path(try std.fmt.allocPrint(self.allocator(), "origin/{s}", .{name}));
+        const dir = try self.path(try self.allocator().print("origin/{s}", .{name}));
         try self.run(&.{ "git", "init", "--quiet", "--initial-branch=main", dir });
-        try self.write(try std.fmt.allocPrint(self.allocator(), "origin/{s}/build.zig.zon", .{name}), try std.fmt.allocPrint(self.allocator(), ".{{ .name = .{s}, .dependencies = .{{ {s} }} }}\n", .{ name, dependencies }));
-        try self.write(try std.fmt.allocPrint(self.allocator(), "origin/{s}/build.zig", .{name}), "");
+        try self.write(try self.allocator().print("origin/{s}/build.zig.zon", .{name}), try self.allocator().print(".{{ .name = .{s}, .dependencies = .{{ {s} }} }}\n", .{ name, dependencies }));
+        try self.write(try self.allocator().print("origin/{s}/build.zig", .{name}), "");
         try self.commit(dir, "one");
         try self.run(&.{ "git", "-C", dir, "tag", "v1" });
     }
@@ -1158,7 +1188,7 @@ const TestTree = struct {
     ///
     /// Return: nothing; IO errors.
     fn consumer(self: *Self, dependencies: []const u8) !void {
-        try self.write("consumer/build.zig.zon", try std.fmt.allocPrint(self.allocator(), ".{{ .name = .consumer, .dependencies = .{{ {s} }} }}\n", .{dependencies}));
+        try self.write("consumer/build.zig.zon", try self.allocator().print(".{{ .name = .consumer, .dependencies = .{{ {s} }} }}\n", .{dependencies}));
     }
 
     /// Writes the dependency text for `name` at `deps/<name>`, cloned from its upstream, plus `extra`.
@@ -1170,7 +1200,7 @@ const TestTree = struct {
     ///
     /// Return: the text.
     fn dep(self: *Self, name: []const u8, extra: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(self.allocator(), ".{s} = .{{ .path = \"deps/{s}\", .clone = \"{s}/origin/{s}\", {s} }},", .{ name, name, self.root, name, extra });
+        return self.allocator().print(".{s} = .{{ .path = \"deps/{s}\", .clone = \"{s}/origin/{s}\", {s} }},", .{ name, name, self.root, name, extra });
     }
 
     /// Runs a sync of the consumer.
@@ -1221,7 +1251,7 @@ const TestTree = struct {
     ///
     /// Return: nothing; IO errors.
     fn write(self: *Self, sub: []const u8, data: []const u8) !void {
-        try self.tmp.dir.createDirPath(self.io, std.fs.path.dirname(sub).?);
+        try self.tmp.dir.createDirPath(self.io, std.Io.Dir.path.dirname(sub).?);
         try self.tmp.dir.writeFile(self.io, .{ .sub_path = sub, .data = data });
     }
 
@@ -1234,7 +1264,7 @@ const TestTree = struct {
     ///
     /// Return: nothing; IO and spawn errors.
     fn commit(self: *Self, dir: []const u8, name: []const u8) !void {
-        const file = try std.fs.path.join(self.allocator(), &.{ dir, name });
+        const file = try std.Io.Dir.path.join(self.allocator(), &.{ dir, name });
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = file, .data = name });
         try self.run(&.{ "git", "-C", dir, "add", "--all" });
         try self.run(&.{ "git", "-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", name });
@@ -1259,7 +1289,7 @@ test "sync creates worktrees for a SHA, a tag and a branch, then stays put" {
     for ([_][]const u8{ "bysha", "bytag", "bybranch" }) |name| try tree.upstream(name, "");
     const sha = try tree.rev("origin/bysha", "HEAD");
     try tree.consumer(try std.mem.concat(tree.allocator(), u8, &.{
-        try tree.dep("bysha", try std.fmt.allocPrint(tree.allocator(), ".sha = \"{s}\",", .{sha[0..10]})),
+        try tree.dep("bysha", try tree.allocator().print(".sha = \"{s}\",", .{sha[0..10]})),
         try tree.dep("bytag", ".tag = \"v1\","),
         try tree.dep("bybranch", ".branch = \"main\","),
     }));
@@ -1305,7 +1335,7 @@ test "sync moves a clean worktree to a new pin and refuses a dirty or ahead one"
     // Dirty: refused, and the worktree stays at v1.
     try tree.write("consumer/deps/leaf/scratch", "x");
     try tree.consumer(try tree.dep("leaf", ".tag = \"v2\","));
-    try std.testing.expect(std.mem.indexOf(u8, try tree.syncFails(), "uncommitted changes") != null);
+    try std.testing.expect(std.mem.find(u8, try tree.syncFails(), "uncommitted changes") != null);
     try tree.tmp.dir.deleteFile(tree.io, "consumer/deps/leaf/scratch");
 
     // Clean: moved to v2, then to the branch.
@@ -1318,7 +1348,7 @@ test "sync moves a clean worktree to a new pin and refuses a dirty or ahead one"
     // Ahead: a commit of its own blocks a move back to a tag.
     try tree.commit(try tree.path("consumer/deps/leaf"), "mine");
     try tree.consumer(try tree.dep("leaf", ".tag = \"v1\","));
-    try std.testing.expect(std.mem.indexOf(u8, try tree.syncFails(), "commits beyond") != null);
+    try std.testing.expect(std.mem.find(u8, try tree.syncFails(), "commits beyond") != null);
 }
 
 test "update fast-forwards a branch worktree and skips a dirty one" {
@@ -1342,7 +1372,7 @@ test "update fast-forwards a branch worktree and skips a dirty one" {
     var out: std.Io.Writer.Allocating = .init(tree.allocator());
     var status_run = after;
     try status_run.status(&out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "deps/dirty  branch main") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "deps/dirty  branch main") != null);
 }
 
 test "update fetches a tag's checkout, so status reports the tag moved upstream" {
@@ -1362,16 +1392,16 @@ test "update fetches a tag's checkout, so status reports the tag moved upstream"
     try std.testing.expectEqualStrings(pinned, try tree.rev("consumer/deps/leaf", "HEAD"));
     var out: std.Io.Writer.Allocating = .init(tree.allocator());
     try run_.status(&out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tag moved upstream") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "tag moved upstream") != null);
 }
 
 test "sync rejects two pin fields and a pin on a path outside deps/" {
     var tree = try TestTree.init();
     defer tree.deinit();
     try tree.consumer(".leaf = .{ .path = \"deps/leaf\", .tag = \"v1\", .branch = \"main\" },");
-    try std.testing.expect(std.mem.indexOf(u8, try tree.syncFails(), "more than one") != null);
+    try std.testing.expect(std.mem.find(u8, try tree.syncFails(), "more than one") != null);
     try tree.consumer(".leaf = .{ .path = \"../leaf\", .tag = \"v1\" },");
-    try std.testing.expect(std.mem.indexOf(u8, try tree.syncFails(), "must be under deps/") != null);
+    try std.testing.expect(std.mem.find(u8, try tree.syncFails(), "must be under deps/") != null);
 }
 
 test "a worktree deleted by hand is recreated on its existing branch, commits kept" {
@@ -1413,7 +1443,7 @@ test "transitive dependencies resolve through worktrees, and the root's pin wins
     const leaf_origin = try tree.path("origin/leaf");
     try tree.commit(leaf_origin, "two");
     // mid names leaf as a sibling and pins it to main; the root pins it to v1.
-    try tree.upstream("mid", try std.fmt.allocPrint(tree.allocator(), ".leaf = .{{ .path = \"../leaf\", .clone = \"{s}\", .branch = \"main\" }}, .nested = .{{ .path = \"deps/nested\", .clone = \"{s}/origin/nested\", .branch = \"main\" }},", .{ leaf_origin, tree.root }));
+    try tree.upstream("mid", try tree.allocator().print(".leaf = .{{ .path = \"../leaf\", .clone = \"{s}\", .branch = \"main\" }}, .nested = .{{ .path = \"deps/nested\", .clone = \"{s}/origin/nested\", .branch = \"main\" }},", .{ leaf_origin, tree.root }));
     try tree.upstream("nested", "");
     try tree.consumer(try std.mem.concat(tree.allocator(), u8, &.{ try tree.dep("mid", ".tag = \"v1\","), try tree.dep("leaf", ".tag = \"v1\",") }));
     const run_ = try tree.sync();
@@ -1438,7 +1468,7 @@ test "an unpinned path is used as is, even under deps/, and is never an orphan" 
     try std.testing.expectEqual(0, run_.orphans.items.len);
     try tree.tmp.dir.access(tree.io, "consumer/deps/leaf/build.zig", .{});
     // A pinned dependency's sibling path to it is used as is too.
-    try tree.upstream("mid", try std.fmt.allocPrint(tree.allocator(), ".leaf = .{{ .path = \"../leaf\", .clone = \"{s}/origin/leaf\", .tag = \"v1\" }},", .{tree.root}));
+    try tree.upstream("mid", try tree.allocator().print(".leaf = .{{ .path = \"../leaf\", .clone = \"{s}/origin/leaf\", .tag = \"v1\" }},", .{tree.root}));
     try tree.consumer(try std.mem.concat(tree.allocator(), u8, &.{ try tree.dep("mid", ".tag = \"v1\","), ".leaf = .{ .path = \"deps/leaf\" }," }));
     const again = try tree.sync();
     try std.testing.expectEqual(1, again.worktrees.items.len);

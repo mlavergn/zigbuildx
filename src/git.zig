@@ -71,7 +71,7 @@ pub const Git = struct {
     /// Return: the SHA, owned by the caller; `null` when `rev` names no commit
     /// here; `error.GitFailed` when `git` fails otherwise, or spawn errors.
     pub fn revParse(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, rev: []const u8) !?[]u8 {
-        const commit = try std.fmt.allocPrint(allocator, "{s}^{{commit}}", .{rev});
+        const commit = try allocator.print("{s}^{{commit}}", .{rev});
         defer allocator.free(commit);
         return Self.runOptional(allocator, io, repo, &.{ "rev-parse", "--verify", "--quiet", commit });
     }
@@ -193,7 +193,7 @@ pub const Git = struct {
     /// Return: `true` when HEAD is ahead of `base`; `error.GitFailed` when `git`
     /// fails, or spawn errors.
     pub fn isAhead(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, base: []const u8) !bool {
-        const range = try std.fmt.allocPrint(allocator, "{s}..HEAD", .{base});
+        const range = try allocator.print("{s}..HEAD", .{base});
         defer allocator.free(range);
         const out = try Self.run(allocator, io, repo, &.{ "rev-list", "--count", range });
         defer allocator.free(out);
@@ -211,7 +211,7 @@ pub const Git = struct {
     /// Return: `true` when it exists; `error.GitFailed` when `git` fails
     /// otherwise, or spawn errors.
     pub fn branchExists(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, name: []const u8) !bool {
-        const ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name});
+        const ref = try allocator.print("refs/heads/{s}", .{name});
         defer allocator.free(ref);
         const out = try Self.runOptional(allocator, io, repo, &.{ "show-ref", "--verify", "--quiet", ref }) orelse return false;
         allocator.free(out);
@@ -375,7 +375,7 @@ const TestRepo = struct {
     ///
     /// Return: the absolute path, owned by the caller.
     fn path(self: *const Self, sub: []const u8) ![]u8 {
-        return std.fs.path.join(self.allocator, &.{ self.root, sub });
+        return std.Io.Dir.path.join(self.allocator, &.{ self.root, sub });
     }
 
     /// Writes file `name` in repository `repo` and commits it.
@@ -389,7 +389,7 @@ const TestRepo = struct {
     fn commit(self: *const Self, repo: []const u8, name: []const u8) !void {
         const dir = try self.path(repo);
         defer self.allocator.free(dir);
-        const file = try std.fs.path.join(self.allocator, &.{ repo, name });
+        const file = try std.Io.Dir.path.join(self.allocator, &.{ repo, name });
         defer self.allocator.free(file);
         try self.tmp.dir.writeFile(self.io, .{ .sub_path = file, .data = name });
         try self.git(&.{ "git", "-C", dir, "add", name });

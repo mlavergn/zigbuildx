@@ -18,6 +18,9 @@ VERSION := $(shell sed -n -E 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"
 # Every Zig source this project owns.
 ZIG_SOURCES := build.zig $(shell find src -name '*.zig' | sort)
 
+# The Zig 0.17 compiler; `make ZIG=zig17 ...` where `zig` is another release.
+ZIG ?= zig
+
 # The zlint config directory; `make substyle` adds it as a submodule.
 STYLEGUIDE ?= styleguide
 
@@ -41,9 +44,9 @@ validate: clean format lint test cross
 
 # Run the unit test suite.
 test:
-	zig build test --summary all
+	$(ZIG) build test --summary all
 
-# Compile the suite and the host tools for the hosts this one cannot run.
+# Compile the suite and the host tool for the hosts this one cannot run.
 #
 # zigbuildx runs inside other projects' build runners, on whatever host they
 # build on. Its host-specific paths are runtime branches, so a Windows-only
@@ -53,16 +56,14 @@ CROSS_TARGETS := x86_64-windows aarch64-windows x86_64-linux aarch64-linux
 cross:
 	@mkdir -p zig-out/cross
 	@for t in $(CROSS_TARGETS); do \
-		zig test src/module.zig -target $$t --test-no-exec -femit-bin=zig-out/cross/test-$$t || exit 1; \
-		zig build-exe src/pkg/android/apk_zip.zig -target $$t -femit-bin=zig-out/cross/apk-zip-$$t || exit 1; \
-		zig build-exe src/docs.zig -target $$t -femit-bin=zig-out/cross/docs-patch-$$t || exit 1; \
-		zig build-exe src/pkg/linux/deb.zig -target $$t -femit-bin=zig-out/cross/deb-$$t || exit 1; \
+		$(ZIG) test src/module.zig -target $$t --test-no-exec -femit-bin=zig-out/cross/test-$$t || exit 1; \
+		$(ZIG) build-exe src/tool.zig -target $$t -femit-bin=zig-out/cross/zigbuildx-$$t || exit 1; \
 		echo "cross $$t ok"; \
 	done
 
 # Format the Zig sources.
 format:
-	zig fmt $(ZIG_SOURCES) build.zig.zon
+	$(ZIG) fmt $(ZIG_SOURCES) build.zig.zon
 
 # Lint the Zig sources against the shared styleguide.
 lint:

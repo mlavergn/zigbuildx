@@ -13,26 +13,25 @@ where the copies drift. It is imported, not run: nothing acts unless a
 |---|---|
 | `Deps` | Clones missing sibling checkouts, and gives pinned dependencies their own git worktree |
 | `Git` | Runs `git` commands for the build |
-| `Xcode` | Finds the macOS SDK, sets a macOS deployment floor, links frameworks and libc++ |
-| `Archive` | Installs static libraries that Apple's linker accepts |
+| `Xcode` | Finds the macOS SDK, sets a macOS deployment floor, links frameworks |
 | `Swift` | Builds a Swift dylib that a Zig package links against |
 | `Android` | Builds Android native libraries against the NDK |
 | `Apk` | Packages Android native libraries into a signed APK, with no Java or Kotlin |
 | `Docs` | Includes private declarations in Zig's generated documentation |
 | `Pkg` | Builds an installable package: `.pkg` (macOS), `.deb` (Linux), `.msi` (Windows) |
 
-Several extensions work around defects in Zig 0.16.0 or the macOS 27 SDK;
+Several extensions work around defects in Zig 0.17.0 or the macOS 27 SDK;
 each is written to be deleted on its own once the cause goes away.
 
 ## Requirements
 
-- **Zig 0.16.** `build.zig` refuses any other minor release; the workarounds
-  were written against 0.16.0.
+- **Zig 0.17.** `build.zig` refuses any other minor release; the workarounds
+  were checked against 0.17.0. zigbuildx 1.x is the Zig 0.16 release.
 - **Hosts:** macOS (Apple Silicon), Linux (arm64, x86_64) and Windows (x86_64,
   arm64). Apple-only extensions fall back to plain behaviour elsewhere.
 - **Per extension:**
   - `Deps`: `git`.
-  - `Xcode`, `Swift`, `Archive`: Xcode or the Command Line Tools.
+  - `Xcode`, `Swift`: Xcode or the Command Line Tools.
   - `Android`, `Apk`: the Android SDK and NDK; a JDK's `keytool` for the debug
     keystore.
   - `Pkg`: `pkgbuild` and `codesign` for macOS; `wixl` (`apt install wixl`, or
@@ -107,18 +106,19 @@ zig build deps            # each worktree: pin, commit, clean or dirty
 zig build deps -Dupdate   # fetch, and fast-forward branch pins
 ```
 
-Target macOS with a floor, link frameworks and C++, and install a static
-library Apple's linker accepts:
+A dependency `Deps` clones or a worktree it creates or moves ends the build
+with `error: configure command exited with code 1`, after
+`dependencies changed; re-run zig build`: run `zig build` again.
+
+Target macOS with a floor and link frameworks:
 
 ```zig
 const target = try zigbuildx.Xcode.standardTargetOptions(b, "26.0");
 if (b.graph.host.result.os.tag == .macos) {
     var xcode = try zigbuildx.Xcode.init(b.allocator, b.graph.io);
-    try xcode.resolve();
+    try xcode.resolve(b);
     xcode.linkFramework(lib.root_module, "CoreFoundation");
-    try xcode.linkLibCpp(b, exe);
 }
-zigbuildx.Archive.install(b, lib); // plain install off Apple targets
 ```
 
 Build and link a Swift dylib:
@@ -154,30 +154,35 @@ _ = zigbuildx.Pkg.add(b, zon, .{ .executables = &.{exe} });
 ```
 
 ```sh
-zig build pkg -Doptimize=ReleaseFast                        # zig-out/pkg/<name>-<version>.pkg
-zig build pkg -Doptimize=ReleaseFast -Dtarget=aarch64-linux # <name>_<version>_arm64.deb
-zig build pkg -Doptimize=ReleaseFast -Dtarget=x86_64-windows # <name>-<version>-x64.msi
-zig build pkg-notarize -Doptimize=ReleaseFast               # macOS: notarize and staple
+zig build pkg -Doptimize=fast                         # zig-out/pkg/<name>-<version>.pkg
+zig build pkg -Doptimize=fast -Dtarget=aarch64-linux  # <name>_<version>_arm64.deb
+zig build pkg -Doptimize=fast -Dtarget=x86_64-windows # <name>-<version>-x64.msi
+zig build pkg-notarize -Doptimize=fast                # macOS: notarize and staple
 ```
 
 Packages install to `/usr/local/<org>/<name>` (per user under
 `%LOCALAPPDATA%\<org>\<name>` on Windows) and put its `bin` on `PATH`.
+Without `wixl`, a Windows package stops after writing its WiX source and
+programs to `zig-out/pkg/<name>-<version>-wix/`, with the command to finish it.
 
 ## Architecture
 
 ```
-build.zig        the public surface: re-exports each extension
+build.zig        the public surface: re-exports each extension, declares the host tool
 src/module.zig   the barrel the tests compile
-src/             build-side extensions: deps, git, xcode, archive, swift, android, docs
+src/tool.zig     the host tool: one program, a command per job a step hands it
+src/             build-side extensions: deps, git, xcode, swift, android, docs
 src/pkg/         packaging: pkg.zig (zig build pkg), one folder per platform
   macos/         pkgbuild.zig and the install scripts
-  linux/         deb.zig (a host tool) and the maintainer scripts
+  linux/         deb.zig and the maintainer scripts
   windows/       msi.zig (WiX source for wixl)
-  android/       apk.zig and apk_zip.zig (a host tool)
+  android/       apk.zig and apk_zip.zig
 ```
 
 Code that compiles lives at the top of `src/`; code that assembles an
 installable package lives under `src/pkg/`. Each extension is one struct per
 file, re-exported from `build.zig`, whose `pub` declarations are the package's
 whole surface. Work that would otherwise need a platform-specific shell tool
-(`zip`, `dpkg-deb`, `sed -i`) is done by small Zig programs built for the host.
+(`zip`, `dpkg-deb`, `sed -i`), and work a step must do while the build runs
+(a Zig 0.17 step cannot run code of its own), is done by zigbuildx's host
+tool, built from `src/tool.zig` for the build host.

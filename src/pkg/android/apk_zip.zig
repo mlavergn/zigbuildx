@@ -202,65 +202,65 @@ pub const ApkZip = struct {
         }
         return false;
     }
-};
 
-/// `apk-zip <base.apk> <out.apk> <dir>`: writes `base.apk` plus every file under `dir`.
-///
-/// Parameters:
-/// - `init`: the process's allocator, IO and arguments.
-///
-/// Return: nothing; `error.InvalidArguments` on a bad command line, or IO and zip errors.
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    const io = init.io;
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 4) {
-        log.err("usage: apk-zip <base.apk> <out.apk> <dir>", .{});
-        return error.InvalidArguments;
-    }
-    const cwd = std.Io.Dir.cwd();
-
-    var dir = try cwd.openDir(io, args[3], .{ .iterate = true });
-    defer dir.close(io);
-    var names: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (names.items) |name| allocator.free(name);
-        names.deinit(allocator);
-    }
-    var walker = try dir.walk(allocator);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        const name = try allocator.dupe(u8, entry.path);
-        std.mem.replaceScalar(u8, name, '\\', '/');
-        try names.append(allocator, name);
-    }
-    // Sorted, so the archive does not depend on the order the host lists a directory in.
-    std.mem.sort([]const u8, names.items, {}, struct {
-        /// Orders names bytewise.
-        ///
-        /// Parameters:
-        /// - `a`: one name.
-        /// - `b`: another.
-        ///
-        /// Return: `true` when `a` sorts before `b`.
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
+    /// `zigbuildx apk-zip <base.apk> <out.apk> <dir>`: writes `base.apk` plus every file under `dir`.
+    ///
+    /// Parameters:
+    /// - `process_init`: the process's allocator and IO.
+    /// - `args`: the command line after the program's path; `args[0]` is the command.
+    ///
+    /// Return: nothing; `error.InvalidArguments` on a bad command line, or IO and zip errors.
+    pub fn command(process_init: std.process.Init, args: []const [:0]const u8) !void {
+        const allocator = process_init.gpa;
+        const io = process_init.io;
+        if (args.len != 4) {
+            log.err("usage: zigbuildx apk-zip <base.apk> <out.apk> <dir>", .{});
+            return error.InvalidArguments;
         }
-    }.lessThan);
+        const cwd = std.Io.Dir.cwd();
 
-    const base = try cwd.readFileAlloc(io, args[1], allocator, .unlimited);
-    defer allocator.free(base);
-    var zip = try ApkZip.init(allocator);
-    defer zip.deinit();
-    try zip.copyEntries(base, names.items);
-    for (names.items) |name| {
-        const data = try dir.readFileAlloc(io, name, allocator, .unlimited);
-        defer allocator.free(data);
-        try zip.addStored(name, data);
+        var dir = try cwd.openDir(io, args[3], .{ .iterate = true });
+        defer dir.close(io);
+        var names: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (names.items) |name| allocator.free(name);
+            names.deinit(allocator);
+        }
+        var walker = try dir.walk(allocator);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            const name = try allocator.dupe(u8, entry.path);
+            std.mem.replaceScalar(u8, name, '\\', '/');
+            try names.append(allocator, name);
+        }
+        // Sorted, so the archive does not depend on the order the host lists a directory in.
+        std.mem.sort([]const u8, names.items, {}, struct {
+            /// Orders names bytewise.
+            ///
+            /// Parameters:
+            /// - `a`: one name.
+            /// - `b`: another.
+            ///
+            /// Return: `true` when `a` sorts before `b`.
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+
+        const base = try cwd.readFileAlloc(io, args[1], allocator, .unlimited);
+        defer allocator.free(base);
+        var zip = try Self.init(allocator);
+        defer zip.deinit();
+        try zip.copyEntries(base, names.items);
+        for (names.items) |name| {
+            const data = try dir.readFileAlloc(io, name, allocator, .unlimited);
+            defer allocator.free(data);
+            try zip.addStored(name, data);
+        }
+        try cwd.writeFile(io, .{ .sub_path = args[2], .data = try zip.finish() });
     }
-    try cwd.writeFile(io, .{ .sub_path = args[2], .data = try zip.finish() });
-}
+};
 
 // -----------------------------------------------------------------------------
 // Unit Tests

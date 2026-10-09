@@ -1,5 +1,4 @@
 const std = @import("std");
-const mod = @import("../module.zig");
 
 /// Text escaped for an XML attribute value, for `{f}` in a format string.
 const Escaped = struct {
@@ -48,42 +47,6 @@ pub const Msi = struct {
     version: []const u8,
     /// The programs' file names, installed in `bin`.
     files: []const []const u8,
-
-    /// Stages the `.msi`'s files and WiX source, and builds it with the `wixl` on `PATH`.
-    ///
-    /// Without `wixl`, the WiX source is copied to `zig-out/pkg/` and the step
-    /// fails with the command that would build the installer.
-    ///
-    /// Parameters:
-    /// - `pkg`: the package.
-    /// - `stage`: an empty staging directory.
-    ///
-    /// Return: nothing; `error.MakeFailed`, or IO errors.
-    pub fn build(pkg: *mod.Pkg, stage: []const u8) !void {
-        const b = pkg.step.owner;
-        const io = b.graph.io;
-        _ = try pkg.copyExecutables(b.pathJoin(&.{ stage, "bin" }));
-        var files: std.ArrayList([]const u8) = .empty;
-        for (pkg.executables) |exe| try files.append(b.allocator, exe.out_filename);
-        const msi = Self{ .name = pkg.name, .org = pkg.orgLabel(), .id = pkg.id(), .version = pkg.version, .files = files.items };
-        const xml = msi.render(b.allocator) catch |err| switch (err) {
-            error.InvalidVersion => return pkg.step.fail(".version = \"{s}\" is not one an MSI can carry: major.minor.patch, at most 255.255.65535", .{pkg.version}),
-            else => return err,
-        };
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = b.pathJoin(&.{ stage, "product.wxs" }), .data = xml });
-        const out = try pkg.outputPath();
-        const platform = Self.arch(pkg.target.cpu.arch).?;
-        const argv = [_][]const u8{ "wixl", "-a", platform, "-o", out, "product.wxs" };
-        const result = std.process.run(b.allocator, io, .{ .argv = &argv, .cwd = .{ .path = stage } }) catch |err| switch (err) {
-            error.FileNotFound => {
-                const wxs = b.getInstallPath(.prefix, b.fmt("pkg/{s}-{s}.wxs", .{ pkg.name, pkg.version }));
-                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = wxs, .data = xml });
-                return pkg.step.fail("wixl is not on PATH (apt install wixl, or Homebrew's msitools); wrote {s}; to build the installer: cd {s} && wixl -a {s} -o {s} product.wxs", .{ wxs, stage, platform, out });
-            },
-            else => return err,
-        };
-        try pkg.checkTool(&argv, result, null);
-    }
 
     /// Maps a CPU architecture to the `wixl -a` platform.
     ///
@@ -155,7 +118,7 @@ pub const Msi = struct {
     /// Return: the leading `major.minor.patch` of `version`;
     /// `error.InvalidVersion` when it is not three numbers within 255.255.65535.
     pub fn msiVersion(version: []const u8) ![]const u8 {
-        const end = std.mem.indexOfAny(u8, version, "-+") orelse version.len;
+        const end = std.mem.findAny(u8, version, "-+") orelse version.len;
         const core = version[0..end];
         var parts = std.mem.splitScalar(u8, core, '.');
         const limits = [_]u32{ 255, 255, 65535 };
@@ -248,7 +211,7 @@ test "render writes a per-user product with the files, PATH entry and escaped na
     const wix = Msi{ .name = "tool", .org = "a&b", .id = "com.ab.tool", .version = "1.0.0", .files = &.{ "tool.exe", "helper.exe" } };
     const xml = try wix.render(allocator);
     defer allocator.free(xml);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "<Wix xmlns=\"http://schemas.microsoft.com/wix/2006/wi\">") != null);
+    try std.testing.expect(std.mem.find(u8, xml, "<Wix xmlns=\"http://schemas.microsoft.com/wix/2006/wi\">") != null);
     try std.testing.expect(std.mem.endsWith(u8, xml, "</Wix>\n"));
     for ([_][]const u8{
         "InstallScope=\"perUser\"",
@@ -258,10 +221,10 @@ test "render writes a per-user product with the files, PATH entry and escaped na
         "<Environment Id=\"UserPath\" Name=\"PATH\" Value=\"[BinDir]\"",
         "Key=\"Software\\a&amp;b\\tool\"",
     }) |needle| {
-        if (std.mem.indexOf(u8, xml, needle) == null) {
+        if (std.mem.find(u8, xml, needle) == null) {
             std.debug.print("missing: {s}\n", .{needle});
             return error.TestUnexpectedResult;
         }
     }
-    try std.testing.expect(std.mem.indexOf(u8, xml, &Msi.guid("com.ab.tool", "upgrade")) != null);
+    try std.testing.expect(std.mem.find(u8, xml, &Msi.guid("com.ab.tool", "upgrade")) != null);
 }
