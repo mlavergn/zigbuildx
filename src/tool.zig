@@ -21,6 +21,7 @@ pub const Tool = struct {
         .{ .name = "apk-zip", .run = mod.pkg.android.ApkZip.command },
         .{ .name = "deb", .run = mod.pkg.Deb.command },
         .{ .name = "deps", .run = mod.Deps.command },
+        .{ .name = "deps-mark", .run = mod.Deps.mark },
         .{ .name = "docs-patch", .run = mod.Docs.command },
         .{ .name = "pkg", .run = mod.pkg.Pkg.command },
     };
@@ -39,7 +40,7 @@ pub const Tool = struct {
                 if (std.mem.eql(u8, entry.name, args[0])) return entry.run(process_init, args);
             }
         }
-        log.err("usage: zigbuildx <command> [args]; commands: apk-zip, deb, deps, docs-patch, pkg", .{});
+        log.err("usage: zigbuildx <command> [args]; commands: apk-zip, deb, deps, deps-mark, docs-patch, pkg", .{});
         return error.InvalidArguments;
     }
 };

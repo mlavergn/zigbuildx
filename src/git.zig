@@ -76,6 +76,34 @@ pub const Git = struct {
         return Self.runOptional(allocator, io, repo, &.{ "rev-parse", "--verify", "--quiet", commit });
     }
 
+    /// Names the branch HEAD is on.
+    ///
+    /// Parameters:
+    /// - `allocator`: allocator for the returned name.
+    /// - `io`: IO the `git` child is spawned on.
+    /// - `repo`: the checkout or worktree to inspect.
+    ///
+    /// Return: the branch, without `refs/heads/`, owned by the caller; `null`
+    /// when HEAD is detached; `error.GitFailed` when `git` fails otherwise, or
+    /// spawn errors.
+    pub fn currentBranch(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !?[]u8 {
+        return Self.runOptional(allocator, io, repo, &.{ "symbolic-ref", "--quiet", "--short", "HEAD" });
+    }
+
+    /// Resolves the upstream of the branch HEAD is on (`@{u}`).
+    ///
+    /// Parameters:
+    /// - `allocator`: allocator for the returned SHA.
+    /// - `io`: IO the `git` child is spawned on.
+    /// - `repo`: the checkout to inspect.
+    ///
+    /// Return: the upstream's SHA as last fetched, owned by the caller; `null`
+    /// when the branch has no upstream or HEAD is detached; `error.GitFailed`
+    /// when `git` fails otherwise, or spawn errors.
+    pub fn upstream(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !?[]u8 {
+        return Self.revParse(allocator, io, repo, "@{u}");
+    }
+
     /// Adds a worktree at `path`, detached at `commit` or on `branch`.
     ///
     /// Parameters:
@@ -476,6 +504,33 @@ test "fetch accepts a tag moved upstream" {
     const head = (try Git.revParse(allocator, io, origin, "HEAD")).?;
     defer allocator.free(head);
     try std.testing.expectEqualStrings(head, moved);
+}
+
+test "currentBranch and upstream follow a clone's branch and report a detached HEAD" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TestRepo.init(allocator, io);
+    defer repo.deinit();
+    const origin = try repo.path("origin");
+    defer allocator.free(origin);
+    const checkout = try repo.path("checkout");
+    defer allocator.free(checkout);
+    try Git.clone(io, origin, checkout);
+
+    // A clone's branch tracks origin's; origin's own branch tracks nothing.
+    const branch = (try Git.currentBranch(allocator, io, checkout)).?;
+    defer allocator.free(branch);
+    try std.testing.expectEqualStrings("main", branch);
+    const up = (try Git.upstream(allocator, io, checkout)).?;
+    defer allocator.free(up);
+    const head = (try Git.revParse(allocator, io, origin, "HEAD")).?;
+    defer allocator.free(head);
+    try std.testing.expectEqualStrings(head, up);
+    try std.testing.expectEqual(null, try Git.upstream(allocator, io, origin));
+
+    try repo.git(&.{ "git", "-C", checkout, "checkout", "--quiet", "--detach" });
+    try std.testing.expectEqual(null, try Git.currentBranch(allocator, io, checkout));
+    try std.testing.expectEqual(null, try Git.upstream(allocator, io, checkout));
 }
 
 test "worktrees: add, inspect, move, remove" {
