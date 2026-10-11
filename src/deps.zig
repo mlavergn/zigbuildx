@@ -212,6 +212,15 @@ const Target = struct {
     branch: []const u8,
 };
 
+/// What `Sync.update` did to the worktrees that follow a branch.
+const Updated = struct {
+    /// Worktrees fast-forwarded.
+    moved: usize = 0,
+    /// Worktrees skipped (uncommitted changes, commits of their own, branch
+    /// gone) or whose checkout could not be fetched.
+    failed: usize = 0,
+};
+
 /// One run of `Deps.sync`: reads the manifests and brings the worktrees in line with them.
 ///
 /// All allocation goes through `allocator`, which should be an arena (the
@@ -511,6 +520,55 @@ const Sync = struct {
         try self.followSiblings();
     }
 
+    /// Fetches every sibling checkout and fast-forwards each one that is behind its upstream.
+    ///
+    /// Siblings are the developer's own checkouts, so one is left alone, with
+    /// a warning, when it has uncommitted changes or commits its upstream
+    /// lacks; and quietly when it is not a repository of its own, is on a
+    /// detached HEAD, or its branch has no upstream. A fetch that fails (say,
+    /// offline) skips that sibling too. None of these fail the build.
+    ///
+    /// Parameters:
+    /// - `self`: the run, after `run` or `cloneSiblings` has queued the siblings.
+    ///
+    /// Return: whether any sibling moved; IO errors.
+    fn updateSiblings(self: *Self) !bool {
+        var moved = false;
+        for (self.siblings.items) |dir| {
+            const rel = try std.Io.Dir.path.relativeAlloc(self.allocator, self.root, null, self.root, dir);
+            // A directory inside some other repository is not its own checkout: leave that repository alone.
+            if (!try self.exists(try std.Io.Dir.path.join(self.allocator, &.{ dir, ".git" }))) {
+                log.info("not updating {s}: it is not a git checkout", .{rel});
+                continue;
+            }
+            const branch = (mod.Git.currentBranch(self.allocator, self.io, dir) catch continue) orelse {
+                log.info("not updating {s}: HEAD is detached", .{rel});
+                continue;
+            };
+            if ((mod.Git.upstream(self.allocator, self.io, dir) catch continue) == null) {
+                log.info("not updating {s}: {s} has no upstream branch", .{ rel, branch });
+                continue;
+            }
+            mod.Git.fetch(self.allocator, self.io, dir) catch {
+                log.warn("not updating {s}: git fetch failed", .{rel});
+                continue;
+            };
+            const tip = (mod.Git.upstream(self.allocator, self.io, dir) catch null) orelse continue;
+            const head = (mod.Git.revParse(self.allocator, self.io, dir, "HEAD") catch null) orelse continue;
+            if (std.mem.eql(u8, tip, head)) continue;
+            const clean = mod.Git.isClean(self.allocator, self.io, dir) catch false;
+            const ahead = mod.Git.isAhead(self.allocator, self.io, dir, tip) catch true;
+            if (!clean or ahead) {
+                log.warn("not updating {s}: {s} has {s}", .{ rel, branch, if (!clean) "uncommitted changes" else "commits its upstream lacks" });
+                continue;
+            }
+            mod.Git.fastForward(self.allocator, self.io, dir, tip) catch continue;
+            log.info("updated {s} ({s}) from {s} to {s}", .{ rel, branch, Self.short(head), Self.short(tip) });
+            moved = true;
+        }
+        return moved;
+    }
+
     /// Brings worktree `index` in line with its pin: creates it, moves it, or leaves it.
     ///
     /// Parameters:
@@ -708,9 +766,9 @@ const Sync = struct {
     /// Parameters:
     /// - `self`: the run, after `run`.
     ///
-    /// Return: how many worktrees were skipped or failed; IO errors.
-    fn update(self: *const Self) !usize {
-        var failed: usize = 0;
+    /// Return: how many worktrees moved, and how many were skipped or failed; IO errors.
+    fn update(self: *const Self) !Updated {
+        var updated: Updated = .{};
         var fetched: std.ArrayList([]const u8) = .empty;
         for (self.worktrees.items) |*worktree| {
             const stamp = worktree.stamp orelse continue;
@@ -719,7 +777,7 @@ const Sync = struct {
                 if (std.mem.eql(u8, checkout, stamp.checkout)) break;
             } else {
                 mod.Git.fetch(self.allocator, self.io, stamp.checkout) catch {
-                    failed += 1;
+                    updated.failed += 1;
                     continue;
                 };
                 try fetched.append(self.allocator, stamp.checkout);
@@ -727,7 +785,7 @@ const Sync = struct {
             if (!stamp.pin.follows()) continue;
             const tip = (self.lookup(stamp.checkout, stamp.pin) catch null) orelse {
                 log.warn("skipped {s}: branch {s} is gone from {s}", .{ worktree.rel, stamp.pin.value, stamp.checkout });
-                failed += 1;
+                updated.failed += 1;
                 continue;
             };
             if (std.mem.eql(u8, tip, stamp.sha)) continue;
@@ -735,17 +793,18 @@ const Sync = struct {
             const ahead = mod.Git.isAhead(self.allocator, self.io, worktree.dir, stamp.sha) catch true;
             if (!clean or ahead) {
                 log.warn("skipped {s}: it has {s}", .{ worktree.rel, if (!clean) "uncommitted changes" else "commits of its own" });
-                failed += 1;
+                updated.failed += 1;
                 continue;
             }
             mod.Git.fastForward(self.allocator, self.io, worktree.dir, tip) catch {
-                failed += 1;
+                updated.failed += 1;
                 continue;
             };
             try self.writeStamp(worktree, .{ .sha = tip, .pin = stamp.pin, .branch = stamp.branch });
             log.info("updated {s} to {s}", .{ worktree.rel, Self.short(tip) });
+            updated.moved += 1;
         }
-        return failed;
+        return updated;
     }
 
     /// Writes one line per worktree: path, pin, SHA, and clean, dirty or ahead; then the orphans left in place.
@@ -874,6 +933,110 @@ const Sync = struct {
     }
 };
 
+/// The file a failed compile leaves behind, so the next build updates its dependencies.
+///
+/// It lives at `<root>/.zig-cache/zigbuildx/update`, a fixed path: the
+/// configure phase cannot learn where the local cache really is, and the
+/// marks are written by the host tool, which is given the root. A
+/// `--cache-dir` elsewhere leaves it there all the same.
+const Breadcrumb = struct {
+    const Self = @This();
+
+    /// Its directory relative to the package root, as `b.path` takes it.
+    ///
+    /// The configure phase tracks this directory's contents rather than the
+    /// file: Zig 0.17 fails configuration (`FileSystemFailure`) on a tracked
+    /// file that is missing, despite `dependOnFileMetadata`'s doc comment.
+    /// The directory holds nothing else, so it is empty after every build
+    /// that compiled, and the configure cache holds.
+    const dir_sub_path = ".zig-cache/zigbuildx";
+
+    /// What the file says, for whoever finds it.
+    const contents = "A zig build failed to compile; the next zig build fetches and fast-forwards its dependencies, then deletes this file.\n";
+
+    /// Returns the breadcrumb's absolute path for the package at `root`.
+    ///
+    /// Parameters:
+    /// - `allocator`: allocator for the path.
+    /// - `root`: the package's absolute root.
+    ///
+    /// Return: the path, owned by the caller.
+    fn path(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+        return std.Io.Dir.path.join(allocator, &.{ root, ".zig-cache", "zigbuildx", "update" });
+    }
+
+    /// Creates the breadcrumb's directory, so the configure phase can track it.
+    ///
+    /// Parameters:
+    /// - `io`: IO for the filesystem.
+    /// - `file`: the breadcrumb's absolute path.
+    ///
+    /// Return: nothing; IO errors.
+    fn prepare(io: std.Io, file: []const u8) !void {
+        try std.Io.Dir.cwd().createDirPath(io, std.Io.Dir.path.dirname(file).?);
+    }
+
+    /// Leaves the breadcrumb.
+    ///
+    /// Parameters:
+    /// - `io`: IO for the filesystem.
+    /// - `file`: its absolute path.
+    ///
+    /// Return: nothing; IO errors.
+    fn set(io: std.Io, file: []const u8) !void {
+        try Self.prepare(io, file);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = Self.contents });
+    }
+
+    /// Removes the breadcrumb, if it is there.
+    ///
+    /// Parameters:
+    /// - `io`: IO for the filesystem.
+    /// - `file`: its absolute path.
+    ///
+    /// Return: nothing; IO errors other than "not found".
+    fn clear(io: std.Io, file: []const u8) !void {
+        std.Io.Dir.cwd().deleteFile(io, file) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
+    /// Reports whether the breadcrumb is there.
+    ///
+    /// Parameters:
+    /// - `io`: IO for the filesystem.
+    /// - `file`: its absolute path.
+    ///
+    /// Return: `true` when it exists; IO errors other than "not found".
+    fn isSet(io: std.Io, file: []const u8) !bool {
+        std.Io.Dir.cwd().access(io, file, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+};
+
+/// Why a build updates its dependencies before declaring its graph.
+const UpdateRequest = struct {
+    const Self = @This();
+    /// `-Dupdate` was given.
+    flag: bool,
+    /// A failed compile left the breadcrumb; its absolute path, to delete once consumed.
+    breadcrumb: ?[]const u8,
+
+    /// Reports whether anything asks for an update.
+    ///
+    /// Parameters:
+    /// - `self`: the request.
+    ///
+    /// Return: `true` for `-Dupdate` or a breadcrumb.
+    fn any(self: *const Self) bool {
+        return self.flag or self.breadcrumb != null;
+    }
+};
+
 /// Walks a package's `build.zig.zon` dependencies and fetches the ones missing from disk.
 ///
 /// A dependency that names a sibling checkout by `.path` can also name the
@@ -892,11 +1055,15 @@ pub const Deps = struct {
     /// The exit is not optional. The build runner was compiled before the clone
     /// existed, so a dependency cloned mid-`build()` resolves but its own `build()`
     /// never runs; only a fresh `zig build` picks it up. When nothing is missing the
-    /// return type is `void` and the call compiles away.
+    /// return type is `void`.
     ///
     /// A `.path` dependency of a sibling (`../tui` declaring `../vaxis`) is
     /// cloned from the `.clone` in the sibling's manifest: Zig opens it before
     /// the sibling's own `build()` could, and `Deps` runs for the root only.
+    ///
+    /// Also declares `-Dupdate`, which fetches every sibling checkout and
+    /// fast-forwards those behind their upstream, then exits 1 for a re-run
+    /// when any moved. A breadcrumb left by `guard` asks for the same once.
     ///
     /// Parameters:
     /// - `b`: the build graph.
@@ -904,15 +1071,20 @@ pub const Deps = struct {
     ///
     /// Return: nothing when all are present; otherwise never.
     pub fn cloneMissing(b: *std.Build, comptime zon: anytype) if (Self.allPresent(zon) and Self.siblingsPresent()) void else noreturn {
-        if (comptime Self.allPresent(zon) and Self.siblingsPresent()) return;
+        const present = comptime Self.allPresent(zon) and Self.siblingsPresent();
+        // In a dependency's build() the root's has already run.
+        if (present and !b.isRoot()) return;
         const root = Self.rootPath(b) catch |err| {
             log.err("cannot resolve the build root [{any}]", .{err});
             std.process.exit(1);
         };
+        const request: UpdateRequest = if (present) Self.updateRequest(b, root) else .{ .flag = false, .breadcrumb = null };
+        if (present and !request.any()) return;
         var run = Sync.init(b.allocator, b.graph.io, root) catch |err| {
             log.err("cannot clone dependencies [{any}]", .{err});
             std.process.exit(1);
         };
+        // With everything present this only queues the siblings, for the update.
         run.cloneSiblings() catch |err| {
             if (err == error.DepsFailed) {
                 log.err("{s}", .{run.problem});
@@ -922,6 +1094,7 @@ pub const Deps = struct {
             }
             std.process.exit(1);
         };
+        if (present) return Self.applyUpdate(&run, request, false);
         if (run.changed) {
             log.info("cloned missing dependencies; re-run zig build", .{});
         } else {
@@ -952,8 +1125,13 @@ pub const Deps = struct {
     /// while there are worktrees this poisons the configure cache, and
     /// `build()` runs on every build, as it did before 0.17.
     ///
-    /// Also declares the `deps` step, which lists the worktrees, and its
-    /// `-Dupdate` option, which fetches and fast-forwards those that follow a branch.
+    /// Also declares the `deps` step, which lists the worktrees, and
+    /// `-Dupdate`, which fetches every sibling checkout and worktree checkout
+    /// and fast-forwards the siblings and branch worktrees that are behind,
+    /// then exits 1 for a re-run when any moved. A branch worktree it must
+    /// skip (uncommitted changes, commits of its own) fails the build; a
+    /// sibling it skips only warns. A breadcrumb left by `guard` asks for the
+    /// same once.
     ///
     /// Parameters:
     /// - `b`: the build graph.
@@ -990,16 +1168,17 @@ pub const Deps = struct {
             std.process.exit(1);
         }
         if (comptime !present) {
-            log.err("{s} is still missing; an unpinned .path is used as is, so put it there or give it a .clone", .{comptime Self.missingWorktree() orelse Self.missingSibling() orelse "a .path dependency"});
+            log.err("{s} is still missing; an unpinned .path is used as is, so put it there or give it a .clone", .{comptime Self.missingWorktree() orelse (Self.missingSibling() orelse "a .path dependency")});
             std.process.exit(1);
         }
         if (run.worktrees.items.len > 0 or run.orphans.items.len > 0) b.graph.poisonCache();
-        const update = b.option(bool, "update", "With the deps step: fetch and fast-forward worktree dependencies that follow a branch") orelse false;
+        const request = Self.updateRequest(b, root);
+        if (request.any()) Self.applyUpdate(&run, request, true);
         const list = b.addRunArtifact(mod.HostTool.add(b));
         list.setName("deps");
         list.addArg("deps");
         list.addDirectoryArg2(b.path("."), .{});
-        if (update) list.addArg("--update");
+        if (request.flag) list.addArg("--update");
         // It reads and moves worktrees: never cached.
         list.has_side_effects = true;
         const top = b.step("deps", "List worktree dependencies; -Dupdate fast-forwards those that follow a branch");
@@ -1033,15 +1212,147 @@ pub const Deps = struct {
             return err;
         };
         if (run.changed) log.info("dependencies changed; re-run zig build", .{});
-        const failed = if (update) try run.update() else 0;
+        const updated: Updated = if (update) try run.update() else .{};
         var buffer: [1024]u8 = undefined;
         var stdout = std.Io.File.stdout().writer(io, &buffer);
         try run.status(&stdout.interface);
         try stdout.interface.flush();
-        if (failed > 0) {
-            log.err("{d} worktree dependencies were not updated; see the warnings above", .{failed});
+        if (updated.failed > 0) {
+            log.err("{d} worktree dependencies were not updated; see the warnings above", .{updated.failed});
             return error.DepsFailed;
         }
+    }
+
+    /// Leaves a breadcrumb while `zig build` compiles, so that a compile error makes the next build update dependencies.
+    ///
+    /// Call it last in the root's `build()`, after `cloneMissing` or `sync`
+    /// and once every artifact is declared. It wraps the default step only:
+    /// one step leaves the breadcrumb, another removes it once every `Compile`
+    /// the default step reaches has succeeded, and the default step waits for
+    /// that. A compile error stops the removal, so the breadcrumb stays, and
+    /// the next build's `cloneMissing` or `sync` updates as `-Dupdate` would,
+    /// then deletes it. A failure after the compiles (an install, a run step)
+    /// leaves none. The build runner keeps running independent steps after a
+    /// failure, so the breadcrumb is left even when a compile fails first.
+    ///
+    /// zigbuildx's own host tool is not watched, since the marks run on it.
+    ///
+    /// Parameters:
+    /// - `b`: the root package's build graph.
+    ///
+    /// Return: nothing.
+    pub fn guard(b: *std.Build) void {
+        if (!b.isRoot()) return;
+        const tool = mod.HostTool.add(b);
+        const install = b.getInstallStep();
+        var compiles: std.ArrayList(*std.Build.Step) = .empty;
+        var seen: std.AutoHashMapUnmanaged(*std.Build.Step, void) = .empty;
+        var pending: std.ArrayList(*std.Build.Step) = .empty;
+        pending.append(b.allocator, install) catch @panic("OOM");
+        while (pending.pop()) |step| {
+            if (step == &tool.step) continue;
+            const visit = seen.getOrPut(b.allocator, step) catch @panic("OOM");
+            if (visit.found_existing) continue;
+            if (step.cast(std.Build.Step.Compile) != null) compiles.append(b.allocator, step) catch @panic("OOM");
+            pending.appendSlice(b.allocator, step.dependencies.items) catch @panic("OOM");
+        }
+        if (compiles.items.len == 0) return;
+        const arm = Self.addMark(b, tool, "set");
+        const disarm = Self.addMark(b, tool, "clear");
+        disarm.step.dependOn(&arm.step);
+        for (compiles.items) |compile| disarm.step.dependOn(compile);
+        install.dependOn(&disarm.step);
+    }
+
+    /// `zigbuildx deps-mark set|clear <root>`: leaves or removes the breadcrumb that makes the next build update dependencies.
+    ///
+    /// Runs as the two steps `guard` adds.
+    ///
+    /// Parameters:
+    /// - `process_init`: the process's allocator and IO.
+    /// - `args`: the command line after the program's path; `args[0]` is the command.
+    ///
+    /// Return: nothing; `error.InvalidArguments` on a bad command line, or IO errors.
+    pub fn mark(process_init: std.process.Init, args: []const [:0]const u8) !void {
+        const set = args.len == 3 and std.mem.eql(u8, args[1], "set");
+        const clear = args.len == 3 and std.mem.eql(u8, args[1], "clear");
+        if (!set and !clear) {
+            log.err("usage: zigbuildx deps-mark set|clear <root>", .{});
+            return error.InvalidArguments;
+        }
+        const file = try Breadcrumb.path(process_init.arena.allocator(), args[2]);
+        if (set) try Breadcrumb.set(process_init.io, file) else try Breadcrumb.clear(process_init.io, file);
+    }
+
+    /// Declares `-Dupdate` and makes the breadcrumb a configure input, then reports what asks for an update.
+    ///
+    /// Parameters:
+    /// - `b`: the root package's build graph.
+    /// - `root`: its absolute root.
+    ///
+    /// Return: the request.
+    fn updateRequest(b: *std.Build, root: []const u8) UpdateRequest {
+        const flag = b.option(bool, "update", "Fetch and fast-forward sibling checkouts, and worktree dependencies that follow a branch") orelse false;
+        // Upstream is nothing the configure cache tracks: without this a repeated -Dupdate would not fetch.
+        if (flag) b.graph.poisonCache();
+        const file = Breadcrumb.path(b.allocator, root) catch @panic("OOM");
+        // The breadcrumb appearing re-runs build(); while it is absent the configure cache holds.
+        Breadcrumb.prepare(b.graph.io, file) catch |err| {
+            log.err("cannot create {s} [{any}]", .{ std.Io.Dir.path.dirname(file).?, err });
+            std.process.exit(1);
+        };
+        b.dependOnDirectoryContents(b.path(Breadcrumb.dir_sub_path));
+        const left = Breadcrumb.isSet(b.graph.io, file) catch false;
+        return .{ .flag = flag, .breadcrumb = if (left) file else null };
+    }
+
+    /// Updates the siblings and, for `sync`, the branch worktrees; exits when anything moved or a worktree was skipped.
+    ///
+    /// A consumed breadcrumb is deleted either way, so the build after this
+    /// one is an ordinary one.
+    ///
+    /// Parameters:
+    /// - `run`: the run, after `run` or `cloneSiblings`.
+    /// - `request`: what asked for the update.
+    /// - `worktrees`: whether to update worktrees too (`sync`).
+    ///
+    /// Return: nothing when nothing moved and no worktree was skipped; otherwise it exits 1.
+    fn applyUpdate(run: *Sync, request: UpdateRequest, worktrees: bool) void {
+        if (request.breadcrumb != null) log.info("the last build failed to compile; updating dependencies", .{});
+        const moved = run.updateSiblings() catch |err| {
+            log.err("cannot update dependencies [{any}]", .{err});
+            std.process.exit(1);
+        };
+        const updated: Updated = if (worktrees) run.update() catch |err| {
+            log.err("cannot update dependencies [{any}]", .{err});
+            std.process.exit(1);
+        } else .{};
+        if (request.breadcrumb) |file| Breadcrumb.clear(run.io, file) catch |err| log.warn("cannot delete {s} [{any}]", .{ file, err });
+        if (updated.failed > 0) log.err("{d} worktree dependencies were not updated; see the warnings above", .{updated.failed});
+        if (moved or updated.moved > 0) {
+            log.info("dependencies updated; re-run zig build", .{});
+            std.process.exit(1);
+        }
+        if (updated.failed > 0) std.process.exit(1);
+    }
+
+    /// Adds a step that runs `zigbuildx deps-mark <action> <root>`.
+    ///
+    /// Parameters:
+    /// - `b`: the root package's build graph.
+    /// - `tool`: zigbuildx's host tool.
+    /// - `action`: `set` or `clear`.
+    ///
+    /// Return: the step.
+    fn addMark(b: *std.Build, tool: *std.Build.Step.Compile, action: []const u8) *std.Build.Step.Run {
+        const run = b.addRunArtifact(tool);
+        run.setName(b.allocator.print("deps-mark {s}", .{action}) catch @panic("OOM"));
+        run.addArg("deps-mark");
+        run.addArg(action);
+        run.addDirectoryArg2(b.path("."), .{});
+        // It touches a file outside the cache: never cached.
+        run.has_side_effects = true;
+        return run;
     }
 
     /// Returns the absolute, resolved path of `b`'s package.
@@ -1314,6 +1625,17 @@ const TestTree = struct {
         return self.allocator().print(".{s} = .{{ .path = \"deps/{s}\", .clone = \"{s}/origin/{s}\", {s} }},", .{ name, name, self.root, name, extra });
     }
 
+    /// Writes the dependency text for sibling `name` at `../<name>`, cloned from its upstream.
+    ///
+    /// Parameters:
+    /// - `self`: the fixture.
+    /// - `name`: the dependency.
+    ///
+    /// Return: the text.
+    fn sibling(self: *Self, name: []const u8) ![]const u8 {
+        return self.allocator().print(".{s} = .{{ .path = \"../{s}\", .clone = \"{s}/origin/{s}\" }},", .{ name, name, self.root, name });
+    }
+
     /// Runs a sync of the consumer.
     ///
     /// Parameters:
@@ -1473,7 +1795,9 @@ test "update fast-forwards a branch worktree and skips a dirty one" {
     try tree.write("consumer/deps/dirty/scratch", "x");
 
     var run_ = try tree.sync();
-    try std.testing.expectEqual(1, try run_.update());
+    const updated = try run_.update();
+    try std.testing.expectEqual(1, updated.moved);
+    try std.testing.expectEqual(1, updated.failed);
     try std.testing.expectEqualStrings(try tree.rev("origin/clean", "HEAD"), try tree.rev("consumer/deps/clean", "HEAD"));
     try std.testing.expectEqualStrings(try tree.rev("origin/dirty", "v1"), try tree.rev("consumer/deps/dirty", "HEAD"));
 
@@ -1498,7 +1822,7 @@ test "update fetches a tag's checkout, so status reports the tag moved upstream"
     try tree.run(&.{ "git", "-C", origin, "tag", "--force", "v1" });
 
     var run_ = try tree.sync();
-    try std.testing.expectEqual(0, try run_.update());
+    try std.testing.expectEqual(Updated{}, try run_.update());
     // The worktree stays where its stamp put it.
     try std.testing.expectEqualStrings(pinned, try tree.rev("consumer/deps/leaf", "HEAD"));
     var out: std.Io.Writer.Allocating = .init(tree.allocator());
@@ -1616,4 +1940,80 @@ test "cloneSiblings follows siblings through a cycle and leaves their pins alone
     try std.testing.expectError(error.FileNotFound, tree.tmp.dir.access(tree.io, "local", .{}));
     try std.testing.expectError(error.FileNotFound, tree.tmp.dir.access(tree.io, "leaf/deps/own", .{}));
     try std.testing.expectEqual(3, run_.siblings.items.len);
+}
+
+test "updateSiblings fast-forwards a sibling and its own sibling, then stays put" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.upstream("leaf", "");
+    try tree.upstream("mid", try tree.sibling("leaf"));
+    try tree.consumer(try tree.sibling("mid"));
+    _ = try tree.sync();
+    for ([_][]const u8{ "origin/mid", "origin/leaf" }) |sub| try tree.commit(try tree.path(sub), "two");
+
+    var run_ = try tree.sync();
+    try std.testing.expect(try run_.updateSiblings());
+    try std.testing.expectEqualStrings(try tree.rev("origin/mid", "HEAD"), try tree.rev("mid", "HEAD"));
+    try std.testing.expectEqualStrings(try tree.rev("origin/leaf", "HEAD"), try tree.rev("leaf", "HEAD"));
+
+    var again = try tree.sync();
+    try std.testing.expect(!try again.updateSiblings());
+}
+
+test "updateSiblings leaves a dirty, ahead, detached, untracked or non-git sibling alone" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    const names = [_][]const u8{ "dirty", "ahead", "detached", "untracked" };
+    var dependencies: std.ArrayList(u8) = .empty;
+    for (names) |name| {
+        try tree.upstream(name, "");
+        try dependencies.appendSlice(tree.allocator(), try tree.sibling(name));
+    }
+    try tree.write("plain/build.zig.zon", ".{ .name = .plain }\n");
+    try dependencies.appendSlice(tree.allocator(), ".plain = .{ .path = \"../plain\" },");
+    try tree.consumer(dependencies.items);
+    _ = try tree.sync();
+    for (names) |name| try tree.commit(try tree.path(try tree.allocator().print("origin/{s}", .{name})), "two");
+    try tree.write("dirty/scratch", "x");
+    try tree.commit(try tree.path("ahead"), "mine");
+    const mine = try tree.rev("ahead", "HEAD");
+    try tree.run(&.{ "git", "-C", try tree.path("detached"), "checkout", "--quiet", "--detach" });
+    try tree.run(&.{ "git", "-C", try tree.path("untracked"), "branch", "--unset-upstream" });
+
+    var run_ = try tree.sync();
+    try std.testing.expect(!try run_.updateSiblings());
+    try std.testing.expectEqualStrings(mine, try tree.rev("ahead", "HEAD"));
+    for ([_][]const u8{ "dirty", "detached", "untracked" }) |name| {
+        try std.testing.expectEqualStrings(try tree.rev(try tree.allocator().print("origin/{s}", .{name}), "v1"), try tree.rev(name, "HEAD"));
+    }
+}
+
+test "updateSiblings follows a feature branch's upstream" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.upstream("mid", "");
+    const origin = try tree.path("origin/mid");
+    try tree.run(&.{ "git", "-C", origin, "checkout", "--quiet", "-b", "feature" });
+    try tree.consumer(try tree.sibling("mid"));
+    _ = try tree.sync();
+    try std.testing.expectEqualStrings("feature", (try mod.Git.currentBranch(tree.allocator(), tree.io, try tree.path("mid"))).?);
+    try tree.commit(origin, "two");
+
+    var run_ = try tree.sync();
+    try std.testing.expect(try run_.updateSiblings());
+    try std.testing.expectEqualStrings(try tree.rev("origin/mid", "feature"), try tree.rev("mid", "HEAD"));
+}
+
+test "Breadcrumb is set, found and cleared, each idempotently" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    const file = try Breadcrumb.path(tree.allocator(), try tree.path("consumer"));
+    try std.testing.expect(std.mem.endsWith(u8, file, try std.Io.Dir.path.join(tree.allocator(), &.{ ".zig-cache", "zigbuildx", "update" })));
+    try std.testing.expect(!try Breadcrumb.isSet(tree.io, file));
+    try Breadcrumb.set(tree.io, file);
+    try Breadcrumb.set(tree.io, file);
+    try std.testing.expect(try Breadcrumb.isSet(tree.io, file));
+    try Breadcrumb.clear(tree.io, file);
+    try Breadcrumb.clear(tree.io, file);
+    try std.testing.expect(!try Breadcrumb.isSet(tree.io, file));
 }

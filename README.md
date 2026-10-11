@@ -11,7 +11,7 @@ where the copies drift. It is imported, not run: nothing acts unless a
 
 | Extension | What it does |
 |---|---|
-| `Deps` | Clones missing sibling checkouts, and gives pinned dependencies their own git worktree |
+| `Deps` | Clones missing sibling checkouts and keeps them up to date, and gives pinned dependencies their own git worktree |
 | `Git` | Runs `git` commands for the build |
 | `Xcode` | Finds the macOS SDK, sets a macOS deployment floor, links frameworks |
 | `Swift` | Builds a Swift dylib that a Zig package links against |
@@ -82,7 +82,7 @@ make validate  # clean, format, lint, test, cross
   defaults or `PATH`. A release APK's keystore password is best passed as
   `env:VAR`, keeping it off the command line.
 - **Build options:** `-Dmacos-min` (from `Xcode.standardTargetOptions`) and
-  `-Dupdate` (for `zig build deps`).
+  `-Dupdate` (from `Deps`: fetch and fast-forward dependencies).
 - **Ignore `deps/`** in a project that pins dependencies, and keep it out of
   `zig fmt` and linting.
 
@@ -112,6 +112,34 @@ zig build deps -Dupdate   # fetch, and fast-forward branch pins
 A dependency `Deps` clones or a worktree it creates or moves ends the build
 with `error: configure command exited with code 1`, after
 `dependencies changed; re-run zig build`: run `zig build` again.
+
+Bring sibling checkouts (`../x`) up to date, with `cloneMissing` or `sync`:
+
+```sh
+zig build -Dupdate   # fetch each sibling, fast-forward those behind their upstream
+```
+
+A sibling is moved only when it is clean, on a branch with an upstream, and
+has no commits of its own; otherwise it is skipped with a warning and the
+build goes on. Under `sync`, `-Dupdate` also fast-forwards branch worktrees,
+and one it must skip fails the build. Anything moved ends the build as above,
+with `dependencies updated; re-run zig build`.
+
+To update automatically after a compile error, call `guard` last in
+`build()`:
+
+```zig
+pub fn build(b: *std.Build) !void {
+    zigbuildx.Deps.cloneMissing(b, zon);
+    // ... every artifact and step ...
+    zigbuildx.Deps.guard(b);
+}
+```
+
+When a compile reached from `zig build`'s default step fails, `guard` leaves
+`.zig-cache/zigbuildx/update`; the next `zig build` updates as `-Dupdate`
+would, then deletes it. A step that does not depend on the default one
+(usually `test`), and a failure after the compiles, leave none.
 
 Target macOS with a floor and link frameworks:
 

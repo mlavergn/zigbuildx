@@ -13,7 +13,8 @@ the workarounds behind them, are below.
   Zig outside 0.17 (it does not check the patch). Several extensions work
   around Zig 0.17.0 defects; see *Workarounds*. Version 1.x was the Zig 0.16
   release; 2.0.0 dropped 0.16; 3.0.0 made `Xcode` and `Android` take the
-  build graph at `init`; 3.2.0 made `Deps` clone a sibling's own siblings.
+  build graph at `init`; 3.2.0 made `Deps` clone a sibling's own siblings;
+  3.3.0 added `-Dupdate` for siblings and `Deps.guard`.
 - **The public surface is `build.zig`.** Consumers import this package's
   `build.zig` by dependency name, so only what it re-exports (`Deps`, `Git`,
   `Xcode`, `Swift`, `Android`, `AndroidAbi`, `Apk`, `Docs`, `Pkg`) is
@@ -99,8 +100,13 @@ Beyond ZIGSTYLE:
   directory listings, git state) must be declared: `b.dependOnFileMetadata`
   and friends where a path captures it, else `b.graph.poisonCache()`, which
   makes every build configure again. `Xcode.resolve` depends on the SDK's
-  `SDKSettings.json`; `Android.resolve`, `Deps.sync` (while worktrees exist)
-  and `Pkg` for Windows (`b.findProgram`) poison.
+  `SDKSettings.json`; `Deps` on the contents of `.zig-cache/zigbuildx/` (the
+  breadcrumb); `Android.resolve`, `Deps.sync` (while worktrees exist),
+  `Deps` under `-Dupdate` and `Pkg` for Windows (`b.findProgram`) poison.
+- **A tracked path must exist.** Despite its doc comment,
+  `dependOnFileMetadata` on a missing file fails configuration with
+  `FileSystemFailure`. Track a directory that always exists instead (create
+  it in `build()`); a directory deleted later is only a cache miss.
 - **No concrete paths at configure time.** `b.cache_root`,
   `b.getInstallPath`, `b.pathFromRoot` and `LazyPath.getPath*` are gone; the
   package root is `b.root` (a `Cache.Path`), and cache and install paths
@@ -126,8 +132,9 @@ Beyond ZIGSTYLE:
 ## Extension internals
 
 - **`Deps.cloneMissing`:** clones every root `.path` dependency that has a
-  `.clone` and is absent, then exits 1 for a re-run; it compiles away when
-  nothing is missing.
+  `.clone` and is absent, then exits 1 for a re-run. When nothing is missing
+  it only declares `-Dupdate` and checks the breadcrumb (see *Updates*), and
+  returns at once in a dependency's `build()`.
   - **Siblings of siblings:** an unpinned `.path` outside `deps/` declared by
     a sibling (`../tui` naming `../vaxis`) is cloned from the `.clone` in that
     sibling's manifest, and its manifest is followed in turn (each path once,
@@ -137,7 +144,7 @@ Beyond ZIGSTYLE:
   - **Detection:** `missingSibling` scans the runner's whole package table for
     a `.path` package (keyed by its path, which equals its `build_root`; a
     fetched one is keyed by hash) outside `deps/` with no `build_zig`, so the
-    call still compiles away in the steady state.
+    clone path still compiles away in the steady state.
 - **`Deps.sync`:** the successor, and it must come first in `build()`.
   - **Pins:** `.sha` and `.tag` give a detached worktree; `.branch` gives the
     branch `<consumer>/<branch>`, created at `origin/<branch>`. `<consumer>`
@@ -163,7 +170,8 @@ Beyond ZIGSTYLE:
   - **`zig build deps`** lists the worktrees; `-Dupdate` fetches checkouts
     behind branch and tag pins, fast-forwards branch pins (skipping any with
     work of their own, and failing at the end), and lets `status` report a
-    tag moved upstream.
+    tag moved upstream. Since 3.3.0 `build()` has already done that under
+    `-Dupdate`, so the step's own `--update` finds nothing left to move.
   - **Return type:** `noreturn` while a `deps/` package is missing from the
     runner's table, so code after the call is not compiled; that lets a
     transitive top-level `@import` wait. A worktree dependency must have a
@@ -175,6 +183,32 @@ Beyond ZIGSTYLE:
     only unpinned dependencies keeps the cache. The `deps` step runs the host
     tool's `deps` command, which reads the manifests again (no `git` in the
     steady state) before `status` and `update`.
+- **Updates (`-Dupdate`, 3.3.0):** declared by `cloneMissing` and `sync` for
+  the root only; it poisons the configure cache, since upstream is nothing Zig
+  tracks.
+  - **Siblings** (`Sync.updateSiblings`, every unpinned `.path` outside
+    `deps/`, siblings of siblings included): `git fetch`, then `merge
+    --ff-only @{u}`. Skipped quietly when not its own checkout (no `.git`; a
+    directory inside another repository is left alone), detached, or with no
+    upstream; with a warning when dirty, ahead of `@{u}`, or the fetch fails.
+    A skipped sibling never fails the build.
+  - **Worktrees** (`sync` only): the existing `Sync.update`, run in
+    `build()`; one it skips fails the build, after everything else is updated.
+  - **Anything moved** exits 1 for a re-run, as a clone does.
+- **`Deps.guard` (the breadcrumb):** called last in the root's `build()`. It
+  walks the default step for every `Compile` (skipping the host tool), adds
+  `deps-mark set` (no ordering) and `deps-mark clear` (after `set` and every
+  `Compile`), and makes the default step wait for `clear`. The build runner
+  keeps running independent steps after a failure, so a compile error leaves
+  `<root>/.zig-cache/zigbuildx/update`; a failure after the compiles does not.
+  - **Consumed** by the next `cloneMissing` or `sync`: the directory's
+    contents are a configure input, so the file re-runs `build()`, which
+    updates as `-Dupdate` would and deletes it. Each failing build therefore
+    costs one fetch per sibling on the next.
+  - **Fixed path:** the configurer cannot learn the real cache directory, so
+    a `--cache-dir` elsewhere still uses `<root>/.zig-cache/zigbuildx/`.
+  - **Not covered:** steps that do not reach the default step (`test`), and a
+    compile error in `build.zig` itself, which stops before `build()` runs.
 - **`Git`:** one thin wrapper per command, given the directory git runs in;
   no manifest knowledge. `Deps` owns the policy.
 - **`Xcode`:**
@@ -301,9 +335,9 @@ contents.
 ## Adopters
 
 Every Zig project under `~/src/inferise` and `~/src/mlavergn` that lists
-zigbuildx (about 27) pins `git+https://github.com/mlavergn/zigbuildx#v3.0.0`
-with its `.hash`. Their Zig 0.17 ports are uncommitted. Nearly all use
-`Xcode` and `Deps.cloneMissing`; beyond that:
+zigbuildx (29) tracks `git+https://github.com/mlavergn/zigbuildx#main`, with
+the `.hash` of the commit last fetched. Their Zig 0.17 ports are uncommitted.
+Nearly all use `Xcode` and `Deps.cloneMissing`; beyond that:
 
 | Repo | Uses |
 |---|---|
@@ -314,11 +348,16 @@ with its `.hash`. Their Zig 0.17 ports are uncommitted. Nearly all use
 | zigagent | `Swift.fromDependency` (zigafm's dylib) |
 | zlintpre | `Pkg` |
 
-- **Version bumps:** bump `.version` on any change, push the tag, then in each
-  adopter run `zig fetch --save-exact=zigbuildx
-  git+https://github.com/mlavergn/zigbuildx#v<x.y.z>`, which keeps the tag in
-  the URL. Before the tag is pushed, `zig fetch .` from this repo puts the
-  same hash in the global cache, so adopters build against it locally.
+- **Version bumps:** bump `.version` on any change, push `main` and the tag,
+  then in each adopter run `zig fetch --save-exact=zigbuildx
+  git+https://github.com/mlavergn/zigbuildx#main`, which keeps `#main` in the
+  URL and refreshes the hash. Before `main` is pushed, `zig fetch .` from this
+  repo puts the same hash in the global cache, so adopters build against it
+  locally.
+- **From 3.2.0 to 3.3.0:** nothing required; add `zigbuildx.Deps.guard(b);`
+  last in `build()` to update after a compile error. Pilot: zigclaude.
+- **From 3.0.0 to 3.1.0:** a `Pkg` adopter's manifest replaces `.org` with a
+  three-label `.bundle` (zlintpre: `.bundle = "com.inferise.zlintpre"`).
 - **From 2.0.0 to 3.0.0:** `Xcode.init(b.allocator, b.graph.io)` becomes
   `Xcode.init(b)` and `resolve(b)` becomes `resolve()`; `Android` likewise,
   with `configure(b, lib)` becoming `configure(lib)`.
