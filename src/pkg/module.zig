@@ -4,6 +4,7 @@ const std = @import("std");
 const parent = @import("../module.zig");
 
 pub const Pkg = @import("pkg.zig").Pkg;
+pub const PkgLibrary = @import("pkg.zig").PkgLibrary;
 pub const PkgOptions = @import("pkg.zig").PkgOptions;
 pub const PkgRun = @import("pkg.zig").PkgRun;
 pub const Signing = @import("pkg.zig").Signing;

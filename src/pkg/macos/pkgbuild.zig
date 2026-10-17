@@ -26,6 +26,7 @@ pub const Pkgbuild = struct {
         const root = try std.Io.Dir.path.join(allocator, &.{ stage, "root" });
         const scripts = try std.Io.Dir.path.join(allocator, &.{ stage, "scripts" });
         const bins = try run.copyExecutables(try std.Io.Dir.path.join(allocator, &.{ root, "bin" }));
+        const libs = try run.copyLibraries(try std.Io.Dir.path.join(allocator, &.{ root, "lib" }));
         try run.writeScript(try std.Io.Dir.path.join(allocator, &.{ root, "uninstall.sh" }), "uninstall.sh", true);
         try run.writeScript(try std.Io.Dir.path.join(allocator, &.{ scripts, "preinstall" }), "preinstall", true);
         try run.writeScript(try std.Io.Dir.path.join(allocator, &.{ scripts, "postinstall" }), "postinstall", true);
@@ -35,6 +36,8 @@ pub const Pkgbuild = struct {
         try argv.appendSlice(allocator, &.{ "pkgbuild", "--identifier", run.id(), "--version", run.version });
         if (signing) |settings| {
             const application = try allocator.print("Developer ID Application: {s} ({s})", .{ settings.apple_name.?, settings.apple_team.? });
+            // Notarization refuses a package holding any unsigned Mach-O, libraries included.
+            for (libs) |lib| _ = try run.runTool(&.{ "codesign", "-s", application, "--timestamp", "-o", "runtime", "-f", lib }, null);
             for (bins) |bin| _ = try run.runTool(&.{ "codesign", "-s", application, "--timestamp", "-o", "runtime", "-f", bin }, null);
             try argv.appendSlice(allocator, &.{ "--sign", try allocator.print("Developer ID Installer: {s} ({s})", .{ settings.apple_name.?, settings.apple_team.? }) });
         } else {

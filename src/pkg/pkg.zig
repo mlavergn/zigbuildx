@@ -58,11 +58,23 @@ pub const PkgLabels = struct {
     name: []const u8,
 };
 
+/// A shared library the programs load, and the file name it is installed as.
+pub const PkgLibrary = struct {
+    /// The file name in `lib`, e.g. `libfoo.dylib`; what the programs' install names expect.
+    name: []const u8,
+    /// The built library.
+    path: std.Build.LazyPath,
+};
+
 /// What to package.
 pub const PkgOptions = struct {
     const Self = @This();
     /// The programs to install in `bin`, all built for one target.
     executables: []const *std.Build.Step.Compile,
+    /// The shared libraries the programs load, installed in `lib` beside
+    /// `bin` (in `bin` on Windows, where a DLL is looked for beside its
+    /// program) and signed as the programs are.
+    libraries: []const PkgLibrary = &.{},
     /// A directory of script templates replacing the embedded ones of the
     /// same name: `preinstall`, `postinstall`, `uninstall.sh` (macOS),
     /// `preinst`, `postrm`, `profile.sh` (Linux). They are filled in the
@@ -88,6 +100,12 @@ pub const PkgRun = struct {
         .{ .name = "profile.sh", .text = @embedFile("linux/profile.sh") },
     };
 
+    /// A shared library to stage: the name it is installed as, and where it was built.
+    const Library = struct {
+        name: []const u8,
+        path: []const u8,
+    };
+
     allocator: std.mem.Allocator,
     io: std.Io,
     /// The package's name: the last label of `.bundle`.
@@ -106,6 +124,8 @@ pub const PkgRun = struct {
     scripts: ?[]const u8 = null,
     /// The built programs, by path.
     executables: []const []const u8 = &.{},
+    /// The shared libraries, from each `--library=<name>=<path>`.
+    libraries: std.ArrayList(Library) = .empty,
 
     /// Creates a run.
     ///
@@ -120,11 +140,14 @@ pub const PkgRun = struct {
 
     /// Reads `--key=value` options and, after `--`, the programs.
     ///
+    /// `--library=<name>=<path>` may repeat, once per shared library.
+    ///
     /// Parameters:
     /// - `self`: the run.
     /// - `args`: the options.
     ///
-    /// Return: nothing; `error.InvalidArguments` on an unknown option.
+    /// Return: nothing; `error.InvalidArguments` on an unknown option or a
+    /// `--library` without a name, or `error.OutOfMemory`.
     pub fn parseArgs(self: *Self, args: []const [:0]const u8) !void {
         for (args, 0..) |arg, i| {
             if (std.mem.eql(u8, arg, "--")) {
@@ -141,6 +164,10 @@ pub const PkgRun = struct {
                 }
             } else if (std.mem.eql(u8, key, "--scripts")) {
                 self.scripts = value;
+            } else if (std.mem.eql(u8, key, "--library")) {
+                const split = std.mem.findScalar(u8, value, '=') orelse return error.InvalidArguments;
+                if (split == 0 or split + 1 == value.len) return error.InvalidArguments;
+                try self.libraries.append(self.allocator, .{ .name = value[0..split], .path = value[split + 1 ..] });
             } else {
                 log.err("unknown option {s}", .{arg});
                 return error.InvalidArguments;
@@ -161,6 +188,25 @@ pub const PkgRun = struct {
         for (self.executables) |from| {
             const to = try std.Io.Dir.path.join(self.allocator, &.{ dir, std.Io.Dir.path.basename(from) });
             try std.Io.Dir.cwd().copyFile(from, std.Io.Dir.cwd(), to, self.io, .{});
+            try copies.append(self.allocator, to);
+        }
+        return copies.items;
+    }
+
+    /// Copies the shared libraries into `dir`, each under its own name.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    /// - `dir`: the destination, created only when there is a library to copy.
+    ///
+    /// Return: the copies' paths; IO errors.
+    pub fn copyLibraries(self: *const Self, dir: []const u8) ![]const []const u8 {
+        if (self.libraries.items.len == 0) return &.{};
+        try std.Io.Dir.cwd().createDirPath(self.io, dir);
+        var copies: std.ArrayList([]const u8) = .empty;
+        for (self.libraries.items) |library| {
+            const to = try std.Io.Dir.path.join(self.allocator, &.{ dir, library.name });
+            try std.Io.Dir.cwd().copyFile(library.path, std.Io.Dir.cwd(), to, self.io, .{});
             try copies.append(self.allocator, to);
         }
         return copies.items;
@@ -277,6 +323,7 @@ pub const PkgRun = struct {
     fn buildDeb(self: *const Self, stage: []const u8, out: []const u8) !void {
         const prefix = try self.allocator.print("usr/local/{s}/{s}", .{ self.orgLabel(), self.name });
         _ = try self.copyExecutables(try std.Io.Dir.path.join(self.allocator, &.{ stage, "data", prefix, "bin" }));
+        _ = try self.copyLibraries(try std.Io.Dir.path.join(self.allocator, &.{ stage, "data", prefix, "lib" }));
         try self.writeScript(try std.Io.Dir.path.join(self.allocator, &.{ stage, "data", "etc", "profile.d", try self.allocator.print("{s}.sh", .{self.name}) }), "profile.sh", false);
         try self.writeScript(try std.Io.Dir.path.join(self.allocator, &.{ stage, "control", "preinst" }), "preinst", true);
         try self.writeScript(try std.Io.Dir.path.join(self.allocator, &.{ stage, "control", "postrm" }), "postrm", true);
@@ -374,6 +421,7 @@ pub const Pkg = struct {
     /// One line describing the package, from `.description` or the name.
     description: []const u8,
     executables: []const *std.Build.Step.Compile,
+    libraries: []const PkgLibrary,
     scripts: ?std.Build.LazyPath,
     /// The target the executables are built for; valid unless `problem` is set.
     // SAFETY: populated by check() before first read, unless problem is set.
@@ -403,6 +451,7 @@ pub const Pkg = struct {
             .version = zon.version,
             .description = if (@hasField(@TypeOf(zon), "description")) zon.description else @tagName(zon.name),
             .executables = b.allocator.dupe(*std.Build.Step.Compile, options.executables) catch @panic("OOM"),
+            .libraries = b.allocator.dupe(PkgLibrary, options.libraries) catch @panic("OOM"),
             .scripts = options.scripts,
         };
         self.problem = self.check(b);
@@ -492,6 +541,7 @@ pub const Pkg = struct {
         const out = run.addOutputFileArg2(file_name, .{});
         self.addOptions(b, run);
         if (self.target.os.tag == .linux) run.addArg(b.fmt("--arch={s}", .{mod.Deb.arch(self.target.cpu.arch).?}));
+        for (self.libraries) |library| run.addFileArg2(library.path, .{ .prefix = b.fmt("--library={s}=", .{library.name}) });
         run.addArg("--");
         for (self.executables) |exe| run.addArtifactArg2(exe, .{});
         // Signing reads signing.zon and the keychain, and scripts are read from
@@ -543,6 +593,10 @@ pub const Pkg = struct {
             _ = stage.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{file}));
             files.append(b.allocator, file) catch @panic("OOM");
         }
+        for (self.libraries) |library| {
+            _ = stage.addCopyFile(library.path, b.fmt("bin/{s}", .{library.name}));
+            files.append(b.allocator, library.name) catch @panic("OOM");
+        }
         const msi = mod.Msi{ .name = self.name, .org = Self.labels(self.bundle).?.org, .id = self.bundle, .version = self.version, .files = files.items };
         const xml = msi.render(b.allocator) catch |err| switch (err) {
             error.InvalidVersion => return &b.addFail(b.fmt(".version = \"{s}\" is not one an MSI can carry: major.minor.patch, at most 255.255.65535", .{self.version})).step,
@@ -565,6 +619,7 @@ pub const Pkg = struct {
         run.setCwd(stage.getDirectory());
         // wixl reads bin/ through the stage's path, which a Run step does not hash.
         for (self.executables) |exe| run.addFileInput(exe.getEmittedBin());
+        for (self.libraries) |library| run.addFileInput(library.path);
         run.addFileInput(stage.getDirectory().path(b, "product.wxs"));
         return &b.addInstallFileWithDir(out, .prefix, b.fmt("pkg/{s}", .{file_name})).step;
     }
@@ -601,6 +656,16 @@ pub const Pkg = struct {
         for (self.executables, 0..) |exe, i| {
             for (self.executables[i + 1 ..]) |other| {
                 if (std.mem.eql(u8, exe.name, other.name)) return b.fmt("two executables install as bin/{s}; give them different names", .{Self.exeName(exe)});
+            }
+        }
+        for (self.libraries, 0..) |library, i| {
+            if (!Self.isSafe(library.name)) return b.fmt("library name \"{s}\" may hold only letters, digits, '.', '-' and '_'", .{library.name});
+            for (self.libraries[i + 1 ..]) |other| {
+                if (std.mem.eql(u8, library.name, other.name)) return b.fmt("two libraries install as {s}; give them different names", .{library.name});
+            }
+            // Windows stages libraries in `bin` beside the programs.
+            for (self.executables) |exe| {
+                if (std.mem.eql(u8, library.name, Self.exeName(exe))) return b.fmt("library {s} has the name of an executable", .{library.name});
             }
         }
         self.target = self.executables[0].rootModuleTarget();
@@ -725,13 +790,20 @@ test "parseArgs reads options and programs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var run = try PkgRun.init(arena.allocator(), std.testing.io);
-    try run.parseArgs(&.{ "--name=tool", "--bundle=com.acme.tool", "--version=1.2.3", "--summary=A tool", "--scripts=s", "--", "a/tool", "b/helper" });
+    try run.parseArgs(&.{ "--name=tool", "--bundle=com.acme.tool", "--version=1.2.3", "--summary=A tool", "--scripts=s", "--library=libx.dylib=c/x=1/libx.dylib", "--library=liby.so=d/liby.so", "--", "a/tool", "b/helper" });
     try std.testing.expectEqualStrings("tool", run.name);
     try std.testing.expectEqualStrings("com.acme.tool", run.id());
     try std.testing.expectEqualStrings("acme", run.orgLabel());
     try std.testing.expectEqualStrings("s", run.scripts.?);
     try std.testing.expectEqual(@as(usize, 2), run.executables.len);
+    try std.testing.expectEqual(@as(usize, 2), run.libraries.items.len);
+    try std.testing.expectEqualStrings("libx.dylib", run.libraries.items[0].name);
+    // Only the first `=` after the name splits: a path may hold one.
+    try std.testing.expectEqualStrings("c/x=1/libx.dylib", run.libraries.items[0].path);
+    try std.testing.expectEqualStrings("d/liby.so", run.libraries.items[1].path);
     try std.testing.expectError(error.InvalidArguments, run.parseArgs(&.{"--nope"}));
+    try std.testing.expectError(error.InvalidArguments, run.parseArgs(&.{"--library=nopath"}));
+    try std.testing.expectError(error.InvalidArguments, run.parseArgs(&.{"--library==a/libx.dylib"}));
 }
 
 test "isSafe allows letters, digits, '.', '-' and '_'" {

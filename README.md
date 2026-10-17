@@ -214,6 +214,13 @@ zig build pkg -Doptimize=fast -Dtarget=x86_64-windows # <name>-<version>-x64.msi
 zig build pkg-notarize -Doptimize=fast                # macOS: notarize and staple
 ```
 
+Shared libraries the programs load go in `lib` beside `bin`, under the name
+the programs expect (on Windows, in `bin`), and are signed with them:
+
+```zig
+_ = zigbuildx.Pkg.add(b, zon, .{ .executables = &.{exe}, .libraries = &.{.{ .name = "libfoo.dylib", .path = dylib }} });
+```
+
 Packages install to `/usr/local/<org>/<name>` (per user under
 `%LOCALAPPDATA%\<org>\<name>` on Windows) and put its `bin` on `PATH`, where
 `.bundle = "com.<org>.<name>"`; `com.example.tool` installs to
