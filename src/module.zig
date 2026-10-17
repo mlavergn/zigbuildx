@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 
 pub const is_debug = builtin.mode == .debug;
 
+pub const ZipArchive = @import("zip_archive.zig").ZipArchive;
 pub const Deps = @import("deps.zig").Deps;
 pub const Git = @import("git.zig").Git;
 pub const WorktreeHead = @import("git.zig").WorktreeHead;

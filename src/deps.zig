@@ -90,10 +90,19 @@ const Entry = struct {
     name: []const u8,
     path: ?[]const u8 = null,
     clone: ?[]const u8 = null,
+    archive: ?[]const u8 = null,
     checkout: ?[]const u8 = null,
     sha: ?[]const u8 = null,
     tag: ?[]const u8 = null,
     branch: ?[]const u8 = null,
+};
+
+/// Where an absent `.path` dependency comes from.
+const Source = union(enum) {
+    /// A git repository to clone (`.clone`).
+    clone: []const u8,
+    /// A zip to download and unpack (`.archive`).
+    archive: []const u8,
 };
 
 /// The parts of a `build.zig.zon` `Deps` reads at run time.
@@ -169,7 +178,7 @@ const Manifest = struct {
                     .string_literal => |text| text,
                     else => continue,
                 };
-                inline for (.{ "path", "clone", "checkout", "sha", "tag", "branch" }) |field| {
+                inline for (.{ "path", "clone", "archive", "checkout", "sha", "tag", "branch" }) |field| {
                     if (std.mem.eql(u8, key.get(zoir), field)) @field(entry, field) = try allocator.dupe(u8, text);
                 }
             }
@@ -241,10 +250,15 @@ const Sync = struct {
     siblings: std.ArrayList([]const u8) = .empty,
     /// How many of `siblings` have had their manifests read.
     walked: usize = 0,
+    /// Paths unpacked from an `.archive`, absolute: no git checkouts, so never updated.
+    archives: std.ArrayList([]const u8) = .empty,
     /// Orphans left in place, relative to the consumer.
     orphans: std.ArrayList([]const u8) = .empty,
     /// Whether anything was cloned, created or moved, so the build must re-run.
     changed: bool = false,
+    /// Whether an archive was unpacked. That needs no re-run: nothing compiles
+    /// an archive's Zig code, and its files are read only once the build runs.
+    unpacked: bool = false,
     /// What went wrong, when a function returns `error.DepsFailed`.
     problem: []const u8 = "",
 
@@ -298,7 +312,8 @@ const Sync = struct {
     /// package, must be a direct child of a `deps` directory inside the
     /// consumer. An **unpinned** dependency's `.path` is used as is, wherever
     /// it points. The first declaration of a path wins, pinned or not; a later
-    /// one that pins it differently is ignored with a warning.
+    /// one that pins it differently is ignored with a warning. An `.archive`
+    /// dependency is pinned by its URL alone, so it may not set a pin field.
     ///
     /// Parameters:
     /// - `self`: the run.
@@ -312,8 +327,12 @@ const Sync = struct {
         const is_root = std.mem.eql(u8, dir, self.root);
         for (manifest.entries) |entry| {
             const pin = try self.pinOf(manifest.name, entry);
+            const source = try self.sourceOf(manifest.name, entry);
+            const archive = if (source) |from| from == .archive else false;
+            if (pin != null and archive) return self.fail("{s} pins {s}, but an .archive dependency is pinned by its URL alone", .{ manifest.name, entry.name });
             const path = entry.path orelse {
                 if (pin != null and is_root) return self.fail("{s} pins {s}, which is not a worktree dependency (its .path must be under deps/)", .{ manifest.name, entry.name });
+                if (archive and is_root) return self.fail("{s} names an .archive for {s}, which has no .path to unpack it at", .{ manifest.name, entry.name });
                 continue;
             };
             const resolved = try std.Io.Dir.path.resolveAlloc(self.allocator, &.{ dir, path });
@@ -332,16 +351,17 @@ const Sync = struct {
                 if (pin) |wanted| log.warn("{s} pins {s} to {t} {s}; using the path as is, as an earlier declaration does", .{ manifest.name, rel, wanted.kind, wanted.value });
                 continue;
             }
-            // Unpinned: the path is used as is. Under deps/ the root clones it when
-            // absent, as cloneMissing does; a sibling outside deps/ is cloned
-            // whoever declares it, and its own dependencies are followed.
+            // Unpinned: the path is used as is. Under deps/ the root clones or
+            // unpacks it when absent, as cloneMissing does; a sibling outside
+            // deps/ is fetched whoever declares it, and its own dependencies
+            // are followed.
             const wanted = pin orelse {
                 if (!pinnable) {
-                    try self.addSibling(resolved, entry.clone);
+                    try self.addSibling(resolved, source);
                     continue;
                 }
                 try self.unpinned.append(self.allocator, resolved);
-                if (is_root) if (entry.clone) |url| try self.cloneSibling(resolved, url);
+                if (is_root) if (source) |from| try self.materialize(resolved, from);
                 continue;
             };
             try self.worktrees.append(self.allocator, .{
@@ -376,6 +396,22 @@ const Sync = struct {
         }
         if (count > 1) return self.fail("{s}: {s} sets more than one of .sha, .tag and .branch", .{ package, entry.name });
         return pin;
+    }
+
+    /// Reads where an entry is fetched from when it is absent.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    /// - `package`: the declaring package, for the message.
+    /// - `entry`: the dependency.
+    ///
+    /// Return: the source, or `null` when it names none; `error.DepsFailed`
+    /// when it sets both `.clone` and `.archive`.
+    fn sourceOf(self: *Self, package: []const u8, entry: Entry) !?Source {
+        if (entry.clone != null and entry.archive != null) return self.fail("{s}: {s} sets both .clone and .archive", .{ package, entry.name });
+        if (entry.clone) |url| return .{ .clone = url };
+        if (entry.archive) |url| return .{ .archive = url };
+        return null;
     }
 
     /// Reports whether `path` is a direct child of a `deps` directory inside the consumer.
@@ -441,39 +477,88 @@ const Sync = struct {
         return false;
     }
 
-    /// Clones an unpinned root dependency that is absent, as `cloneMissing` does.
+    /// Clones or unpacks an unpinned dependency from `source`, as `cloneMissing` does.
+    ///
+    /// A clone happens only when the path is absent. An archive is also
+    /// unpacked again when its URL changed; see `ensureArchive`.
     ///
     /// Parameters:
     /// - `self`: the run.
     /// - `path`: the dependency's absolute path.
-    /// - `url`: where to clone it from.
+    /// - `source`: where it comes from.
     ///
-    /// Return: nothing; clone errors, which `Git.clone` logs.
-    fn cloneSibling(self: *Self, path: []const u8, url: []const u8) !void {
-        if (try self.exists(path)) return;
-        try mod.Git.clone(self.io, url, path);
-        self.changed = true;
+    /// Return: nothing; `error.DepsFailed` for an archive, or clone errors, which `Git.clone` logs.
+    fn materialize(self: *Self, path: []const u8, source: Source) !void {
+        switch (source) {
+            .clone => |url| {
+                if (try self.exists(path)) return;
+                try mod.Git.clone(self.io, url, path);
+                self.changed = true;
+            },
+            .archive => |url| try self.ensureArchive(path, url),
+        }
     }
 
-    /// Queues the sibling checkout at `path`, cloning it from `url` when absent.
+    /// Unpacks an `.archive` dependency when it is absent or was unpacked from another URL.
     ///
-    /// Each path is queued once, so a cycle of siblings ends. One that is absent
-    /// with no `url` is left for Zig to report.
+    /// The directory's stamp records its URL, so an unchanged one costs a
+    /// file read and no download. A directory without a stamp is not
+    /// zigbuildx's to replace.
     ///
     /// Parameters:
     /// - `self`: the run.
     /// - `path`: the dependency's absolute path.
-    /// - `url`: where to clone it from, if anywhere.
+    /// - `url`: the zip's URL.
     ///
-    /// Return: nothing; clone errors, which `Git.clone` logs.
-    fn addSibling(self: *Self, path: []const u8, url: ?[]const u8) !void {
+    /// Return: nothing; `error.DepsFailed` when the path holds something else
+    /// or the archive cannot be fetched, or IO errors.
+    fn ensureArchive(self: *Self, path: []const u8, url: []const u8) !void {
+        if (!self.isArchive(path)) try self.archives.append(self.allocator, path);
+        const rel = try std.Io.Dir.path.relativeAlloc(self.allocator, self.root, null, self.root, path);
+        if (try self.exists(path)) {
+            const unpacked = try mod.ZipArchive.source(self.allocator, self.io, path) orelse {
+                return self.fail("{s} exists but zigbuildx did not unpack it (it has no {s}); move it aside and re-run", .{ rel, mod.ZipArchive.stamp_name });
+            };
+            if (std.mem.eql(u8, unpacked, url)) return;
+            log.info("{s} was unpacked from {s}; replacing it", .{ rel, unpacked });
+        }
+        mod.ZipArchive.unpack(self.allocator, self.io, url, path) catch |err| {
+            return self.fail("cannot unpack {s} into {s} [{any}]", .{ url, rel, err });
+        };
+        self.unpacked = true;
+    }
+
+    /// Reports whether `dir` was unpacked from an `.archive`.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    /// - `dir`: an absolute path.
+    ///
+    /// Return: `true` when an `.archive` dependency names it.
+    fn isArchive(self: *const Self, dir: []const u8) bool {
+        for (self.archives.items) |path| {
+            if (std.mem.eql(u8, path, dir)) return true;
+        }
+        return false;
+    }
+
+    /// Queues the sibling at `path`, cloning or unpacking it from `source` as `materialize` does.
+    ///
+    /// Each path is queued once, so a cycle of siblings ends. One that is absent
+    /// with no `source` is left for Zig to report.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    /// - `path`: the dependency's absolute path.
+    /// - `source`: where it comes from, if anywhere.
+    ///
+    /// Return: nothing; `error.DepsFailed` for an archive, or clone errors, which `Git.clone` logs.
+    fn addSibling(self: *Self, path: []const u8, source: ?Source) !void {
         for (self.siblings.items) |seen| {
             if (std.mem.eql(u8, seen, path)) return;
         }
         try self.siblings.append(self.allocator, path);
-        if (try self.exists(path)) return;
-        try mod.Git.clone(self.io, url orelse return, path);
-        self.changed = true;
+        try self.materialize(path, source orelse return);
     }
 
     /// Reads each queued sibling's manifest and queues its unpinned `.path` dependencies outside `deps/`.
@@ -497,12 +582,12 @@ const Sync = struct {
                 if (entry.sha != null or entry.tag != null or entry.branch != null) continue;
                 const resolved = try std.Io.Dir.path.resolveAlloc(self.allocator, &.{ dir, path });
                 if (self.isWorktreePath(resolved)) continue;
-                try self.addSibling(resolved, entry.clone);
+                try self.addSibling(resolved, try self.sourceOf(manifest.name, entry));
             }
         }
     }
 
-    /// Clones every absent `.path` dependency of the root, then of its siblings, as `cloneMissing` does.
+    /// Clones or unpacks every absent `.path` dependency of the root, then of its siblings, as `cloneMissing` does.
     ///
     /// The root's entries are cloned whatever they pin, as `cloneMissing`
     /// always has; no worktree is made.
@@ -515,7 +600,7 @@ const Sync = struct {
         const manifest = try self.readManifest(self.root) orelse return self.fail("no build.zig.zon in {s}", .{self.root});
         for (manifest.entries) |entry| {
             const path = entry.path orelse continue;
-            try self.addSibling(try std.Io.Dir.path.resolveAlloc(self.allocator, &.{ self.root, path }), entry.clone);
+            try self.addSibling(try std.Io.Dir.path.resolveAlloc(self.allocator, &.{ self.root, path }), try self.sourceOf(manifest.name, entry));
         }
         try self.followSiblings();
     }
@@ -535,6 +620,8 @@ const Sync = struct {
     fn updateSiblings(self: *Self) !bool {
         var moved = false;
         for (self.siblings.items) |dir| {
+            // An archive's URL is its pin: `ensureArchive` has already brought it in line.
+            if (self.isArchive(dir)) continue;
             const rel = try std.Io.Dir.path.relativeAlloc(self.allocator, self.root, null, self.root, dir);
             // A directory inside some other repository is not its own checkout: leave that repository alone.
             if (!try self.exists(try std.Io.Dir.path.join(self.allocator, &.{ dir, ".git" }))) {
@@ -1040,9 +1127,10 @@ const UpdateRequest = struct {
 /// Walks a package's `build.zig.zon` dependencies and fetches the ones missing from disk.
 ///
 /// A dependency that names a sibling checkout by `.path` can also name the
-/// repository to fetch it from by `.clone` — a field plain Zig ignores.
-/// `cloneMissing` reads both, and clones every such dependency whose checkout is
-/// absent before the build graph is declared.
+/// repository to fetch it from by `.clone`, or a zip to unpack there by
+/// `.archive` — fields plain Zig ignores. `cloneMissing` reads them, and
+/// fetches every such dependency that is absent before the build graph is
+/// declared.
 ///
 /// `sync` does that too, and also gives each dependency whose `.path` is under
 /// `deps/` its own git worktree of the shared checkout, pinned by `.sha`,
@@ -1061,6 +1149,12 @@ pub const Deps = struct {
     /// cloned from the `.clone` in the sibling's manifest: Zig opens it before
     /// the sibling's own `build()` could, and `Deps` runs for the root only.
     ///
+    /// A `.path` dependency with an `.archive` instead of a `.clone` is
+    /// downloaded and unpacked there (see `ZipArchive`), and the build goes
+    /// on: no Zig code imports an archive, so no re-run is needed. Its stamp
+    /// is checked whenever `build()` runs, so a new `.archive` URL in the
+    /// root's manifest replaces it the same way.
+    ///
     /// Also declares `-Dupdate`, which fetches every sibling checkout and
     /// fast-forwards those behind their upstream, then exits 1 for a re-run
     /// when any moved. A breadcrumb left by `guard` asks for the same once.
@@ -1070,8 +1164,8 @@ pub const Deps = struct {
     /// - `zon`: the caller's `@import("build.zig.zon")`.
     ///
     /// Return: nothing when all are present; otherwise never.
-    pub fn cloneMissing(b: *std.Build, comptime zon: anytype) if (Self.allPresent(zon) and Self.siblingsPresent()) void else noreturn {
-        const present = comptime Self.allPresent(zon) and Self.siblingsPresent();
+    pub fn cloneMissing(b: *std.Build, comptime zon: anytype) if (Self.allPresent(zon) and Self.siblingsPresent(zon)) void else noreturn {
+        const present = comptime Self.allPresent(zon) and Self.siblingsPresent(zon);
         // In a dependency's build() the root's has already run.
         if (present and !b.isRoot()) return;
         const root = Self.rootPath(b) catch |err| {
@@ -1079,12 +1173,14 @@ pub const Deps = struct {
             std.process.exit(1);
         };
         const request: UpdateRequest = if (present) Self.updateRequest(b, root) else .{ .flag = false, .breadcrumb = null };
-        if (present and !request.any()) return;
+        // An archive's URL can change without it going missing: its stamp is read each time.
+        if (present and !request.any() and comptime !Self.hasArchive(zon)) return;
         var run = Sync.init(b.allocator, b.graph.io, root) catch |err| {
             log.err("cannot clone dependencies [{any}]", .{err});
             std.process.exit(1);
         };
-        // With everything present this only queues the siblings, for the update.
+        // With everything present this queues the siblings, for the update, and
+        // unpacks any archive whose URL changed.
         run.cloneSiblings() catch |err| {
             if (err == error.DepsFailed) {
                 log.err("{s}", .{run.problem});
@@ -1094,11 +1190,18 @@ pub const Deps = struct {
             }
             std.process.exit(1);
         };
-        if (present) return Self.applyUpdate(&run, request, false);
-        if (run.changed) {
-            log.info("cloned missing dependencies; re-run zig build", .{});
+        if (present) {
+            if (run.changed) {
+                log.info("dependencies changed; re-run zig build", .{});
+                std.process.exit(1);
+            }
+            if (request.any()) Self.applyUpdate(&run, request, false);
+            return;
+        }
+        if (run.changed or run.unpacked) {
+            log.info("fetched missing dependencies; re-run zig build", .{});
         } else {
-            log.err("{s} is missing: give it a .clone, or put a Zig package there", .{comptime Self.missingSibling() orelse "a .path dependency"});
+            log.err("{s} is missing: give it a .clone or an .archive, or put a Zig package there", .{comptime Self.missingSibling(zon) orelse "a .path dependency"});
         }
         std.process.exit(1);
     }
@@ -1138,8 +1241,8 @@ pub const Deps = struct {
     /// - `zon`: the caller's `@import("build.zig.zon")`.
     ///
     /// Return: nothing when everything is in place; otherwise never.
-    pub fn sync(b: *std.Build, comptime zon: anytype) if (Self.allPresent(zon) and Self.worktreesPresent() and Self.siblingsPresent()) void else noreturn {
-        const present = comptime Self.allPresent(zon) and Self.worktreesPresent() and Self.siblingsPresent();
+    pub fn sync(b: *std.Build, comptime zon: anytype) if (Self.allPresent(zon) and Self.worktreesPresent(zon) and Self.siblingsPresent(zon)) void else noreturn {
+        const present = comptime Self.allPresent(zon) and Self.worktreesPresent(zon) and Self.siblingsPresent(zon);
         // In a dependency's build() the root's sync has already run.
         if (b.pkg_hash.len != 0) {
             if (present) return;
@@ -1168,7 +1271,7 @@ pub const Deps = struct {
             std.process.exit(1);
         }
         if (comptime !present) {
-            log.err("{s} is still missing; an unpinned .path is used as is, so put it there or give it a .clone", .{comptime Self.missingWorktree() orelse (Self.missingSibling() orelse "a .path dependency")});
+            log.err("{s} is still missing; an unpinned .path is used as is, so put it there or give it a .clone or an .archive", .{comptime Self.missingWorktree(zon) orelse (Self.missingSibling(zon) orelse "a .path dependency")});
             std.process.exit(1);
         }
         if (run.worktrees.items.len > 0 or run.orphans.items.len > 0) b.graph.poisonCache();
@@ -1401,6 +1504,9 @@ pub const Deps = struct {
 
     /// Reports whether dependency `name` declares both a `.path` and a `.clone`.
     ///
+    /// An `.archive` dependency is not cloneable: no Zig code imports it, so it
+    /// is unpacked in the same build and never makes `cloneMissing` `noreturn`.
+    ///
     /// Parameters:
     /// - `zon`: the caller's `@import("build.zig.zon")`.
     /// - `name`: the dependency's field name in `build.zig.zon`.
@@ -1411,37 +1517,78 @@ pub const Deps = struct {
         return @hasField(Dep, "path") and @hasField(Dep, "clone");
     }
 
+    /// Reports whether any root dependency is unpacked from an `.archive`.
+    ///
+    /// Parameters:
+    /// - `zon`: the caller's `@import("build.zig.zon")`.
+    ///
+    /// Return: `true` when one declares an `.archive`.
+    fn hasArchive(comptime zon: anytype) bool {
+        inline for (@typeInfo(@TypeOf(zon.dependencies)).@"struct".field_names) |field_name| {
+            if (@hasField(@TypeOf(@field(zon.dependencies, field_name)), "archive")) return true;
+        }
+        return false;
+    }
+
+    /// Reports whether `path` is the `.path` of one of the root's `.archive` dependencies.
+    ///
+    /// The runner keys a `.path` package by its `.path` as the manifest
+    /// writes it, so the two compare as written.
+    ///
+    /// Parameters:
+    /// - `zon`: the caller's `@import("build.zig.zon")`.
+    /// - `path`: a key of the runner's package table.
+    ///
+    /// Return: `true` for a root archive's path.
+    fn isRootArchive(comptime zon: anytype, comptime path: []const u8) bool {
+        inline for (@typeInfo(@TypeOf(zon.dependencies)).@"struct".field_names) |field_name| {
+            const dep = @field(zon.dependencies, field_name);
+            const Dep = @TypeOf(dep);
+            if (@hasField(Dep, "archive") and @hasField(Dep, "path") and std.mem.eql(u8, dep.path, path)) return true;
+        }
+        return false;
+    }
+
     /// Reports whether every worktree dependency, transitive ones included, was present when the build runner was compiled.
     ///
     /// The runner keys a `.path` package by its path from the root, so a
     /// worktree dependency is any key under `deps/`. Unlike `isPresent`, this
     /// checks the whole package table, not just the root's dependencies.
     ///
+    /// Parameters:
+    /// - `zon`: the caller's `@import("build.zig.zon")`; its `.archive` paths are skipped.
+    ///
     /// Return: `true` when none is missing, or when the root is not a build runner.
-    fn worktreesPresent() bool {
-        return Self.missingWorktree() == null;
+    fn worktreesPresent(comptime zon: anytype) bool {
+        return Self.missingWorktree(zon) == null;
     }
 
     /// Names the first package under `deps/` that was missing when the build runner was compiled.
     ///
+    /// Parameters:
+    /// - `zon`: the caller's `@import("build.zig.zon")`; its `.archive` paths are skipped.
+    ///
     /// Return: its path from the root, or `null` when none is missing or the
     /// root is not a build runner.
-    fn missingWorktree() ?[]const u8 {
+    fn missingWorktree(comptime zon: anytype) ?[]const u8 {
         const root = @import("root");
         if (!@hasDecl(root, "dependencies")) return null;
         const packages = root.dependencies.packages;
         for (@typeInfo(packages).@"struct".decl_names) |decl_name| {
             const under_deps = std.mem.startsWith(u8, decl_name, "deps/") or std.mem.startsWith(u8, decl_name, "deps\\");
-            if (under_deps and !@hasDecl(@field(packages, decl_name), "build_zig")) return decl_name;
+            if (under_deps and !@hasDecl(@field(packages, decl_name), "build_zig") and !Self.isRootArchive(zon, decl_name)) return decl_name;
         }
         return null;
     }
 
     /// Reports whether every `.path` package outside `deps/`, transitive ones included, was present when the build runner was compiled.
     ///
+    /// Parameters:
+    /// - `zon`: the caller's `@import("build.zig.zon")`; its `.archive` paths are skipped.
+    ///
     /// Return: `true` when none is missing, or when the root is not a build runner.
-    fn siblingsPresent() bool {
-        return Self.missingSibling() == null;
+    fn siblingsPresent(comptime zon: anytype) bool {
+        return Self.missingSibling(zon) == null;
     }
 
     /// Names the first `.path` package outside `deps/` that was missing when the build runner was compiled.
@@ -1449,10 +1596,16 @@ pub const Deps = struct {
     /// The runner keys a `.path` package by its path from the root, which is
     /// also its `build_root`; a fetched package is keyed by its hash and lives
     /// in a cache, so an unfetched lazy dependency is not mistaken for one.
+    /// The root's own `.archive` paths are skipped: `cloneMissing` unpacks
+    /// them in the same build. A sibling's archive is not known at comptime,
+    /// so a missing one still costs a re-run.
+    ///
+    /// Parameters:
+    /// - `zon`: the caller's `@import("build.zig.zon")`.
     ///
     /// Return: its path from the root, or `null` when none is missing or the
     /// root is not a build runner.
-    fn missingSibling() ?[]const u8 {
+    fn missingSibling(comptime zon: anytype) ?[]const u8 {
         const root = @import("root");
         if (!@hasDecl(root, "dependencies")) return null;
         const packages = root.dependencies.packages;
@@ -1460,7 +1613,7 @@ pub const Deps = struct {
             const package = @field(packages, decl_name);
             const is_path = std.mem.eql(u8, package.build_root, decl_name);
             const under_deps = std.mem.startsWith(u8, decl_name, "deps/") or std.mem.startsWith(u8, decl_name, "deps\\");
-            if (is_path and !under_deps and !@hasDecl(package, "build_zig")) return decl_name;
+            if (is_path and !under_deps and !@hasDecl(package, "build_zig") and !Self.isRootArchive(zon, decl_name)) return decl_name;
         }
         return null;
     }
@@ -1474,20 +1627,24 @@ const test_zon = .{
         .sibling = .{ .path = "../sibling", .clone = "git@example.com:sibling.git" },
         .local = .{ .path = "../local" },
         .fetched = .{ .url = "https://example.com/fetched.tar.gz", .hash = "fetched-0.0.0" },
+        .unpacked = .{ .path = "../unpacked", .archive = "https://example.com/unpacked.zip" },
     },
 };
 
-test "isCloneable requires both path and clone" {
+test "isCloneable requires a path and a clone; an archive is not cloned" {
     try std.testing.expect(Deps.isCloneable(test_zon, "sibling"));
+    try std.testing.expect(!Deps.isCloneable(test_zon, "unpacked"));
     try std.testing.expect(!Deps.isCloneable(test_zon, "local"));
     try std.testing.expect(!Deps.isCloneable(test_zon, "fetched"));
+    try std.testing.expect(Deps.hasArchive(test_zon));
+    try std.testing.expect(!Deps.hasArchive(.{ .dependencies = .{ .local = .{ .path = "../local" } } }));
 }
 
 test "outside a build runner every dependency counts as present" {
     try std.testing.expect(Deps.isPresent("sibling"));
     try std.testing.expect(Deps.allPresent(test_zon));
     try std.testing.expect(Deps.allPresent(.{ .dependencies = .{} }));
-    try std.testing.expect(Deps.worktreesPresent());
+    try std.testing.expect(Deps.worktreesPresent(test_zon));
 }
 
 test "Manifest reads the name and dependencies and ignores other fields" {
@@ -1673,6 +1830,22 @@ const TestTree = struct {
     /// Return: the SHA; `error.TestUnexpectedResult` when it is not there.
     fn rev(self: *Self, sub: []const u8, rev_: []const u8) ![]const u8 {
         return try mod.Git.revParse(self.allocator(), self.io, try self.path(sub), rev_) orelse error.TestUnexpectedResult;
+    }
+
+    /// Writes a zip of `entries` (name, contents) at `sub`.
+    ///
+    /// Parameters:
+    /// - `self`: the fixture.
+    /// - `sub`: the zip, relative to the scratch root, inside a directory.
+    /// - `entries`: the entries, `/`-separated names.
+    ///
+    /// Return: its `file://` URL; IO and zip errors.
+    fn zip(self: *Self, sub: []const u8, entries: []const [2][]const u8) ![]const u8 {
+        var archive = try mod.pkg.android.ApkZip.init(self.allocator());
+        defer archive.deinit();
+        for (entries) |entry| try archive.addStored(entry[0], entry[1]);
+        try self.write(sub, try archive.finish());
+        return self.allocator().print("file://{s}", .{try self.path(sub)});
     }
 
     /// Writes a file, creating its directory.
@@ -2002,6 +2175,68 @@ test "updateSiblings follows a feature branch's upstream" {
     var run_ = try tree.sync();
     try std.testing.expect(try run_.updateSiblings());
     try std.testing.expectEqualStrings(try tree.rev("origin/mid", "feature"), try tree.rev("mid", "HEAD"));
+}
+
+test "sync unpacks an archive sibling, stays put, and replaces it when its URL changes" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    const one = try tree.zip("zips/one.zip", &.{.{ "amalg-1/sqlite3.c", "one" }});
+    try tree.consumer(try tree.allocator().print(".amalg = .{{ .path = \"../amalg\", .archive = \"{s}\" }},", .{one}));
+    const first = try tree.sync();
+    // Unpacked in the same build: no re-run.
+    try std.testing.expect(first.unpacked and !first.changed);
+    try std.testing.expectEqualStrings("one", try tree.tmp.dir.readFileAlloc(tree.io, "amalg/sqlite3.c", tree.allocator(), .limited(64)));
+    // The stub build.zig is what makes the build runner see the package.
+    try tree.tmp.dir.access(tree.io, "amalg/build.zig", .{});
+    const second = try tree.sync();
+    try std.testing.expect(!second.unpacked);
+
+    const two = try tree.zip("zips/two.zip", &.{.{ "amalg-2/sqlite3.c", "two" }});
+    try tree.consumer(try tree.allocator().print(".amalg = .{{ .path = \"../amalg\", .archive = \"{s}\" }},", .{two}));
+    const third = try tree.sync();
+    try std.testing.expect(third.unpacked);
+    try std.testing.expectEqualStrings("two", try tree.tmp.dir.readFileAlloc(tree.io, "amalg/sqlite3.c", tree.allocator(), .limited(64)));
+    // -Dupdate leaves an archive alone: it is no git checkout, and its URL is its pin.
+    var run_ = try tree.sync();
+    try std.testing.expect(!try run_.updateSiblings());
+}
+
+test "an archive under deps/ is unpacked by the root and is never an orphan" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    const one = try tree.zip("zips/one.zip", &.{.{ "amalg-1/sqlite3.c", "one" }});
+    try tree.consumer(try tree.allocator().print(".amalg = .{{ .path = \"deps/amalg\", .archive = \"{s}\" }},", .{one}));
+    const first = try tree.sync();
+    try std.testing.expect(first.unpacked);
+    try std.testing.expectEqual(0, first.orphans.items.len);
+    try tree.tmp.dir.access(tree.io, "consumer/deps/amalg/sqlite3.c", .{});
+    try std.testing.expect(!(try tree.sync()).unpacked);
+}
+
+test "cloneSiblings unpacks a sibling's own archive dependency" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    const one = try tree.zip("zips/one.zip", &.{.{ "amalg-1/sqlite3.c", "one" }});
+    try tree.upstream("mid", try tree.allocator().print(".amalg = .{{ .path = \"../amalg\", .archive = \"{s}\" }},", .{one}));
+    try tree.consumer(try tree.sibling("mid"));
+    var run_ = try Sync.init(tree.allocator(), tree.io, try tree.path("consumer"));
+    try run_.cloneSiblings();
+    try std.testing.expect(run_.unpacked);
+    try tree.tmp.dir.access(tree.io, "amalg/sqlite3.c", .{});
+}
+
+test "sync refuses to replace a directory it did not unpack, a pinned archive, and two sources" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    const one = try tree.zip("zips/one.zip", &.{.{ "amalg-1/sqlite3.c", "one" }});
+    try tree.write("amalg/mine", "x");
+    try tree.consumer(try tree.allocator().print(".amalg = .{{ .path = \"../amalg\", .archive = \"{s}\" }},", .{one}));
+    try std.testing.expect(std.mem.find(u8, try tree.syncFails(), "did not unpack it") != null);
+    try tree.tmp.dir.access(tree.io, "amalg/mine", .{});
+    try tree.consumer(try tree.allocator().print(".amalg = .{{ .path = \"deps/amalg\", .archive = \"{s}\", .tag = \"v1\" }},", .{one}));
+    try std.testing.expect(std.mem.find(u8, try tree.syncFails(), "pinned by its URL") != null);
+    try tree.consumer(".amalg = .{ .path = \"../other\", .archive = \"file:///x.zip\", .clone = \"git@example.com:x.git\" },");
+    try std.testing.expect(std.mem.find(u8, try tree.syncFails(), "both .clone and .archive") != null);
 }
 
 test "Breadcrumb is set, found and cleared, each idempotently" {
