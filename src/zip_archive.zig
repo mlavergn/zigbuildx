@@ -1,0 +1,216 @@
+const std = @import("std");
+const log = std.log.scoped(.zigbuildx_zip_archive);
+const mod = @import("module.zig");
+
+/// Unpacks a zip archive, fetched from a URL, as a `.path` dependency.
+///
+/// A source release that is not a git repository (SQLite's amalgamation, say)
+/// can still be a `.path` dependency: its `.archive` names the zip, and `Deps`
+/// unpacks it there when it is absent or was unpacked from another URL. A
+/// single top-level folder is stripped, as `zig fetch` does.
+///
+/// An `https://` or `http://` archive is downloaded by `curl`, which ships
+/// with macOS, Windows 10 and later, and nearly every Linux, and honours
+/// `https_proxy`: the build runner's configure phase is compiled with
+/// `std.options.http_disable_tls`, so `std.http` cannot fetch over TLS there.
+/// The zip is unpacked in process with `std.zip`, as `unzip` is not on every host.
+pub const ZipArchive = struct {
+    const Self = @This();
+
+    /// The file `unpack` leaves in the directory, holding the URL it came from.
+    ///
+    /// It marks the directory as zigbuildx's own, to replace when the URL changes.
+    pub const stamp_name = ".zigbuildx-archive";
+
+    /// The `build.zig` written into an archive that has none.
+    ///
+    /// `Deps` learns whether a `.path` dependency is present from the build
+    /// runner's package table, which records a package by its `build.zig`;
+    /// without one an unpacked archive would look absent forever.
+    const stub_build_zig =
+        \\//! Written by zigbuildx when it unpacked this archive, so Zig sees a package here.
+        \\
+        \\pub fn build(_: *@import("std").Build) void {}
+        \\
+    ;
+
+    /// The largest local (`file://`) archive `unpack` reads.
+    const max_file_bytes = 1 << 30;
+
+    /// The scheme of a local archive, as a mirror or a test uses.
+    const file_scheme = "file://";
+
+    /// Reads the URL the directory at `dir` was unpacked from.
+    ///
+    /// Parameters:
+    /// - `allocator`: allocator for the result; use an arena, as nothing is freed individually.
+    /// - `io`: IO for the filesystem.
+    /// - `dir`: the dependency's absolute path.
+    ///
+    /// Return: the URL; `null` when `dir` has no stamp; IO errors.
+    pub fn source(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !?[]const u8 {
+        const path = try std.Io.Dir.path.join(allocator, &.{ dir, stamp_name });
+        const text = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 16)) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return std.mem.trimEnd(u8, text, "\r\n");
+    }
+
+    /// Downloads the zip at `url` and unpacks it at `dest`, replacing whatever an earlier unpack left there.
+    ///
+    /// The archive is downloaded and unpacked beside `dest`, in
+    /// `<dest>.zigbuildx-unpack`, and renamed into place only once complete,
+    /// so a failed download leaves `dest` as it was. The caller decides
+    /// whether `dest` may be replaced.
+    ///
+    /// Parameters:
+    /// - `allocator`: an arena for everything it allocates.
+    /// - `io`: IO for the filesystem and `curl`.
+    /// - `url`: an `https://`, `http://` or `file://` URL of a zip.
+    /// - `dest`: the dependency's absolute path.
+    ///
+    /// Return: nothing; `error.ArchiveDownloadFailed`, `error.ArchiveEmpty`, or
+    /// spawn, IO and zip errors, none of them logged.
+    pub fn unpack(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest: []const u8) !void {
+        const cwd = std.Io.Dir.cwd();
+        const staging = try allocator.print("{s}.zigbuildx-unpack", .{dest});
+        // A staging directory left by an interrupted unpack is stale.
+        try cwd.deleteTree(io, staging);
+        defer cwd.deleteTree(io, staging) catch |err| log.warn("cannot delete {s} [{any}]", .{ staging, err });
+        const files = try std.Io.Dir.path.join(allocator, &.{ staging, "files" });
+        try cwd.createDirPath(io, files);
+        const zip_path = try std.Io.Dir.path.join(allocator, &.{ staging, "archive.zip" });
+        try Self.download(allocator, io, url, zip_path);
+        const top = try Self.extract(allocator, io, zip_path, files);
+        const build_zig = try std.Io.Dir.path.join(allocator, &.{ top, "build.zig" });
+        cwd.access(io, build_zig, .{}) catch |err| switch (err) {
+            error.FileNotFound => try cwd.writeFile(io, .{ .sub_path = build_zig, .data = Self.stub_build_zig }),
+            else => return err,
+        };
+        const stamp = try std.Io.Dir.path.join(allocator, &.{ top, stamp_name });
+        try cwd.writeFile(io, .{ .sub_path = stamp, .data = try allocator.print("{s}\n", .{url}) });
+        try cwd.deleteTree(io, dest);
+        try cwd.createDirPath(io, std.Io.Dir.path.dirname(dest).?);
+        try cwd.rename(top, cwd, dest, io);
+        log.info("unpacked {s} into {s}", .{ url, dest });
+    }
+
+    /// Downloads `url` to the file at `path`.
+    ///
+    /// Parameters:
+    /// - `allocator`: an arena for a local archive's contents.
+    /// - `io`: IO for the filesystem and `curl`.
+    /// - `url`: an `https://`, `http://` or `file://` URL.
+    /// - `path`: the file to write.
+    ///
+    /// Return: nothing; `error.ArchiveDownloadFailed` when `curl` fails (it
+    /// prints why), or spawn and IO errors. Errors are returned, not logged:
+    /// the caller names the archive in its message.
+    fn download(allocator: std.mem.Allocator, io: std.Io, url: []const u8, path: []const u8) !void {
+        const cwd = std.Io.Dir.cwd();
+        if (std.mem.startsWith(u8, url, Self.file_scheme)) {
+            const data = try cwd.readFileAlloc(io, url[Self.file_scheme.len..], allocator, .limited(Self.max_file_bytes));
+            return cwd.writeFile(io, .{ .sub_path = path, .data = data });
+        }
+        // --fail turns an HTTP error into a non-zero exit; --show-error still prints it.
+        var child = try std.process.spawn(io, .{ .argv = &.{ "curl", "--fail", "--location", "--silent", "--show-error", "--output", path, url } });
+        const term = try child.wait(io);
+        switch (term) {
+            .exited => |code| if (code == 0) return,
+            else => {},
+        }
+        log.warn("curl {s} failed [{any}]", .{ url, term });
+        return error.ArchiveDownloadFailed;
+    }
+
+    /// Unpacks the zip at `zip_path` into `dir`.
+    ///
+    /// Parameters:
+    /// - `allocator`: an arena for the result.
+    /// - `io`: IO for the filesystem.
+    /// - `zip_path`: the zip.
+    /// - `dir`: an empty directory to unpack into.
+    ///
+    /// Return: the archive's top: its single top-level folder inside `dir`
+    /// when it has one, else `dir`; `error.ArchiveEmpty`, or IO and zip errors.
+    fn extract(allocator: std.mem.Allocator, io: std.Io, zip_path: []const u8, dir: []const u8) ![]const u8 {
+        const cwd = std.Io.Dir.cwd();
+        var file = try cwd.openFile(io, zip_path, .{});
+        defer file.close(io);
+        var buffer: [16 * 1024]u8 = undefined;
+        var reader = file.reader(io, &buffer);
+        var out = try cwd.openDir(io, dir, .{});
+        defer out.close(io);
+        var diagnostics: std.zip.Diagnostics = .{ .allocator = allocator };
+        try std.zip.extract(out, &reader, .{ .allow_backslashes = true, .diagnostics = &diagnostics });
+        if (!diagnostics.saw_first_file) return error.ArchiveEmpty;
+        if (diagnostics.root_dir.len == 0) return dir;
+        return std.Io.Dir.path.join(allocator, &.{ dir, diagnostics.root_dir });
+    }
+};
+
+// -----------------------------------------------------------------------------
+// Unit Tests
+
+/// Writes a zip of `entries` (name, contents) into `tmp` as `name`, and returns its `file://` URL.
+///
+/// Parameters:
+/// - `allocator`: an arena for the result.
+/// - `tmp`: the scratch directory.
+/// - `name`: the zip's file name.
+/// - `entries`: the entries, `/`-separated names.
+///
+/// Return: the URL; IO and zip errors.
+fn writeTestZip(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8, entries: []const [2][]const u8) ![]const u8 {
+    var zip = try mod.pkg.android.ApkZip.init(allocator);
+    defer zip.deinit();
+    for (entries) |entry| try zip.addStored(entry[0], entry[1]);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = try zip.finish() });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    return allocator.print("{s}{s}/{s}", .{ ZipArchive.file_scheme, root, name });
+}
+
+test "unpack strips a single top-level folder and stamps the URL" {
+    std.testing.log_level = .err;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const url = try writeTestZip(allocator, &tmp, "one.zip", &.{ .{ "release-1/a.c", "one" }, .{ "release-1/inc/a.h", "h" } });
+    const dest = try std.Io.Dir.path.join(allocator, &.{ try tmp.dir.realPathFileAlloc(io, ".", allocator), "dep" });
+
+    try std.testing.expectEqual(null, try ZipArchive.source(allocator, io, dest));
+    try ZipArchive.unpack(allocator, io, url, dest);
+    const a = try tmp.dir.readFileAlloc(io, "dep/a.c", allocator, .limited(64));
+    try std.testing.expectEqualStrings("one", a);
+    try tmp.dir.access(io, "dep/inc/a.h", .{});
+    try tmp.dir.access(io, "dep/build.zig", .{});
+    try std.testing.expectEqualStrings(url, (try ZipArchive.source(allocator, io, dest)).?);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "dep.zigbuildx-unpack", .{}));
+}
+
+test "unpack replaces an earlier unpack, keeps an archive's own build.zig, and leaves dest alone on failure" {
+    std.testing.log_level = .err;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const dest = try std.Io.Dir.path.join(allocator, &.{ try tmp.dir.realPathFileAlloc(io, ".", allocator), "dep" });
+    try ZipArchive.unpack(allocator, io, try writeTestZip(allocator, &tmp, "one.zip", &.{.{ "release-1/old.c", "one" }}), dest);
+
+    // Two top-level entries: nothing is stripped.
+    const two = try writeTestZip(allocator, &tmp, "two.zip", &.{ .{ "new.c", "two" }, .{ "build.zig", "// own" } });
+    try ZipArchive.unpack(allocator, io, two, dest);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "dep/old.c", .{}));
+    try std.testing.expectEqualStrings("// own", try tmp.dir.readFileAlloc(io, "dep/build.zig", allocator, .limited(64)));
+    try std.testing.expectEqualStrings(two, (try ZipArchive.source(allocator, io, dest)).?);
+
+    const missing = try allocator.print("{s}{s}", .{ ZipArchive.file_scheme, try std.Io.Dir.path.join(allocator, &.{ dest, "..", "missing.zip" }) });
+    try std.testing.expectError(error.FileNotFound, ZipArchive.unpack(allocator, io, missing, dest));
+    try tmp.dir.access(io, "dep/new.c", .{});
+}

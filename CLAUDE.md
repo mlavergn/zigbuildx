@@ -14,7 +14,8 @@ the workarounds behind them, are below.
   around Zig 0.17.0 defects; see *Workarounds*. Version 1.x was the Zig 0.16
   release; 2.0.0 dropped 0.16; 3.0.0 made `Xcode` and `Android` take the
   build graph at `init`; 3.2.0 made `Deps` clone a sibling's own siblings;
-  3.3.0 added `-Dupdate` for siblings and `Deps.guard`.
+  3.3.0 added `-Dupdate` for siblings and `Deps.guard`; 3.4.0 added `.archive`
+  dependencies (`ZipArchive`).
 - **The public surface is `build.zig`.** Consumers import this package's
   `build.zig` by dependency name, so only what it re-exports (`Deps`, `Git`,
   `Xcode`, `Swift`, `Android`, `AndroidAbi`, `Apk`, `Docs`, `Pkg`) is
@@ -145,6 +146,34 @@ Beyond ZIGSTYLE:
     a `.path` package (keyed by its path, which equals its `build_root`; a
     fetched one is keyed by hash) outside `deps/` with no `build_zig`, so the
     clone path still compiles away in the steady state.
+- **`.archive` (3.4.0, `ZipArchive`):** a `.path` dependency fetched from a
+  zip URL instead of a `.clone`, handled wherever a `.clone` is (root,
+  siblings of siblings, unpinned under `deps/`), by `Sync.materialize`.
+  - **Unpack:** download into `<path>.zigbuildx-unpack/`, `std.zip.extract`
+    there, strip a single top-level folder (`std.zip.Diagnostics.root_dir`),
+    then rename into place, so a failed download leaves the old directory.
+  - **No re-run:** an unpack sets `Sync.unpacked`, not `changed`. Nothing
+    compiles an archive's Zig code, and `b.dependency(...).path(...)` on a
+    directory without `build.zig` resolves once the directory exists
+    (checked on 0.17.0), so the same `build()` goes on. `isCloneable` stays
+    clone-only, and `missingSibling`/`missingWorktree` skip the root's own
+    archive paths (`isRootArchive`, compared as the manifest writes them),
+    so a missing root archive never makes `cloneMissing` or `sync`
+    `noreturn`.
+  - **Stub `build.zig`:** written when the archive has none. The runner's
+    table marks a `.path` package present by its `build_zig`, which a
+    directory without `build.zig` lacks whether or not it exists. A
+    sibling's archive is not known at comptime, so the stub is what marks it
+    present; a missing one still costs one re-run.
+  - **Stamp:** `<path>/.zigbuildx-archive` holds the URL. A different URL
+    replaces the directory in the same build; a directory without the
+    stamp is refused, never replaced. `cloneMissing` reads the stamps on
+    every `build()` when the root has an `.archive` (`hasArchive`), since a
+    URL change leaves the package present; the root's `build.zig.zon` is a
+    configure input, so such a change re-runs `build()`. A sibling's changed
+    `.archive` is picked up by any build of a root that has one, or `-Dupdate`.
+  - **Not:** pinned (`.sha`/`.tag`/`.branch` with `.archive` fails), updated
+    by `updateSiblings`, or hash-checked.
 - **`Deps.sync`:** the successor, and it must come first in `build()`.
   - **Pins:** `.sha` and `.tag` give a detached worktree; `.branch` gives the
     branch `<consumer>/<branch>`, created at `origin/<branch>`. `<consumer>`
@@ -279,7 +308,7 @@ Beyond ZIGSTYLE:
 
 ## Workarounds
 
-Four remain, because of Zig 0.17.0 or the macOS 27 SDK. Each can be deleted
+Five remain, because of Zig 0.17.0 or the macOS 27 SDK. Each can be deleted
 on its own when the cause goes away; a release for a later Zig starts by
 re-checking every one.
 
@@ -293,6 +322,10 @@ re-checking every one.
   Never removed on its own: it is how a deployment target is stated.
 - **No Android C library (`Android.configure`).** Zig 0.17.0 ships no bionic;
   a libc file points at the NDK sysroot. Remove when Zig ships it.
+- **No TLS in `build()` (`ZipArchive.download`).** The configurer is compiled
+  with `.http_disable_tls = true` (`lib/compiler/configurer.zig`), so
+  `std.http.Client` hits `unreachable` on an `https://` URL; the download
+  runs `curl` instead. Remove when the configurer can fetch over TLS.
 - **Autodoc hides private declarations (`Docs.includePrivate`).** The front
   end passes `include_private = false` at two call sites. Remove when `zig
   build docs` gains an option, or at once if the patch reports a change.

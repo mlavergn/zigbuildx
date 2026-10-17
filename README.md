@@ -11,7 +11,7 @@ where the copies drift. It is imported, not run: nothing acts unless a
 
 | Extension | What it does |
 |---|---|
-| `Deps` | Clones missing sibling checkouts and keeps them up to date, and gives pinned dependencies their own git worktree |
+| `Deps` | Clones missing sibling checkouts and keeps them up to date, unpacks source archives, and gives pinned dependencies their own git worktree |
 | `Git` | Runs `git` commands for the build |
 | `Xcode` | Finds the macOS SDK, sets a macOS deployment floor, links frameworks |
 | `Swift` | Builds a Swift dylib that a Zig package links against |
@@ -31,7 +31,7 @@ each is written to be deleted on its own once the cause goes away.
 - **Hosts:** macOS (Apple Silicon), Linux (arm64, x86_64) and Windows (x86_64,
   arm64). Apple-only extensions fall back to plain behaviour elsewhere.
 - **Per extension:**
-  - `Deps`: `git`.
+  - `Deps`: `git`; `curl` for an `https://` `.archive`.
   - `Xcode`, `Swift`: Xcode or the Command Line Tools.
   - `Android`, `Apk`: the Android SDK and NDK; a JDK's `keytool` for the debug
     keystore.
@@ -68,6 +68,8 @@ make validate  # clean, format, lint, test, cross
 - **`build.zig.zon` fields**, which Zig ignores and zigbuildx reads:
   - `.clone`: where `Deps` clones a missing `.path` dependency from; a
     sibling's own `.path` dependencies are cloned from its manifest's `.clone`.
+  - `.archive`: instead of `.clone`, the URL of a zip `Deps` unpacks at the
+    `.path` (a source release that is not a git repository); see *Usage*.
   - `.sha`, `.tag`, `.branch`: pin a dependency to its own worktree under
     `deps/`; `.checkout` names the shared checkout (default `../<name>`).
   - `.bundle`: the bundle id in reverse DNS, three labels
@@ -112,6 +114,27 @@ zig build deps -Dupdate   # fetch, and fast-forward branch pins
 A dependency `Deps` clones or a worktree it creates or moves ends the build
 with `error: configure command exited with code 1`, after
 `dependencies changed; re-run zig build`: run `zig build` again.
+
+Unpack a source release that is not a git repository, such as SQLite's
+amalgamation, at a `.path`:
+
+```zig
+.sqlite = .{ .path = "sqlite", .archive = "https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip" },
+```
+
+```zig
+const sqlite3_c = b.dependency("sqlite", .{}).path("sqlite3.c");
+```
+
+`cloneMissing` or `sync` downloads the zip (with `curl`; `file://` is read
+directly), strips its single top-level folder as `zig fetch` does, and adds a
+stub `build.zig` when it has none, so Zig sees a package there. A
+`.zigbuildx-archive` file in the directory records the URL: changing the URL
+replaces the directory on the next build, and a directory without that file
+is never touched. Unlike a clone, an unpack needs no re-run: the same build
+goes on with the files in place. Git-ignore the path. The URL is the pin, so an `.archive`
+takes no `.sha`, `.tag` or `.branch`, and `-Dupdate` leaves it alone. Zig
+verifies no hash for it, so point it at a source you trust over `https://`.
 
 Bring sibling checkouts (`../x`) up to date, with `cloneMissing` or `sync`:
 
