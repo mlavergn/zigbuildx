@@ -15,7 +15,7 @@ the workarounds behind them, are below.
   release; 2.0.0 dropped 0.16; 3.0.0 made `Xcode` and `Android` take the
   build graph at `init`; 3.2.0 made `Deps` clone a sibling's own siblings;
   3.3.0 added `-Dupdate` for siblings and `Deps.guard`; 3.4.0 added `.archive`
-  dependencies (`ZipArchive`).
+  dependencies (`ZipArchive`); 3.5.0 added `PkgOptions.libraries`.
 - **The public surface is `build.zig`.** Consumers import this package's
   `build.zig` by dependency name, so only what it re-exports (`Deps`, `Git`,
   `Xcode`, `Swift`, `Android`, `AndroidAbi`, `Apk`, `Docs`, `Pkg`) is
@@ -283,6 +283,13 @@ Beyond ZIGSTYLE:
   - **Scripts:** macOS `preinstall`, `postinstall`, `uninstall.sh` and Linux
     `preinst`, `postrm`, `profile.sh`, embedded and filled with `{pkg_name}`,
     `{pkg_id}`, `{pkg_org}`; `PkgOptions.scripts` overrides them by name.
+  - **Libraries:** `PkgOptions.libraries` (`PkgLibrary`: a `LazyPath` and the
+    file name it installs as, since a generated file's own name is a cache
+    name) go in `lib/` beside `bin/`, for a program whose install name is
+    `@rpath/...` with an `@executable_path/../lib` rpath (zigagent's
+    `libafm.dylib`); on Windows in `bin/`, beside the programs. The host tool
+    takes each as `--library=<name>=<path>`. macOS signs them as it signs
+    the programs, or notarization refuses the package.
     The macOS scripts come from `~/src/inferise/pkg/zlintpre`, with one fix
     (`postinstall` tested `-d` on a file). The preinstall that runs the old
     `uninstall.sh`, wiping `/etc/<org>/<name>` on upgrade, is intended.
@@ -378,7 +385,7 @@ Nearly all use `Xcode` and `Deps.cloneMissing`; beyond that:
 | zigstorage | `Xcode` floor 26.0 and `linkFramework`, `Docs` |
 | zigwebrtc, dropbox | `Xcode` floor |
 | zigafm | `Xcode` floor 26.0, `Swift` |
-| zigagent | `Swift.fromDependency` (zigafm's dylib) |
+| zigagent | `Swift.fromDependency` (zigafm's dylib), `Pkg` with `libraries` |
 | zlintpre | `Pkg` |
 
 - **Version bumps:** bump `.version` on any change, push `main` and the tag,
