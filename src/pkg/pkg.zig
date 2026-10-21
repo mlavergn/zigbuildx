@@ -327,21 +327,43 @@ pub const PkgRun = struct {
         try self.writeScript(try std.Io.Dir.path.join(self.allocator, &.{ stage, "data", "etc", "profile.d", try self.allocator.print("{s}.sh", .{self.name}) }), "profile.sh", false);
         try self.writeScript(try std.Io.Dir.path.join(self.allocator, &.{ stage, "control", "preinst" }), "preinst", true);
         try self.writeScript(try std.Io.Dir.path.join(self.allocator, &.{ stage, "control", "postrm" }), "postrm", true);
-        const control = try self.allocator.print(
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = try std.Io.Dir.path.join(self.allocator, &.{ stage, "control", "control" }), .data = try self.debControl() });
+        var staging = try std.Io.Dir.cwd().openDir(self.io, stage, .{});
+        defer staging.close(self.io);
+        const packer = try mod.Deb.init(self.allocator, self.io);
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = out, .data = try packer.pack(staging) });
+    }
+
+    /// Returns the `.deb`'s `control` file.
+    ///
+    /// The package is the bundle id, as the `.pkg`'s identifier and the MSI's
+    /// name are, so `dpkg-query` finds every package of an organisation under
+    /// `<domain>.<org>.*`. Packages before 3.6.0 were named after the bundle
+    /// id's last label: this one conflicts with, replaces and provides that
+    /// name, so `dpkg -i` removes the old package as it installs.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    ///
+    /// Return: the text; allocation errors.
+    fn debControl(self: *const Self) ![]u8 {
+        const head = try self.allocator.print(
             \\Package: {s}
             \\Version: {s}
             \\Architecture: {s}
             \\Maintainer: {s}
             \\Section: utils
             \\Priority: optional
-            \\Description: {s}
             \\
-        , .{ self.name, self.version, self.arch, self.orgLabel(), self.summary });
-        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = try std.Io.Dir.path.join(self.allocator, &.{ stage, "control", "control" }), .data = control });
-        var staging = try std.Io.Dir.cwd().openDir(self.io, stage, .{});
-        defer staging.close(self.io);
-        const packer = try mod.Deb.init(self.allocator, self.io);
-        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = out, .data = try packer.pack(staging) });
+        , .{ self.id(), self.version, self.arch, self.orgLabel() });
+        const renamed = if (std.mem.eql(u8, self.id(), self.name)) "" else try self.allocator.print(
+            \\Conflicts: {s}
+            \\Replaces: {s}
+            \\Provides: {s}
+            \\
+        , .{ self.name, self.name, self.name });
+        const description = try self.allocator.print("Description: {s}\n", .{self.summary});
+        return std.mem.concat(self.allocator, u8, &.{ head, renamed, description });
     }
 
     /// Returns template `name`: the project's, when `--scripts` has one, else the embedded one.
@@ -675,7 +697,7 @@ pub const Pkg = struct {
         }
         return switch (self.target.os.tag) {
             .macos => null,
-            .linux => if (mod.Deb.arch(self.target.cpu.arch) == null) b.fmt("no Debian architecture for {t}", .{self.target.cpu.arch}) else if (!mod.Deb.isName(self.name)) b.fmt("{s} is not a Debian package name: lowercase letters, digits, '+', '-' and '.', starting with a letter or digit", .{self.name}) else null,
+            .linux => if (mod.Deb.arch(self.target.cpu.arch) == null) b.fmt("no Debian architecture for {t}", .{self.target.cpu.arch}) else if (!mod.Deb.isName(self.bundle)) b.fmt(".bundle = \"{s}\" is not a Debian package name, which the .deb is called: lowercase letters, digits, '+', '-' and '.', starting with a letter or digit", .{self.bundle}) else null,
             .windows => if (mod.Msi.arch(self.target.cpu.arch) == null) b.fmt("wixl cannot build an installer for {t}", .{self.target.cpu.arch}) else null,
             else => b.fmt("no package format for {t}; build for macOS, Linux or Windows", .{self.target.os.tag}),
         };
@@ -820,4 +842,27 @@ test "labels are the bundle id's second and last, and only for three" {
     try std.testing.expectEqual(null, Pkg.labels("com.example.tools.tool"));
     try std.testing.expectEqual(null, Pkg.labels("com..tool"));
     try std.testing.expectEqual(null, Pkg.labels("solo"));
+}
+
+test "a .deb is named for the bundle id and replaces one named for its last label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var run: PkgRun = .{ .allocator = arena.allocator(), .io = std.testing.io, .name = "tool", .bundle = "com.acme.tool", .version = "1.2.3", .summary = "A tool", .arch = "arm64" };
+    try std.testing.expectEqualStrings(
+        \\Package: com.acme.tool
+        \\Version: 1.2.3
+        \\Architecture: arm64
+        \\Maintainer: acme
+        \\Section: utils
+        \\Priority: optional
+        \\Conflicts: tool
+        \\Replaces: tool
+        \\Provides: tool
+        \\Description: A tool
+        \\
+    , try run.debControl());
+
+    // No old name to replace when the two agree.
+    run.name = run.bundle;
+    try std.testing.expect(std.mem.find(u8, try run.debControl(), "Replaces") == null);
 }
