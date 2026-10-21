@@ -15,7 +15,8 @@ the workarounds behind them, are below.
   release; 2.0.0 dropped 0.16; 3.0.0 made `Xcode` and `Android` take the
   build graph at `init`; 3.2.0 made `Deps` clone a sibling's own siblings;
   3.3.0 added `-Dupdate` for siblings and `Deps.guard`; 3.4.0 added `.archive`
-  dependencies (`ZipArchive`); 3.5.0 added `PkgOptions.libraries`.
+  dependencies (`ZipArchive`); 3.5.0 added `PkgOptions.libraries`; 3.6.0 named the `.deb` package for
+  the bundle id, not its last label.
 - **The public surface is `build.zig`.** Consumers import this package's
   `build.zig` by dependency name, so only what it re-exports (`Deps`, `Git`,
   `Xcode`, `Swift`, `Android`, `AndroidAbi`, `Apk`, `Docs`, `Pkg`) is
@@ -304,7 +305,11 @@ Beyond ZIGSTYLE:
     `Developer ID Installer`; `pkg-notarize` runs `notarytool --wait`
     (password visible in `ps` while it runs) and `stapler`.
   - **Linux:** the `deb` host tool writes the archive; entries are root-owned
-    and dated 0. Unsigned; signing belongs to the apt repository.
+    and dated 0. Unsigned; signing belongs to the apt repository. The
+    `Package` is the bundle id (so `.bundle` must be a Debian name, which
+    means lowercase); the file and the paths keep the last label. A package
+    from before 3.6.0 was named by that label, so the control file conflicts
+    with, replaces and provides it, and `dpkg -i` swaps the old one out.
   - **Windows:** `Msi` renders WiX for `wixl` while the graph is declared:
     per-user under `%LOCALAPPDATA%`, the user `PATH`, GUIDs derived from the
     id. A `WriteFiles` step stages `bin/` and `product.wxs`, and `wixl` runs

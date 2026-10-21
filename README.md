@@ -209,7 +209,7 @@ _ = zigbuildx.Pkg.add(b, zon, .{ .executables = &.{exe} });
 
 ```sh
 zig build pkg -Doptimize=fast                         # zig-out/pkg/<name>-<version>.pkg
-zig build pkg -Doptimize=fast -Dtarget=aarch64-linux  # <name>_<version>_arm64.deb
+zig build pkg -Doptimize=fast -Dtarget=aarch64-linux  # <name>_<version>_arm64.deb, package <bundle>
 zig build pkg -Doptimize=fast -Dtarget=x86_64-windows # <name>-<version>-x64.msi
 zig build pkg-notarize -Doptimize=fast                # macOS: notarize and staple
 ```
