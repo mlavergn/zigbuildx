@@ -59,8 +59,7 @@ To work on zigbuildx itself:
 ```sh
 git clone git@github.com:mlavergn/zigbuildx.git
 cd zigbuildx
-make subpull   # the styleguide submodule, for linting
-make validate  # clean, format, lint, test, cross
+make validate  # clean, format, lint, build, test, cross
 ```
 
 ## Configuration
