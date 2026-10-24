@@ -34,22 +34,23 @@ the workarounds behind them, are below.
   this machine.
 - `make`: format and test.
 - One test: `zig build test -Dtest-filter=<substring>`.
-- `make validate`: **the gate**. It runs clean, format, lint, test and cross,
-  and must pass before a change is done. `zlint` and `zlintpre` exit 0 even
-  when they find something, so read the whole output rather than trusting the
-  exit code.
+- `make validate`: **the gate**. It runs clean, format, lint, build, test, then
+  cross (`validate: cross`), and must pass before a change is done. Any lint
+  finding or warning fails it.
 - `make cross`: compiles the test suite and the host tool for x86_64 and
   aarch64 Windows and Linux, without running them.
-- `make lint`: needs the `styleguide` submodule; run `make subpull` after a
-  fresh clone.
-- `make format` and `make lint` cover every `.zig` file under `src/`
-  (`find src -name '*.zig'`), plus `build.zig`.
+- `make format`, `make lint` and `make validate` come from
+  `../styleguide/Makefile.in`, so they need that sibling checkout. `make lint`
+  runs `zlintpre`, then `zlint -c ../styleguide --deny-warnings`.
+- `make format` and `make lint` cover `build.zig` and every `.zig` file under
+  `ZIG_DIRS` (default `src cli web`; only `src/` exists); `make format` also
+  formats `build.zig.zon`. Add new source roots to `ZIG_DIRS`.
 
 ## Style
 
-@styleguide/ZIGSTYLE.md
+@../styleguide/ZIGSTYLE.md
 
-`styleguide/ZIGMIGRATE.md` maps deprecated APIs. Two deliberate departures
+`../styleguide/ZIGMIGRATE.md` maps deprecated APIs. Two deliberate departures
 from ZIGSTYLE D.3.a:
 
 - **No `@src()` entry tracing.** A consumer's build runner is compiled in
@@ -126,10 +127,18 @@ Beyond ZIGSTYLE:
   (`b.graph.cwdRelativePath`), `std.fs.path` (`std.Io.Dir.path`, with
   `resolveAlloc` and `relativeAlloc`), `std.fmt.allocPrint`
   (`allocator.print`), `std.mem.indexOf*` (`std.mem.find*`), `std.builtin`
-  (`std.lang`). See `styleguide/ZIGMIGRATE.md`.
+  (`std.lang`). See `../styleguide/ZIGMIGRATE.md`.
 - **A `.path` dependency is a compile error while missing.** So zigbuildx
   itself must be a `.url` + `.hash` dependency, and a top-level `@import` of
   a missing dependency's `build.zig` must be guarded with `Deps.isPresent`.
+- **Name siblings `../x`, not `deps/x`.** A `.path` resolves as text against
+  the declaring package's directory, never through links, and a `.path`
+  package's identity is that path (checked on 0.17.0). So `../x` from any
+  depth cancels to one directory and one package (zigagent reaches zigstorage
+  by 9 routes), while `deps/x` nests under each declarer and is a separate
+  package, even when both are links to one checkout (`expected type 'root.T',
+  found 'root.T'`). `Deps.sync` maps a worktree's `../x` to the root's
+  `deps/x`, but a package that is also someone's library cannot use `deps/`.
 
 ## Extension internals
 
@@ -442,3 +451,10 @@ Nearly all use `Xcode` and `Deps.cloneMissing`; beyond that:
   docs install step.
 - **zigstorage's `make lint`** walks `zig-pkg/`. Give it an explicit file list,
   as zigclaude does.
+- **Sibling pins as checks** (a 4.0.0 draft, abandoned 2026-10-23: no adopter
+  pins a sibling). `.sha`/`.tag`/`.branch` on a `../x` would set where a fresh
+  clone checks out and warn when a checkout is elsewhere, replacing
+  `Deps.sync`. Rejected with it: hashed SSH dependencies with a `--fork` per
+  sibling, since Zig reads `--fork` only from the command line
+  (`lib/compiler/Maker.zig`) and matches hashed packages by name and
+  fingerprint, never `.path` ones.

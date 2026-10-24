@@ -6,6 +6,9 @@
 #
 ###############################################
 
+# Optional include to extend the makefile targets
+-include ../styleguide/Makefile.in
+
 .DEFAULT_GOAL := all
 
 # ---------------------------------------------
@@ -15,16 +18,10 @@
 # The released version, read from build.zig.zon (the source of truth).
 VERSION := $(shell sed -n -E 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.zig.zon)
 
-# Every Zig source this project owns.
-ZIG_SOURCES := build.zig $(shell find src -name '*.zig' | sort)
-
 # The Zig 0.17 compiler; `make ZIG=zig17 ...` where `zig` is another release.
 ZIG ?= zig
 
-# The zlint config directory; `make substyle` adds it as a submodule.
-STYLEGUIDE ?= styleguide
-
-.PHONY: all validate test cross format lint tag substyle subpull clean
+.PHONY: all build test cross tag clean
 
 # ---------------------------------------------
 # Primary workflows
@@ -34,13 +31,16 @@ STYLEGUIDE ?= styleguide
 all: format test
 	@echo "done"
 
-# Full pre-commit gate. zlint exits zero on findings: read the output.
-validate: clean format lint test cross
-	@echo "validate done"
+# Extend the canonical pre-commit gate with the cross-compile check.
+validate: cross
 
 # ---------------------------------------------
-# Test, format & lint
+# Build & test
 # ---------------------------------------------
+
+# Build the library and host tool.
+build:
+	$(ZIG) build
 
 # Run the unit test suite.
 test:
@@ -60,15 +60,6 @@ cross:
 		$(ZIG) build-exe src/tool.zig -target $$t -femit-bin=zig-out/cross/zigbuildx-$$t || exit 1; \
 		echo "cross $$t ok"; \
 	done
-
-# Format the Zig sources.
-format:
-	$(ZIG) fmt $(ZIG_SOURCES) build.zig.zon
-
-# Lint the Zig sources against the shared styleguide.
-lint:
-	@zlintpre $(ZIG_SOURCES)
-	@echo "$(ZIG_SOURCES)" | tr ' ' '\n' | zlint -c $(STYLEGUIDE) -S
 
 # ---------------------------------------------
 # Release
