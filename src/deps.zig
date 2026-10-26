@@ -1841,7 +1841,7 @@ const TestTree = struct {
     ///
     /// Return: its `file://` URL; IO and zip errors.
     fn zip(self: *Self, sub: []const u8, entries: []const [2][]const u8) ![]const u8 {
-        var archive = try mod.pkg.android.ApkZip.init(self.allocator());
+        var archive = mod.ZipWriter.init(self.allocator());
         defer archive.deinit();
         for (entries) |entry| try archive.addStored(entry[0], entry[1]);
         try self.write(sub, try archive.finish());

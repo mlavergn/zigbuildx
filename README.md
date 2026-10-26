@@ -16,9 +16,11 @@ where the copies drift. It is imported, not run: nothing acts unless a
 | `Xcode` | Finds the macOS SDK, sets a macOS deployment floor, links frameworks |
 | `Swift` | Builds a Swift dylib that a Zig package links against |
 | `Android` | Builds Android native libraries against the NDK |
-| `Apk` | Packages Android native libraries into a signed APK, with no Java or Kotlin |
 | `Docs` | Includes private declarations in Zig's generated documentation |
-| `Pkg` | Builds an installable package: `.pkg` (macOS), `.deb` (Linux), `.msi` (Windows) |
+
+Packaging is not here: [zigpkg](https://github.com/mlavergn/zigpkg) (`zpkg`)
+turns what a build made into a `.pkg`, `.deb`, `.msi` or `.apk`. zigbuildx
+4.0.0 removed `Pkg` and `Apk`; see *Migrating from 3.x*.
 
 Several extensions work around defects in Zig 0.17.0 or the macOS 27 SDK;
 each is written to be deleted on its own once the cause goes away.
@@ -27,16 +29,14 @@ each is written to be deleted on its own once the cause goes away.
 
 - **Zig 0.17.** `build.zig` refuses any other minor release; the workarounds
   were checked against 0.17.0. zigbuildx 1.x is the Zig 0.16 release; 3.0.0
-  changed `Xcode.init` and `Android.init` to take `b`.
+  changed `Xcode.init` and `Android.init` to take `b`; 4.0.0 removed `Pkg`
+  and `Apk`.
 - **Hosts:** macOS (Apple Silicon), Linux (arm64, x86_64) and Windows (x86_64,
   arm64). Apple-only extensions fall back to plain behaviour elsewhere.
 - **Per extension:**
   - `Deps`: `git`; `curl` for an `https://` `.archive`.
   - `Xcode`, `Swift`: Xcode or the Command Line Tools.
-  - `Android`, `Apk`: the Android SDK and NDK; a JDK's `keytool` for the debug
-    keystore.
-  - `Pkg`: `pkgbuild` and `codesign` for macOS; `wixl` (`apt install wixl`, or
-    Homebrew's `msitools`) for Windows. Linux packages need no tools.
+  - `Android`: the Android SDK's NDK.
 
 ## Setup
 
@@ -71,17 +71,9 @@ make validate  # clean, format, lint, build, test, cross
     `.path` (a source release that is not a git repository); see *Usage*.
   - `.sha`, `.tag`, `.branch`: pin a dependency to its own worktree under
     `deps/`; `.checkout` names the shared checkout (default `../<name>`).
-  - `.bundle`: the bundle id in reverse DNS, three labels
-    (`com.example.tool`), required by `zig build pkg`. It is the package id,
-    and its second and last labels name the install directory.
-- **`signing.zon`**, in the project root, holds the Apple signing identity and
-  notarization credentials as `.apple_id`, `.apple_password`, `.apple_name`
-  and `.apple_team`. It must be listed in `.gitignore`; `Pkg` refuses it
-  otherwise. Without it, macOS packages are built unsigned.
-- **Environment:** `ANDROID_HOME` or `ANDROID_SDK_ROOT`, `ANDROID_NDK_HOME` or
-  `ANDROID_NDK_ROOT`, and `JAVA_HOME`. Each falls back to Android Studio's
-  defaults or `PATH`. A release APK's keystore password is best passed as
-  `env:VAR`, keeping it off the command line.
+- **Environment:** `ANDROID_HOME` or `ANDROID_SDK_ROOT`, and
+  `ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT`. Each falls back to Android
+  Studio's defaults.
 - **Build options:** `-Dmacos-min` (from `Xcode.standardTargetOptions`) and
   `-Dupdate` (from `Deps`: fetch and fast-forward dependencies).
 - **Ignore `deps/`** in a project that pins dependencies, and keep it out of
@@ -181,7 +173,7 @@ const shim = zigbuildx.Swift.addDylib(b, .{ .name = "afm", .sources = &.{b.path(
 zigbuildx.Swift.link(exe.root_module, "afm", shim);
 ```
 
-Build an Android library and package it as an APK:
+Build an Android library (`zpkg --package --format apk` packages it):
 
 ```zig
 var android = try zigbuildx.Android.init(b);
@@ -191,7 +183,6 @@ const lib = b.addLibrary(.{ .name = "main", .linkage = .dynamic, .root_module = 
     .target = zigbuildx.Android.resolveTarget(b, .arm64V8a, 30),
 }) });
 try android.configure(lib);
-const apk = try zigbuildx.Apk.add(&android, b, .{ .name = "app", .manifest = b.path("AndroidManifest.xml"), .resources = b.path("res"), .libraries = &.{lib} });
 ```
 
 Document private declarations:
@@ -200,33 +191,42 @@ Document private declarations:
 const docs = zigbuildx.Docs.includePrivate(b, lib.getEmittedDocs());
 ```
 
-Build an installable package of a project's executables:
+### Migrating from 3.x
+
+`Pkg` and `Apk` moved to zigpkg, which packages what a build already made:
+build first, then run `zpkg --package`, which reads the project's
+`package.zon` (beside `build.zig`, committed). Its top level takes the bundle
+id apart: `.bundle = "com.example.tool"` becomes `.domain = "com"`,
+`.org = "example"`, `.name = "tool"` (and its own `.version`), and still
+installs to `/usr/local/example/tool`; each format is a section.
 
 ```zig
-_ = zigbuildx.Pkg.add(b, zon, .{ .executables = &.{exe} });
+.{
+    .org = "example",
+    .name = "tool",
+    .version = "1.0.0",
+    .pkg = .{ .root = "zig-out/pkg/root" },
+}
 ```
 
-```sh
-zig build pkg -Doptimize=fast                         # zig-out/pkg/<name>-<version>.pkg
-zig build pkg -Doptimize=fast -Dtarget=aarch64-linux  # <name>_<version>_arm64.deb, package <bundle>
-zig build pkg -Doptimize=fast -Dtarget=x86_64-windows # <name>-<version>-x64.msi
-zig build pkg-notarize -Doptimize=fast                # macOS: notarize and staple
-```
-
-Shared libraries the programs load go in `lib` beside `bin`, under the name
-the programs expect (on Windows, in `bin`), and are signed with them:
-
-```zig
-_ = zigbuildx.Pkg.add(b, zon, .{ .executables = &.{exe}, .libraries = &.{.{ .name = "libfoo.dylib", .path = dylib }} });
-```
-
-Packages install to `/usr/local/<org>/<name>` (per user under
-`%LOCALAPPDATA%\<org>\<name>` on Windows) and put its `bin` on `PATH`, where
-`.bundle = "com.<org>.<name>"`; `com.example.tool` installs to
-`/usr/local/example/tool`. Each program keeps its executable's name; the
-project's `.name` plays no part.
-Without `wixl`, a Windows package stops after writing its WiX source and
-programs to `zig-out/pkg/<name>-<version>-wix/`, with the command to finish it.
+- **`zig build pkg`:** delete `zigbuildx.Pkg.add(...)`, then
+  `zig build --release=fast --prefix zig-out/pkg/root` and `zpkg --package`,
+  which writes `zig-out/pkg/tool-1.0.0.pkg`. A `.pkg` section with no
+  `.account` builds it unsigned, as `Pkg` did without signing credentials,
+  and needs no `signing.zon`; with one, zigpkg signs it with that account's
+  identities, without the keychain.
+- **`zig build pkg-notarize`:** the section's `.notarize = true`.
+- **`.deb`, `.msi`:** `--format deb` (with `--arch`) or `--format msi`.
+  `Pkg`'s per-user `.msi`, with arm64 programs in an x86 installer, is
+  `.scope = "user"` and `.platform = "x86"`.
+- **`PkgOptions.libraries`:** put them in the payload's `lib/` beside `bin/`
+  (in `bin/` for Windows), and list them in `.sign` to have them signed.
+- **`Apk.add`:** build the libraries, then `zpkg --package --format apk`,
+  whose `.apk` section names the manifest, `res/` and keystore. The keystore password
+  is kept in zigpkg's vault, no longer on the command line.
+- **`signing.zon`:** only to sign, publish or use a release keystore: zigpkg
+  reads it from where `zpkg` runs and needs its `.store`. Its `.apple_*`
+  fields are only imported, once, into an account.
 
 ## Architecture
 
@@ -234,18 +234,11 @@ programs to `zig-out/pkg/<name>-<version>-wix/`, with the command to finish it.
 build.zig        the public surface: re-exports each extension, declares the host tool
 src/module.zig   the barrel the tests compile
 src/tool.zig     the host tool: one program, a command per job a step hands it
-src/             build-side extensions: deps, git, xcode, swift, android, docs
-src/pkg/         packaging: pkg.zig (zig build pkg), one folder per platform
-  macos/         pkgbuild.zig and the install scripts
-  linux/         deb.zig and the maintainer scripts
-  windows/       msi.zig (WiX source for wixl)
-  android/       apk.zig and apk_zip.zig
+src/             the extensions: deps, git, xcode, swift, android, docs, zip_archive
 ```
 
-Code that compiles lives at the top of `src/`; code that assembles an
-installable package lives under `src/pkg/`. Each extension is one struct per
-file, re-exported from `build.zig`, whose `pub` declarations are the package's
-whole surface. Work that would otherwise need a platform-specific shell tool
-(`zip`, `dpkg-deb`, `sed -i`), and work a step must do while the build runs
-(a Zig 0.17 step cannot run code of its own), is done by zigbuildx's host
-tool, built from `src/tool.zig` for the build host.
+Each extension is one struct per file, re-exported from `build.zig`, whose
+`pub` declarations are the package's whole surface. Work that would otherwise
+need a platform-specific shell tool (`sed -i`), and work a step must do while
+the build runs (a Zig 0.17 step cannot run code of its own), is done by
+zigbuildx's host tool, built from `src/tool.zig` for the build host.

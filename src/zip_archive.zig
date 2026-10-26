@@ -163,7 +163,7 @@ pub const ZipArchive = struct {
 ///
 /// Return: the URL; IO and zip errors.
 fn writeTestZip(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8, entries: []const [2][]const u8) ![]const u8 {
-    var zip = try mod.pkg.android.ApkZip.init(allocator);
+    var zip = mod.ZipWriter.init(allocator);
     defer zip.deinit();
     for (entries) |entry| try zip.addStored(entry[0], entry[1]);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = try zip.finish() });

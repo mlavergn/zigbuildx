@@ -3,3 +3,6 @@ zig-out/
 zig-pkg/
 .claude
 signing.zon
+
+# Backups zsecrets import and the signing.zon cleanup leave until checked
+*.bak

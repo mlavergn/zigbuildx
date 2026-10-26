@@ -82,9 +82,8 @@ pub const AndroidAbi = enum {
 ///
 /// Zig ships no Android C library, so a library for Android links against the
 /// NDK's sysroot through a libc file. Packaging the libraries into an APK is
-/// `Apk`'s, in `src/pkg/android/`, which runs the SDK tools this resolves.
-/// Works on macOS, Linux and Windows hosts: the NDK's prebuilt directory and
-/// the tools' file names follow the host.
+/// zigpkg's (`zpkg --recipe <id> --format apk`). Works on macOS, Linux and
+/// Windows hosts: the NDK's prebuilt directory follows the host.
 pub const Android = struct {
     const Self = @This();
     /// Android 15 requires 64-bit libraries to load on 16 KB pages.
@@ -104,19 +103,9 @@ pub const Android = struct {
     sdk: []const u8 = undefined,
     // SAFETY: populated by resolve() before first read, guarded by `loaded`.
     ndk: []const u8 = undefined,
-    /// The newest `build-tools/<version>`.
-    // SAFETY: populated by resolve() before first read, guarded by `loaded`.
-    build_tools: []const u8 = undefined,
-    /// The newest `platforms/android-<N>/android.jar`.
-    // SAFETY: populated by resolve() before first read, guarded by `loaded`.
-    android_jar: []const u8 = undefined,
     /// The NDK's `toolchains/llvm/prebuilt/<host>/sysroot`.
     // SAFETY: populated by resolve() before first read, guarded by `loaded`.
     sysroot: []const u8 = undefined,
-    /// `$JAVA_HOME/bin`, where `keytool` is looked for; null uses `PATH`.
-    java_bin: ?[]const u8 = null,
-    /// The Android Studio debug keystore, when one exists.
-    debug_keystore: ?[]const u8 = null,
 
     /// Creates an unresolved handle for build graph `b`.
     ///
@@ -152,7 +141,7 @@ pub const Android = struct {
         self.arena.deinit();
     }
 
-    /// Locates the SDK, the NDK, the newest build-tools and platform, and the NDK sysroot for this host.
+    /// Locates the SDK, the NDK and the NDK sysroot for this host.
     ///
     /// The SDK is `$ANDROID_HOME`, else `$ANDROID_SDK_ROOT`, else Android
     /// Studio's default for the host. The NDK is `$ANDROID_NDK_HOME`, else
@@ -160,7 +149,7 @@ pub const Android = struct {
     ///
     /// Zig 0.17 reuses a configured build graph until something it was told
     /// about changes, and it is told nothing about the environment or about a
-    /// newer build-tools or NDK appearing, so this poisons the configure cache:
+    /// newer NDK appearing, so this poisons the configure cache:
     /// every build that resolves Android configures again.
     ///
     /// Parameters:
@@ -208,41 +197,12 @@ pub const Android = struct {
         lib.link_z_max_page_size = page_size;
     }
 
-    /// Returns the path of build-tools program `name`, with the host's file extension.
-    ///
-    /// Parameters:
-    /// - `self`: a resolved handle.
-    /// - `name`: e.g. `aapt2`, `zipalign` or `apksigner`.
-    ///
-    /// Return: the path, owned by the handle.
-    pub fn tool(self: *Self, name: []const u8) []const u8 {
-        const allocator = self.arena.allocator();
-        // apksigner is a Java launcher script, a batch file on Windows.
-        const ext = if (self.host != .windows) "" else if (std.mem.eql(u8, name, "apksigner")) ".bat" else ".exe";
-        const file = std.mem.concat(allocator, u8, &.{ name, ext }) catch @panic("OOM");
-        return std.Io.Dir.path.join(allocator, &.{ self.build_tools, file }) catch @panic("OOM");
-    }
-
-    /// Returns JDK program `name`: under `$JAVA_HOME/bin` when set, else bare, for `PATH` to find.
-    ///
-    /// Parameters:
-    /// - `self`: a resolved handle.
-    /// - `name`: the program.
-    ///
-    /// Return: the path or name, owned by the handle.
-    pub fn javaTool(self: *Self, name: []const u8) []const u8 {
-        const allocator = self.arena.allocator();
-        const file = if (self.host == .windows) std.mem.concat(allocator, u8, &.{ name, ".exe" }) catch @panic("OOM") else name;
-        const bin = self.java_bin orelse return file;
-        return std.Io.Dir.path.join(allocator, &.{ bin, file }) catch @panic("OOM");
-    }
-
     /// Populates the handle from `environ` for a `host` build.
     ///
     /// Parameters:
     /// - `self`: the handle.
     /// - `environ`: the build's environment.
-    /// - `host`: the build host's OS, which picks the NDK prebuilt and tool names.
+    /// - `host`: the build host's OS, which picks the NDK prebuilt.
     ///
     /// Return: nothing; an error naming the missing piece, with its path in `missing`.
     fn resolveFrom(self: *Self, environ: *const std.process.Environ.Map, host: std.Target.Os.Tag) !void {
@@ -254,17 +214,6 @@ pub const Android = struct {
         self.missing = sdk;
         cwd.access(self.io, sdk, .{}) catch return error.AndroidSdkNotFound;
         self.sdk = try allocator.dupe(u8, sdk);
-
-        const build_tools = try std.Io.Dir.path.join(allocator, &.{ sdk, "build-tools" });
-        self.missing = build_tools;
-        self.build_tools = try std.Io.Dir.path.join(allocator, &.{ build_tools, try self.newest(build_tools) orelse return error.AndroidBuildToolsNotFound });
-
-        const platforms = try std.Io.Dir.path.join(allocator, &.{ sdk, "platforms" });
-        self.missing = platforms;
-        const platform = try self.newest(platforms) orelse return error.AndroidPlatformNotFound;
-        self.android_jar = try std.Io.Dir.path.join(allocator, &.{ platforms, platform, "android.jar" });
-        self.missing = self.android_jar;
-        cwd.access(self.io, self.android_jar, .{}) catch return error.AndroidPlatformNotFound;
 
         const ndk = environ.get("ANDROID_NDK_HOME") orelse environ.get("ANDROID_NDK_ROOT") orelse ndk: {
             const ndks = try std.Io.Dir.path.join(allocator, &.{ sdk, "ndk" });
@@ -280,11 +229,6 @@ pub const Android = struct {
         self.missing = self.sysroot;
         cwd.access(self.io, self.sysroot, .{}) catch return error.AndroidNdkNotFound;
 
-        if (environ.get("JAVA_HOME")) |java_home| self.java_bin = try std.Io.Dir.path.join(allocator, &.{ java_home, "bin" });
-        if (Self.home(environ, host)) |user_home| {
-            const keystore = try std.Io.Dir.path.join(allocator, &.{ user_home, ".android", "debug.keystore" });
-            if (cwd.access(self.io, keystore, .{})) |_| self.debug_keystore = keystore else |_| {}
-        }
         self.missing = "";
         self.loaded = true;
     }
@@ -440,23 +384,15 @@ test "versionOf reads the numbers in a name" {
 /// Return: nothing; IO errors.
 fn makeFakeSdk(io: std.Io, root: std.Io.Dir) !void {
     const dirs = [_][]const u8{
-        "sdk/build-tools/9.0.0",
-        "sdk/build-tools/35.0.1",
-        "sdk/build-tools/35.0.0",
-        "sdk/platforms/android-9",
-        "sdk/platforms/android-35",
-        "sdk/platforms/android-Baklava",
         "sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/darwin-x86_64/sysroot",
         "sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/darwin-x86_64/sysroot",
         "sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/sysroot",
         "sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/windows-x86_64/sysroot",
     };
     for (dirs) |dir| try root.createDirPath(io, dir);
-    try root.writeFile(io, .{ .sub_path = "sdk/platforms/android-35/android.jar", .data = "" });
-    try root.writeFile(io, .{ .sub_path = "sdk/platforms/android-9/android.jar", .data = "" });
 }
 
-test "resolve picks the newest of each, and the sysroot for every host" {
+test "resolve picks the newest NDK, and the sysroot for every host" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -474,19 +410,8 @@ test "resolve picks the newest of each, and the sysroot for every host" {
         var android = Android.initWith(allocator, io);
         defer android.deinit();
         try android.resolveFrom(&environ, host);
-        try std.testing.expect(std.mem.endsWith(u8, android.build_tools, "35.0.1"));
-        try std.testing.expect(std.mem.find(u8, android.android_jar, "android-35") != null);
         try std.testing.expect(std.mem.find(u8, android.ndk, "27.2.12479018") != null);
         try std.testing.expect(std.mem.find(u8, android.sysroot, Android.hostTag(host).?) != null);
-        const aapt2 = android.tool("aapt2");
-        const apksigner = android.tool("apksigner");
-        if (host == .windows) {
-            try std.testing.expect(std.mem.endsWith(u8, aapt2, "aapt2.exe"));
-            try std.testing.expect(std.mem.endsWith(u8, apksigner, "apksigner.bat"));
-        } else {
-            try std.testing.expect(std.mem.endsWith(u8, aapt2, "aapt2"));
-            try std.testing.expect(std.mem.endsWith(u8, apksigner, "apksigner"));
-        }
 
         const text = try android.libCText(.arm64V8a, 30);
         try std.testing.expect(std.mem.find(u8, text, "sys_include_dir=") != null);

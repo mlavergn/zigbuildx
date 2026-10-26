@@ -24,12 +24,8 @@ pub const Swift = mod.Swift;
 pub const Android = mod.Android;
 /// An Android ABI and its Zig target; see `src/android.zig`.
 pub const AndroidAbi = mod.AndroidAbi;
-/// Packages Android native libraries into a signed APK; see `src/pkg/android/apk.zig`.
-pub const Apk = mod.pkg.android.Apk;
 /// Extends Zig's generated documentation; see `src/docs.zig`.
 pub const Docs = mod.Docs;
-/// Builds installable packages (`zig build pkg`); see `src/pkg/pkg.zig`.
-pub const Pkg = mod.pkg.Pkg;
 
 /// Declares zigbuildx's host tool and the test step for its own suite.
 ///

@@ -18,12 +18,9 @@ pub const Tool = struct {
 
     /// Every command, by the name a step passes first.
     const commands = [_]Command{
-        .{ .name = "apk-zip", .run = mod.pkg.android.ApkZip.command },
-        .{ .name = "deb", .run = mod.pkg.Deb.command },
         .{ .name = "deps", .run = mod.Deps.command },
         .{ .name = "deps-mark", .run = mod.Deps.mark },
         .{ .name = "docs-patch", .run = mod.Docs.command },
-        .{ .name = "pkg", .run = mod.pkg.Pkg.command },
     };
 
     /// Runs the command `args[0]` names.
@@ -40,7 +37,7 @@ pub const Tool = struct {
                 if (std.mem.eql(u8, entry.name, args[0])) return entry.run(process_init, args);
             }
         }
-        log.err("usage: zigbuildx <command> [args]; commands: apk-zip, deb, deps, deps-mark, docs-patch, pkg", .{});
+        log.err("usage: zigbuildx <command> [args]; commands: deps, deps-mark, docs-patch", .{});
         return error.InvalidArguments;
     }
 };
@@ -55,7 +52,7 @@ pub const Tool = struct {
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     Tool.dispatch(init, args[1..]) catch |err| switch (err) {
-        error.AutodocChanged, error.DepsFailed, error.InvalidArguments, error.PkgFailed => std.process.exit(1),
+        error.AutodocChanged, error.DepsFailed, error.InvalidArguments => std.process.exit(1),
         else => return err,
     };
 }

@@ -14,7 +14,7 @@ pub const AndroidAbi = @import("android.zig").AndroidAbi;
 pub const Docs = @import("docs.zig").Docs;
 pub const HostTool = @import("host_tool.zig").HostTool;
 pub const Tool = @import("tool.zig").Tool;
-pub const pkg = @import("pkg/module.zig");
+pub const ZipWriter = @import("zip_writer.zig").ZipWriter;
 
 test {
     std.testing.refAllDecls(@This());

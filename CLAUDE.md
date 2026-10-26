@@ -16,10 +16,11 @@ the workarounds behind them, are below.
   build graph at `init`; 3.2.0 made `Deps` clone a sibling's own siblings;
   3.3.0 added `-Dupdate` for siblings and `Deps.guard`; 3.4.0 added `.archive`
   dependencies (`ZipArchive`); 3.5.0 added `PkgOptions.libraries`; 3.6.0 named the `.deb` package for
-  the bundle id, not its last label.
+  the bundle id, not its last label; 4.0.0 removed `Pkg` and `Apk`, since
+  packaging is zigpkg's (`../zigpkg`, `zpkg --package` and a `package.zon`).
 - **The public surface is `build.zig`.** Consumers import this package's
   `build.zig` by dependency name, so only what it re-exports (`Deps`, `Git`,
-  `Xcode`, `Swift`, `Android`, `AndroidAbi`, `Apk`, `Docs`, `Pkg`) is
+  `Xcode`, `Swift`, `Android`, `AndroidAbi`, `Docs`) is
   reachable. It also declares the host tool, so it has a `build()`.
   `src/module.zig` is the barrel for tests.
 - **It runs on every host.** The code executes inside other projects' build
@@ -64,20 +65,16 @@ Beyond ZIGSTYLE:
 - **`// SAFETY:` comment** above every `undefined` field, saying what
   populates it before its first read.
 - **One-line parameter lists.** `zlintpre` rejects a multi-line list.
-- **Build and package are separate.** Code that compiles lives at the top of
-  `src/` (`android.zig`); code that assembles an installable package lives
-  under `src/pkg/` (`pkg/android/apk.zig`, `macos/`, `linux/`, `windows/`).
-- **Sub-packages:** `src/pkg/` has its own `module.zig` barrel, reached as
-  `mod.pkg`; its files import that barrel, and it passes through the parent
-  types they need (`Git`, `HostTool`, `Android`). A folder with several
-  `.zig` files gets its own barrel too (`pkg/android/`, reached as
-  `mod.pkg.android`); a folder with one does not.
+- **No packaging.** Building an installable package (`.pkg`, `.deb`,
+  `.msi`, `.apk`) is zigpkg's, run after the build; 4.0.0 removed `Pkg`,
+  `Apk` and `src/pkg/`. What is left is flat in `src/`. A new sub-folder with
+  several `.zig` files gets its own `module.zig` barrel (ZIGSTYLE B.1.a).
 - **The host tool** (`src/tool.zig`): one program, `zigbuildx <command>`,
   that does every job a step must do while the build runs. A Zig 0.17 step
   cannot run code of its own (`Step` has a closed set of tags and no
   `makeFn`), and a program also avoids shell tools that differ between
-  platforms (`sed -i`, `zip`). Each command is a `command(process_init, args)`
-  method on the struct it serves (`ApkZip`, `Deb`, `Deps`, `Docs`, `Pkg`),
+  platforms (`sed -i`). Each command is a `command(process_init, args)`
+  method on the struct it serves (`Deps`, `Docs`),
   with `args[0]` the command's name; `Tool.dispatch` maps names to them. Name
   the `std.process.Init` parameter `process_init`, since `init` shadows the
   struct's `init`.
@@ -105,7 +102,7 @@ Beyond ZIGSTYLE:
   makes every build configure again. `Xcode.resolve` depends on the SDK's
   `SDKSettings.json`; `Deps` on the contents of `.zig-cache/zigbuildx/` (the
   breadcrumb); `Android.resolve`, `Deps.sync` (while worktrees exist),
-  `Deps` under `-Dupdate` and `Pkg` for Windows (`b.findProgram`) poison.
+  and `Deps` under `-Dupdate` poison.
 - **A tracked path must exist.** Despite its doc comment,
   `dependOnFileMetadata` on a missing file fails configuration with
   `FileSystemFailure`. Track a directory that always exists instead (create
@@ -118,9 +115,9 @@ Beyond ZIGSTYLE:
   `isPresent`), and its exit-and-re-run is required: a dependency cloned
   mid-`build()` resolves, but its own `build()` never runs.
 - **Run steps hash a directory argument's path, not its contents.** A
-  directory whose path never changes needs `has_side_effects` (the `pkg`
-  run) or each file added with `addFileInput` (`Apk`'s `res/`, whose walk
-  also registers each directory with `dependOnDirectoryContents`).
+  directory whose path never changes needs `has_side_effects`, or each file
+  added with `addFileInput` (3.x's `Apk` walked its `res/` so, also
+  registering each directory with `dependOnDirectoryContents`).
 - **Deprecated in 0.17, and not to be used:** `Run.add*Arg` without `2`
   (`addOutputFileArg2`, `addDirectoryArg2`, ...), `Compile.out_filename`
   (`std.zig.binNameAlloc`, or the artifact's name), `LazyPath.cwd_relative`
@@ -268,64 +265,28 @@ Beyond ZIGSTYLE:
 - **`Android`:** `init(b)` keeps the build graph, as `Xcode` does, so
   `resolve()` and `configure(lib)` take no `b`. `resolve` takes the SDK from `ANDROID_HOME`,
   `ANDROID_SDK_ROOT` or Android Studio's default; the NDK from
-  `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT` or the newest under the SDK; the
-  newest build-tools and platform; and the host's NDK prebuilt. `resolve`
+  `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT` or the newest under the SDK; and the
+  host's NDK prebuilt. Since 4.0.0 it no longer looks for build-tools, a
+  platform, `keytool` or a debug keystore: only `Apk` used them, and zigpkg's
+  `AndroidSdk` finds them now. `resolve`
   poisons the configure cache (it reads the environment). `configure` adds a
   libc file and 16 KB pages. Zig 0.17's libc file needs every field, including
   `darwin_sdk_dir`, and takes a Linux target's `crtbegin`/`crtend` from
   `cc_dir`, which is the NDK's per-API library directory, like `crt_dir`; a
-  test parses the file with `std.zig.LibCInstallation.parse`. Windows tools are `aapt2.exe`,
-  `zipalign.exe`, `apksigner.bat`; `keytool` comes from `JAVA_HOME` or `PATH`.
-- **`Apk.add`:** `aapt2 compile` and `link`, then the host tool's `apk-zip` adds each library
-  under `lib/<abi>/` stored (Android maps them from the APK), `zipalign -P 16`
-  and `apksigner`. Without a keystore it signs with Android Studio's debug
-  keystore, else one generated into the cache.
+  test parses the file with `std.zig.LibCInstallation.parse`.
+- **`ZipWriter`:** what is left of `ApkZip`, stored entries and `finish`
+  only, for the `ZipArchive` and `Deps` tests' fixture zips (std reads zips
+  but cannot write one). Not re-exported from `build.zig`.
 - **`Docs.includePrivate`:** the host tool's `docs-patch` copies the autodoc
   site and flips the two `include_private` call sites in `main.js`; each
   pattern must occur once, so a changed front end fails the build.
-- **`Pkg`:**
-  - **Identity:** `.bundle` is the bundle id and the package id as written, and
-    must be three labels, `<domain>.<org>.<name>`; paths and the package's file
-    name use its second and last labels. The project's `.name` is not read, and
-    each program keeps its executable's name. Three exactly, because
-    `uninstall.sh` removes `/usr/local/<org>/<name>`: `com.example` alone would
-    make that the whole organisation's directory.
-  - **Scripts:** macOS `preinstall`, `postinstall`, `uninstall.sh` and Linux
-    `preinst`, `postrm`, `profile.sh`, embedded and filled with `{pkg_name}`,
-    `{pkg_id}`, `{pkg_org}`; `PkgOptions.scripts` overrides them by name.
-  - **Libraries:** `PkgOptions.libraries` (`PkgLibrary`: a `LazyPath` and the
-    file name it installs as, since a generated file's own name is a cache
-    name) go in `lib/` beside `bin/`, for a program whose install name is
-    `@rpath/...` with an `@executable_path/../lib` rpath (zigagent's
-    `libafm.dylib`); on Windows in `bin/`, beside the programs. The host tool
-    takes each as `--library=<name>=<path>`. macOS signs them as it signs
-    the programs, or notarization refuses the package.
-    The macOS scripts come from `~/src/inferise/pkg/zlintpre`, with one fix
-    (`postinstall` tested `-d` on a file). The preinstall that runs the old
-    `uninstall.sh`, wiping `/etc/<org>/<name>` on upgrade, is intended.
-  - **Steps:** `Pkg.add` declares; `PkgRun` (the host tool's `pkg`
-    command) stages and builds the macOS and Linux packages beside the Run
-    step's output, from `--key=value` options and the programs after `--`,
-    and deletes the stage. A problem (`.bundle` missing, mixed targets) becomes
-    a `Fail` step behind `zig build pkg`. `pkg-notarize` notarizes a copy of
-    the package and installs it over the plain one.
-  - **macOS:** `Pkgbuild` signs each executable with `Developer ID
-    Application` (hardened runtime, timestamp) and the `.pkg` with
-    `Developer ID Installer`; `pkg-notarize` runs `notarytool --wait`
-    (password visible in `ps` while it runs) and `stapler`.
-  - **Linux:** the `deb` host tool writes the archive; entries are root-owned
-    and dated 0. Unsigned; signing belongs to the apt repository. The
-    `Package` is the bundle id (so `.bundle` must be a Debian name, which
-    means lowercase); the file and the paths keep the last label. A package
-    from before 3.6.0 was named by that label, so the control file conflicts
-    with, replaces and provides it, and `dpkg -i` swaps the old one out.
-  - **Windows:** `Msi` renders WiX for `wixl` while the graph is declared:
-    per-user under `%LOCALAPPDATA%`, the user `PATH`, GUIDs derived from the
-    id. A `WriteFiles` step stages `bin/` and `product.wxs`, and `wixl` runs
-    in it. `wixl` has no arm64 platform, so arm64 ships in an x86 installer.
-    Without `wixl`, the stage is installed to
-    `zig-out/pkg/<name>-<version>-wix/` and the step fails with the command to
-    finish it.
+- **Packaging (removed in 4.0.0):** `Pkg` (`.pkg`, `.deb`, `.msi` from
+  `zig build pkg`) and `Apk` moved to zigpkg, which closed the gaps first:
+  a recipe's `.domain` (the bundle id's first label), an unsigned `.pkg` for
+  a recipe with no account, a `.deb` description, a per-user or x86 `.msi`
+  (3.x's layout), and `--format apk`. Not carried over: running inside
+  `zig build`, `PkgOptions.scripts`, and Linux hosts. zigpkg's CLAUDE.md
+  *Origin* maps each piece.
 
 ## Workarounds
 
@@ -370,17 +331,13 @@ Re-run that fetch after every change to zigbuildx, because the hash pins the
 contents.
 
 - **Android without an SDK** (none is installed, and none should be): point
-  `ANDROID_HOME` at a fake tree holding `build-tools/<v>/{aapt2,zipalign,apksigner}`
-  stand-in scripts that log their argv, `platforms/android-N/android.jar`, and
-  `ndk/<v>/toolchains/llvm/prebuilt/<host>/sysroot`. Point `JAVA_HOME` at a
-  directory whose `bin/keytool` is a stand-in. Build the `.so` without libc;
-  linking libc needs the real NDK, so check `configure` from the failing link
-  command instead, which shows `--libc` and `-z max-page-size=16384`.
+  `ANDROID_HOME` at a fake tree holding
+  `ndk/<v>/toolchains/llvm/prebuilt/<host>/sysroot`. Build the `.so` without
+  libc; linking libc needs the real NDK, so check `configure` from the failing
+  link command instead, which shows `--libc` and `-z max-page-size=16384`.
 - **Linux:** run it in podman with Debian, installing `xz-utils curl git` and
   extracting `https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz`
   into `/opt`. One test is skipped there by design: the `xcrun` SDK lookup.
-  `zig build pkg` in a scratch consumer there gives a `.deb` that `dpkg -i`
-  installs.
 - **Windows:** compile only, via `make cross`. Nothing here runs Windows
   binaries.
 - **Configure caching:** run `zig build` twice; the second skips `build()`.
@@ -388,19 +345,18 @@ contents.
 
 ## Adopters
 
-Every Zig project under `~/src/inferise` and `~/src/mlavergn` that lists
-zigbuildx (29) tracks `git+https://github.com/mlavergn/zigbuildx#main`, with
-the `.hash` of the commit last fetched. Their Zig 0.17 ports are uncommitted.
-Nearly all use `Xcode` and `Deps.cloneMissing`; beyond that:
+Every Zig project under `~/src/mlavergn` that lists zigbuildx (34; the
+`~/src/inferise` tree is no longer used) tracks
+`git+https://github.com/mlavergn/zigbuildx#main` or a tag, with the `.hash`
+of the commit last fetched. Nearly all use `Xcode` and `Deps.cloneMissing`;
+beyond that:
 
 | Repo | Uses |
 |---|---|
-| zigclaude | `Deps.sync` (all dependencies unpinned) |
 | zigstorage | `Xcode` floor 26.0 and `linkFramework`, `Docs` |
-| zigwebrtc, dropbox | `Xcode` floor |
-| zigafm | `Xcode` floor 26.0, `Swift` |
-| zigagent | `Swift.fromDependency` (zigafm's dylib), `Pkg` with `libraries` |
-| zlintpre | `Pkg` |
+| zigiptv | `Xcode` floor 26.0 and `linkFramework` |
+| zigwebrtc | `Xcode` floor |
+| ziglink, zigplan, zigprompt | `Pkg` until 4.0.0; now `package.zon` and `zpkg --package` from `make pkg` |
 
 - **Version bumps:** bump `.version` on any change, push `main` and the tag,
   then in each adopter run `zig fetch --save-exact=zigbuildx
@@ -408,10 +364,15 @@ Nearly all use `Xcode` and `Deps.cloneMissing`; beyond that:
   URL and refreshes the hash. Before `main` is pushed, `zig fetch .` from this
   repo puts the same hash in the global cache, so adopters build against it
   locally.
+- **From 3.6 to 4.0.0:** delete `zigbuildx.Pkg.add(...)` and
+  `zigbuildx.Apk.add(...)`; add a `package.zon` and run `zpkg --package` after
+  `zig build` (README's *Migrating from 3.x*). `.bundle` is no longer read by
+  anything; Zig ignores it. `Android`'s `build_tools`,
+  `android_jar`, `tool()` and `javaTool()` are gone.
 - **From 3.2.0 to 3.3.0:** nothing required; add `zigbuildx.Deps.guard(b);`
   last in `build()` to update after a compile error. Pilot: zigclaude.
 - **From 3.0.0 to 3.1.0:** a `Pkg` adopter's manifest replaces `.org` with a
-  three-label `.bundle` (zlintpre: `.bundle = "com.inferise.zlintpre"`).
+  three-label `.bundle` (zlintpre: `.bundle = "com.marclavergne.zlintpre"`).
 - **From 2.0.0 to 3.0.0:** `Xcode.init(b.allocator, b.graph.io)` becomes
   `Xcode.init(b)` and `resolve(b)` becomes `resolve()`; `Android` likewise,
   with `configure(b, lib)` becoming `configure(lib)`.
