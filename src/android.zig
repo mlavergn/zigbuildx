@@ -42,16 +42,14 @@ pub const AndroidAbi = enum {
 
     /// Returns the Zig target query for the ABI at Android API level `api`.
     ///
-    /// The 32-bit ABIs name a CPU, because Android's baselines sit above Zig's:
-    /// armeabi-v7a devices are ARMv7-A with NEON (Cortex-A7, as zigandroidtv
-    /// found it needed), and x86 devices guarantee SSSE3.
-    ///
     /// Parameters:
     /// - `self`: the ABI.
     /// - `api`: the minimum Android API level.
     ///
     /// Return: the query.
     pub fn query(self: Self, api: u32) std.Target.Query {
+        // The 32-bit ABIs name a CPU, since Android's baselines sit above Zig's:
+        // armeabi-v7a devices are ARMv7-A with NEON (Cortex-A7), and x86 devices guarantee SSSE3.
         return switch (self) {
             .arm64V8a => .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .android, .android_api_level = api },
             .armeabiV7a => .{ .cpu_arch = .arm, .cpu_model = .{ .explicit = &std.Target.arm.cpu.cortex_a7 }, .os_tag = .linux, .abi = .androideabi, .android_api_level = api },
@@ -82,25 +80,31 @@ pub const AndroidAbi = enum {
 ///
 /// Zig ships no Android C library, so a library for Android links against the
 /// NDK's sysroot through a libc file. Packaging the libraries into an APK is
-/// zigpkg's (`zpkg --recipe <id> --format apk`). Works on macOS, Linux and
-/// Windows hosts: the NDK's prebuilt directory follows the host.
+/// out of scope. Works on macOS, Linux and Windows hosts: the NDK's prebuilt
+/// directory follows the host.
 pub const Android = struct {
     const Self = @This();
     /// Android 15 requires 64-bit libraries to load on 16 KB pages.
     const page_size: u64 = 16 * 1024;
 
+    /// Backs every resolved path and libc file; freed by `deinit`.
     arena: std.heap.ArenaAllocator,
+    /// IO for inspecting the SDK.
     io: std.Io,
     /// The build graph `resolve` reads and `configure` adds steps to.
     // SAFETY: set by init(b); a handle from initWith (unit tests) never calls resolve or configure.
     b: *std.Build = undefined,
+    /// Whether `resolve` found the SDK, the NDK and the sysroot.
     loaded: bool = false,
     /// What `resolve` looked for and did not find, for its error message.
     missing: []const u8 = "",
+    /// The build host's OS, which picks the NDK's prebuilt directory.
     // SAFETY: populated by resolve() before first read, guarded by `loaded`.
     host: std.Target.Os.Tag = undefined,
+    /// The Android SDK's root.
     // SAFETY: populated by resolve() before first read, guarded by `loaded`.
     sdk: []const u8 = undefined,
+    /// The NDK's root.
     // SAFETY: populated by resolve() before first read, guarded by `loaded`.
     ndk: []const u8 = undefined,
     /// The NDK's `toolchains/llvm/prebuilt/<host>/sysroot`.
@@ -108,9 +112,6 @@ pub const Android = struct {
     sysroot: []const u8 = undefined,
 
     /// Creates an unresolved handle for build graph `b`.
-    ///
-    /// The resolved paths come from `b.allocator` and the SDK is inspected
-    /// through `b.graph.io`.
     ///
     /// Parameters:
     /// - `b`: the build graph; must outlive the handle.
@@ -142,25 +143,19 @@ pub const Android = struct {
     }
 
     /// Locates the SDK, the NDK and the NDK sysroot for this host.
-    ///
-    /// The SDK is `$ANDROID_HOME`, else `$ANDROID_SDK_ROOT`, else Android
-    /// Studio's default for the host. The NDK is `$ANDROID_NDK_HOME`, else
-    /// `$ANDROID_NDK_ROOT`, else the newest under the SDK's `ndk/`.
-    ///
-    /// Zig 0.17 reuses a configured build graph until something it was told
-    /// about changes, and it is told nothing about the environment or about a
-    /// newer NDK appearing, so this poisons the configure cache:
-    /// every build that resolves Android configures again.
+    /// Poisons the configure cache: every build that resolves Android configures again.
     ///
     /// Parameters:
-    /// - `self`: the handle to populate; its build graph's environment and host
-    ///   are read.
+    /// - `self`: the handle to populate; its build graph's environment and host are read.
     ///
     /// Return: nothing; `error.AndroidSdkNotFound` naming what is missing.
     pub fn resolve(self: *Self) !void {
+        // Zig 0.17 reuses a configured graph until a tracked input changes, and neither the
+        // environment nor a newer NDK appearing is tracked.
         self.b.graph.poisonCache();
         self.resolveFrom(&self.b.graph.environ_map, self.b.graph.host.result.os.tag) catch |err| {
-            log.err("{s} not found: {s} (set ANDROID_HOME and ANDROID_NDK_HOME)", .{ @errorName(err), self.missing });
+            const message = self.describeFailure(err) catch "cannot locate the Android SDK";
+            log.err("{s}", .{message});
             return err;
         };
     }
@@ -186,7 +181,11 @@ pub const Android = struct {
     /// Return: nothing; `error.NotAndroid` when `lib`'s target is not Android.
     pub fn configure(self: *Self, lib: *std.Build.Step.Compile) !void {
         std.debug.assert(self.loaded);
-        const target = (lib.root_module.resolved_target orelse return error.NotAndroid).result;
+        const resolved = lib.root_module.resolved_target orelse {
+            log.err("{s} has no target; give it one from resolveTarget", .{lib.name});
+            return error.NotAndroid;
+        };
+        const target = resolved.result;
         const abi = AndroidAbi.fromTarget(target) orelse {
             log.err("{s} does not target Android", .{lib.name});
             return error.NotAndroid;
@@ -204,7 +203,7 @@ pub const Android = struct {
     /// - `environ`: the build's environment.
     /// - `host`: the build host's OS, which picks the NDK prebuilt.
     ///
-    /// Return: nothing; an error naming the missing piece, with its path in `missing`.
+    /// Return: nothing; `error.AndroidSdkNotFound`, `error.AndroidNdkNotFound` or `error.UnsupportedHost`, naming the path in `missing`.
     fn resolveFrom(self: *Self, environ: *const std.process.Environ.Map, host: std.Target.Os.Tag) !void {
         const allocator = self.arena.allocator();
         const cwd = std.Io.Dir.cwd();
@@ -233,23 +232,42 @@ pub const Android = struct {
         self.loaded = true;
     }
 
-    /// Returns the libc file that points Zig at the NDK sysroot for `abi` at `api`.
+    /// Explains a `resolveFrom` failure, naming what was looked for and how to point at it.
     ///
-    /// Zig 0.17 takes a Linux target's `crtbegin` and `crtend` from `cc_dir`;
-    /// the NDK keeps `crtbegin_so.o` and `crtend_so.o` beside the other
-    /// startup objects, so `cc_dir` is `crt_dir`.
+    /// Parameters:
+    /// - `self`: the handle `resolveFrom` failed on; its `missing` names the path.
+    /// - `err`: the error `resolveFrom` returned.
+    ///
+    /// Return: the message, owned by the handle; allocation errors.
+    fn describeFailure(self: *Self, err: anyerror) ![]const u8 {
+        const allocator = self.arena.allocator();
+        return switch (err) {
+            // No `missing` path: there was no home directory to find the default SDK in.
+            error.AndroidSdkNotFound => if (self.missing.len == 0)
+                "Android SDK not found: no home directory to look in; set ANDROID_HOME or ANDROID_SDK_ROOT"
+            else
+                allocator.print("Android SDK not found at {s}; set ANDROID_HOME or ANDROID_SDK_ROOT", .{self.missing}),
+            error.AndroidNdkNotFound => allocator.print("Android NDK not found at {s}; set ANDROID_NDK_HOME or ANDROID_NDK_ROOT", .{self.missing}),
+            error.UnsupportedHost => allocator.print("the Android NDK has no prebuilt toolchain for a {s} host", .{self.missing}),
+            else => allocator.print("cannot locate the Android SDK [{any}]", .{err}),
+        };
+    }
+
+    /// Returns the libc file that points Zig at the NDK sysroot for `abi` at `api`.
     ///
     /// Parameters:
     /// - `self`: a resolved handle.
     /// - `abi`: the ABI.
     /// - `api`: the API level, which selects the sysroot's `usr/lib/<triple>/<api>`.
     ///
-    /// Return: the file's text, owned by the handle.
+    /// Return: the file's text, owned by the handle; allocation errors.
     fn libCText(self: *Self, abi: AndroidAbi, api: u32) ![]const u8 {
         const allocator = self.arena.allocator();
         const include = try std.Io.Dir.path.join(allocator, &.{ self.sysroot, "usr", "include" });
         const sys_include = try std.Io.Dir.path.join(allocator, &.{ include, abi.triple() });
         const crt = try std.Io.Dir.path.join(allocator, &.{ self.sysroot, "usr", "lib", abi.triple(), try allocator.print("{d}", .{api}) });
+        // Zig 0.17 takes a Linux target's `crtbegin`/`crtend` from `cc_dir`; the NDK keeps
+        // `crtbegin_so.o` and `crtend_so.o` beside the other startup objects, so `cc_dir` is `crt_dir`.
         return allocator.print(
             \\include_dir={s}
             \\sys_include_dir={s}
@@ -263,15 +281,13 @@ pub const Android = struct {
     }
 
     /// Returns the newest entry of directory `path`, comparing the numbers in each name.
-    ///
-    /// `35.0.1` beats `35.0.0`, `android-35` beats `android-9`; names with no
-    /// number (preview platforms) are skipped.
+    /// Names with no number (preview platforms) are skipped.
     ///
     /// Parameters:
     /// - `self`: the handle.
     /// - `path`: the directory.
     ///
-    /// Return: the entry's name, or null when the directory is absent or holds none.
+    /// Return: the entry's name, or null when the directory is absent or holds none; IO errors.
     fn newest(self: *Self, path: []const u8) !?[]const u8 {
         var dir = std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true }) catch return null;
         defer dir.close(self.io);
@@ -308,14 +324,13 @@ pub const Android = struct {
 
     /// Returns the NDK prebuilt directory name for a host.
     ///
-    /// Google ships `darwin-x86_64` as a universal binary, so Apple Silicon uses it too.
-    ///
     /// Parameters:
     /// - `host`: the host OS.
     ///
     /// Return: the name, or null for a host the NDK does not support.
     fn hostTag(host: std.Target.Os.Tag) ?[]const u8 {
         return switch (host) {
+            // Google ships `darwin-x86_64` as a universal binary, so Apple Silicon uses it too.
             .macos => "darwin-x86_64",
             .linux => "linux-x86_64",
             .windows => "windows-x86_64",
@@ -336,20 +351,9 @@ pub const Android = struct {
             const local = environ.get("LOCALAPPDATA") orelse return error.AndroidSdkNotFound;
             return std.Io.Dir.path.join(allocator, &.{ local, "Android", "Sdk" });
         }
-        const user_home = Self.home(environ, host) orelse return error.AndroidSdkNotFound;
+        const user_home = environ.get("HOME") orelse return error.AndroidSdkNotFound;
         if (host == .macos) return std.Io.Dir.path.join(allocator, &.{ user_home, "Library", "Android", "sdk" });
         return std.Io.Dir.path.join(allocator, &.{ user_home, "Android", "Sdk" });
-    }
-
-    /// Returns the user's home directory.
-    ///
-    /// Parameters:
-    /// - `environ`: the build's environment.
-    /// - `host`: the host OS.
-    ///
-    /// Return: `$HOME`, `%USERPROFILE%` on Windows, or null.
-    fn home(environ: *const std.process.Environ.Map, host: std.Target.Os.Tag) ?[]const u8 {
-        return environ.get(if (host == .windows) "USERPROFILE" else "HOME");
     }
 };
 
@@ -374,8 +378,7 @@ test "versionOf reads the numbers in a name" {
     try std.testing.expectEqual(@as(?[4]u32, null), Android.versionOf("android-Baklava"));
 }
 
-/// Builds a fake SDK under `root`: two of each versioned directory, and an NDK
-/// sysroot for every host, so a resolve for any host finds its own.
+/// Builds a fake SDK under `root`: two NDKs, the newer with a sysroot for every host.
 ///
 /// Parameters:
 /// - `io`: IO for the filesystem.
@@ -466,4 +469,16 @@ test "a missing SDK is reported, with the path looked for" {
     defer android.deinit();
     try std.testing.expectError(error.AndroidSdkNotFound, android.resolveFrom(&environ, .linux));
     try std.testing.expectEqualStrings("/nonexistent/zigbuildx/sdk", android.missing);
+    try std.testing.expectEqualStrings("Android SDK not found at /nonexistent/zigbuildx/sdk; set ANDROID_HOME or ANDROID_SDK_ROOT", try android.describeFailure(error.AndroidSdkNotFound));
+}
+
+test "every resolve failure has its own message" {
+    var android = Android.initWith(std.testing.allocator, std.testing.io);
+    defer android.deinit();
+    // With no home directory there is no path to name.
+    try std.testing.expectEqualStrings("Android SDK not found: no home directory to look in; set ANDROID_HOME or ANDROID_SDK_ROOT", try android.describeFailure(error.AndroidSdkNotFound));
+    android.missing = "/sdk/ndk";
+    try std.testing.expectEqualStrings("Android NDK not found at /sdk/ndk; set ANDROID_NDK_HOME or ANDROID_NDK_ROOT", try android.describeFailure(error.AndroidNdkNotFound));
+    android.missing = "freebsd";
+    try std.testing.expectEqualStrings("the Android NDK has no prebuilt toolchain for a freebsd host", try android.describeFailure(error.UnsupportedHost));
 }

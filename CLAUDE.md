@@ -1,421 +1,285 @@
 # CLAUDE.md
 
-Guidance for Claude Code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project
 
-zigbuildx is a library of Zig build system extensions: logic that `std.Build`
-lacks, imported from other projects' `build.zig` instead of being copied into
-each one. `README.md` covers setup and usage; how each extension works, and
-the workarounds behind them, are below.
+zigbuildx is a library of Zig build system extensions: logic `std.Build` lacks,
+imported from other projects' `build.zig` instead of copied into each one.
+`README.md` covers setup and usage.
 
-- **Zig 0.17.0 only.** `build.zig` has a `comptime` guard that refuses any
-  Zig outside 0.17 (it does not check the patch). Several extensions work
-  around Zig 0.17.0 defects; see *Workarounds*. Version 1.x was the Zig 0.16
-  release; 2.0.0 dropped 0.16; 3.0.0 made `Xcode` and `Android` take the
-  build graph at `init`; 3.2.0 made `Deps` clone a sibling's own siblings;
-  3.3.0 added `-Dupdate` for siblings and `Deps.guard`; 3.4.0 added `.archive`
-  dependencies (`ZipArchive`); 3.5.0 added `PkgOptions.libraries`; 3.6.0 named the `.deb` package for
-  the bundle id, not its last label; 4.0.0 removed `Pkg` and `Apk`, since
-  packaging is zigpkg's (`../zigpkg`, `zpkg --package` and a `package.zon`).
-- **The public surface is `build.zig`.** Consumers import this package's
-  `build.zig` by dependency name, so only what it re-exports (`Deps`, `Git`,
-  `Xcode`, `Swift`, `Android`, `AndroidAbi`, `Docs`) is
-  reachable. It also declares the host tool, so it has a `build()`.
-  `src/module.zig` is the barrel for tests.
+- **Zig 0.17.0 only.** A `comptime` guard in `build.zig` refuses any other
+  minor release. Several extensions work around 0.17.0 defects (see
+  *Workarounds*).
 - **It runs on every host.** The code executes inside other projects' build
   runners on macOS, Linux and Windows. Host-specific behaviour is a runtime
-  branch on `b.graph.host`, so a Windows-only mistake compiles fine on macOS.
+  branch on `b.graph.host`, so a Windows-only mistake compiles on macOS;
   `make cross` catches it.
 - **No dependencies.** `build.zig.zon` `.dependencies` stays empty.
+- **No packaging.** Building a `.pkg`, `.deb`, `.msi` or `.apk` is out of
+  scope; 4.0.0 removed `Pkg` and `Apk`.
+- **It is a base module.** Never name a project that depends on zigbuildx,
+  in code, docs or examples: zigbuildx knows nothing about its consumers.
+  Use generic names (`../mylib`, `../a`) in examples.
 
-## Commands
+## Build / Test
 
-- **`ZIG`:** the Makefile runs `$(ZIG)`, default `zig`, which is 0.17 on
-  this machine.
-- `make`: format and test.
-- One test: `zig build test -Dtest-filter=<substring>`.
-- `make validate`: **the gate**. It runs clean, format, lint, build, test, then
-  cross (`validate: cross`), and must pass before a change is done. Any lint
-  finding or warning fails it.
-- `make cross`: compiles the test suite and the host tool for x86_64 and
-  aarch64 Windows and Linux, without running them.
-- `make format`, `make lint` and `make validate` come from
-  `../styleguide/Makefile.in`, so they need that sibling checkout. `make lint`
-  runs `zlintpre`, then `zlint -c ../styleguide --deny-warnings`.
-- `make format` and `make lint` cover `build.zig` and every `.zig` file under
-  `ZIG_DIRS` (default `src cli web`; only `src/` exists); `make format` also
-  formats `build.zig.zon`. Add new source roots to `ZIG_DIRS`.
+- `make`: format and test. `ZIG` (default `zig`, 0.17 here) is the compiler.
+- `zig build test -Dtest-filter=<substring>`: one test.
+- `make validate`: **the gate**, which must pass before a change is done:
+  clean, format, lint, build, test, then `cross`. Any lint finding or
+  warning fails it.
+- `make cross`: compiles the suite and the host tool for x86_64 and aarch64
+  Windows and Linux, without running them.
+- `format`, `lint` and `validate` come from `../styleguide/Makefile.in`, so
+  they need that sibling checkout. `make lint` runs `zlintpre`, then `zlint
+  -c ../styleguide --deny-warnings`, over `build.zig` and `ZIG_DIRS`
+  (default `src cli web`; only `src/` exists). Add new source roots to
+  `ZIG_DIRS`.
+- `make tag`: tags `v<.version>` and pushes it; `zigbuildx-pin` finds
+  releases by that tag.
 
-## Style
+Unit tests cannot cover how the build graph is wired, and `refAllDecls` does
+not analyze nested functions, so a typo in an unreferenced method compiles.
+Check graph changes in a scratch consumer outside this repo, re-fetching
+after every change (the hash pins the contents):
+
+```sh
+zig fetch --save=zigbuildx ../zigbuildx   # from the scratch package
+```
+
+- **Android:** no SDK is installed, and none should be. Point `ANDROID_HOME`
+  at a fake tree holding `ndk/<v>/toolchains/llvm/prebuilt/<host>/sysroot`;
+  linking libc needs the real NDK, so check `configure` from the failing
+  link command (`--libc`, `-z max-page-size=16384`).
+- **Linux:** podman with Debian (`xz-utils curl git`) and Zig 0.17.0's
+  aarch64-linux tarball in `/opt`. The `xcrun` tests skip there.
+- **Windows:** compile only, through `make cross`.
+- **Configure caching:** run `zig build` twice; the second skips `build()`
+  (a `std.debug.print` in the scratch `build.zig` shows whether it ran).
+
+## Module layout
+
+```
+build.zig              the public surface: re-exports Deps, Git, Xcode, Swift,
+                       Android, AndroidAbi and Docs; installs the host tool
+src/module.zig         the barrel the tests compile
+src/deps.zig           Deps (clone, sync, update, guard, pin) and its private Sync
+src/git.zig            Git: one thin wrapper per git command
+src/xcode.zig          Xcode: Apple SDKs, the macOS floor, frameworks, xcframeworks
+src/swift.zig          Swift: swiftc dylibs
+src/android.zig        Android, AndroidAbi: the NDK
+src/docs.zig           Docs: autodoc with private declarations
+src/zip_archive.zig    ZipArchive: `.archive` download and unpack
+src/file.zig           File: file-system primitives the others share
+src/tool.zig           Tool: the host tool's main and command dispatch
+src/tool_artifact.zig  ToolArtifact: finds the host tool for a consumer's build
+src/zip_builder.zig    ZipBuilder: in-memory zips for the tests
+```
+
+Consumers import this package's `build.zig` by dependency name, so only what
+it re-exports is reachable; `File`, `ZipArchive`, `ToolArtifact`, `Tool` and
+`ZipBuilder` are internal. A new sub-folder with several `.zig` files gets
+its own `module.zig` barrel.
+
+## Architecture conventions
 
 @../styleguide/ZIGSTYLE.md
 
-`../styleguide/ZIGMIGRATE.md` maps deprecated APIs. Two deliberate departures
-from ZIGSTYLE D.3.a:
+`../styleguide/ZIGMIGRATE.md` maps deprecated APIs. Departures from and
+additions to ZIGSTYLE:
 
-- **No `@src()` entry tracing.** A consumer's build runner is compiled in
-  Debug, where `log.debug` prints, so tracing would print on every build.
-- **A scoped logger only in files that log.** `zlint` flags an unused one.
+- **No `@src()` entry tracing** (D.3.a): a consumer's build runner is Debug,
+  where `log.debug` prints on every build.
+- **A scoped logger only in files that log**: `zlint` flags an unused one.
+- **Fixed limits are named constants** (A.1.b): there is no `Config` inside
+  another project's `build()`, so read caps (`Manifest.max_bytes`) and
+  `curl`'s `ZipArchive.connect_timeout_seconds` are constants on their
+  struct, never bare numbers. A value a consumer must choose is a `-D`
+  option.
+- **Doc comments** on every function say what it does, never how: a
+  one-line summary (plus at most one line a caller must know, such as "Call
+  it first in `build()`"), a one-line `Parameters:` bullet per parameter in
+  signature order, and a one-line `Return:` (omitted for plain `void`). Why a
+  line does something non-obvious, such as a Zig 0.17 workaround, is a `//`
+  comment on that line.
+- **`// SAFETY:`** above every `undefined` field, saying what populates it.
+- **One-line parameter lists**: `zlintpre` rejects multi-line ones.
+- **Use `Run`'s `…Arg2` forms throughout.** Every path-argument method
+  without `2` is deprecated in 0.17 except `addFileArg`, a plain wrapper of
+  `addFileArg2`; `addFileArg2` is used too, so there is one form.
+- **Never use, deprecated in 0.17:**
+  `Compile.out_filename` (`std.zig.binNameAlloc`), `LazyPath.cwd_relative`
+  (`b.graph.cwdRelativePath`), `std.fs.path` (`std.Io.Dir.path`),
+  `std.fmt.allocPrint` (`allocator.print`), `std.mem.indexOf*`
+  (`std.mem.find*`), `std.builtin` (`std.lang`). Optimize modes are
+  `.debug`, `.safe`, `.fast`, `.small`.
+- **Declare what `build()` observes.** Zig 0.17 skips `build()` when nothing
+  it tracks changed (`-D` options, build scripts, manifests, `b.dependOn*`
+  paths). Declare anything else: `b.dependOnFileMetadata` and friends where
+  a path captures it, else `b.graph.poisonCache()`. `Xcode.resolveFor`
+  tracks `SDKSettings.json`; `Deps` tracks `.zig-cache/zigbuildx/`;
+  `Android.resolve`, `Deps.sync` with worktrees, and `-Dupdate` poison.
+- **Work at build time goes in the host tool.** A Zig 0.17 step cannot run
+  code of its own, and cache and install paths exist only when steps run.
+  `src/tool.zig` is one program, `zigbuildx <command>`; each command is a
+  `command(process_init, args)` method on the struct it serves (`args[0]` is
+  its name), listed in `Tool.commands`. Name the parameter `process_init`.
+  `ToolArtifact.add(b)` finds this zigbuildx among the runner's packages by
+  type identity (its `build.zig`'s `Deps` is this `Deps`), so a consumer may
+  name the dependency anything.
+- **Generic helpers stay generic.** `Git` and `File` know nothing about
+  manifests, stamps or archives; `Deps` and `ZipArchive` own the policy.
 
-Beyond ZIGSTYLE:
+### How the extensions work
 
-- **Doc comments** on every function: a one-line summary, an optional
-  rationale paragraph, then `Parameters:` bullets and a `Return:` line.
-- **`// SAFETY:` comment** above every `undefined` field, saying what
-  populates it before its first read.
-- **One-line parameter lists.** `zlintpre` rejects a multi-line list.
-- **No packaging.** Building an installable package (`.pkg`, `.deb`,
-  `.msi`, `.apk`) is zigpkg's, run after the build; 4.0.0 removed `Pkg`,
-  `Apk` and `src/pkg/`. What is left is flat in `src/`. A new sub-folder with
-  several `.zig` files gets its own `module.zig` barrel (ZIGSTYLE B.1.a).
-- **The host tool** (`src/tool.zig`): one program, `zigbuildx <command>`,
-  that does every job a step must do while the build runs. A Zig 0.17 step
-  cannot run code of its own (`Step` has a closed set of tags and no
-  `makeFn`), and a program also avoids shell tools that differ between
-  platforms (`sed -i`). Each command is a `command(process_init, args)`
-  method on the struct it serves (`Deps`, `Docs`),
-  with `args[0]` the command's name; `Tool.dispatch` maps names to them. Name
-  the `std.process.Init` parameter `process_init`, since `init` shadows the
-  struct's `init`.
-- **Reaching the host tool:** `build.zig` installs it as the artifact
-  `zigbuildx`, and `HostTool.add(b)` finds this zigbuildx among the build
-  runner's packages by type identity (its `build.zig`'s `Deps` is this
-  `Deps`), then calls `dependencyFromBuildZig(...).artifact("zigbuildx")`.
-  So the consumer may name the dependency anything, and two zigbuildx
-  versions in one build each use their own tool.
-
-## Gotchas
-
-- **`.paths`:** it must list `build.zig` and `build.zig.zon`. Without them a
-  fetched copy has no `build.zig`, and consumers fail with "no module named
-  'zigbuildx'".
-- **Tests and error logs:** the test runner fails any test that logs at error
-  level, so test a failure path through a function that returns the error and
-  let its caller log it (see `Android.resolveFrom` and `Android.resolve`).
-- **Configure is cached (Zig 0.17).** `build()` runs in a separate
-  configurer process, and Zig skips it when nothing it tracks changed: the
-  `-D` options, the build scripts and manifests, and files named with
-  `b.dependOn*`. Anything else `build()` observes (environment, `xcrun`,
-  directory listings, git state) must be declared: `b.dependOnFileMetadata`
-  and friends where a path captures it, else `b.graph.poisonCache()`, which
-  makes every build configure again. `Xcode.resolve` depends on the SDK's
-  `SDKSettings.json`; `Deps` on the contents of `.zig-cache/zigbuildx/` (the
-  breadcrumb); `Android.resolve`, `Deps.sync` (while worktrees exist),
-  and `Deps` under `-Dupdate` poison.
-- **A tracked path must exist.** Despite its doc comment,
-  `dependOnFileMetadata` on a missing file fails configuration with
-  `FileSystemFailure`. Track a directory that always exists instead (create
-  it in `build()`); a directory deleted later is only a cache miss.
-- **No concrete paths at configure time.** `b.cache_root`,
-  `b.getInstallPath`, `b.pathFromRoot` and `LazyPath.getPath*` are gone; the
-  package root is `b.root` (a `Cache.Path`), and cache and install paths
-  exist only when a step runs. Work that needs them belongs in the host tool.
-- **`Deps` and the re-run.** `Deps` runs for the root package only (see
-  `isPresent`), and its exit-and-re-run is required: a dependency cloned
-  mid-`build()` resolves, but its own `build()` never runs.
-- **Run steps hash a directory argument's path, not its contents.** A
-  directory whose path never changes needs `has_side_effects`, or each file
-  added with `addFileInput` (3.x's `Apk` walked its `res/` so, also
-  registering each directory with `dependOnDirectoryContents`).
-- **Deprecated in 0.17, and not to be used:** `Run.add*Arg` without `2`
-  (`addOutputFileArg2`, `addDirectoryArg2`, ...), `Compile.out_filename`
-  (`std.zig.binNameAlloc`, or the artifact's name), `LazyPath.cwd_relative`
-  (`b.graph.cwdRelativePath`), `std.fs.path` (`std.Io.Dir.path`, with
-  `resolveAlloc` and `relativeAlloc`), `std.fmt.allocPrint`
-  (`allocator.print`), `std.mem.indexOf*` (`std.mem.find*`), `std.builtin`
-  (`std.lang`). See `../styleguide/ZIGMIGRATE.md`.
-- **A `.path` dependency is a compile error while missing.** So zigbuildx
-  itself must be a `.url` + `.hash` dependency, and a top-level `@import` of
-  a missing dependency's `build.zig` must be guarded with `Deps.isPresent`.
-- **Name siblings `../x`, not `deps/x`.** A `.path` resolves as text against
-  the declaring package's directory, never through links, and a `.path`
-  package's identity is that path (checked on 0.17.0). So `../x` from any
-  depth cancels to one directory and one package (zigagent reaches zigstorage
-  by 9 routes), while `deps/x` nests under each declarer and is a separate
-  package, even when both are links to one checkout (`expected type 'root.T',
-  found 'root.T'`). `Deps.sync` maps a worktree's `../x` to the root's
-  `deps/x`, but a package that is also someone's library cannot use `deps/`.
-
-## Extension internals
-
-- **`Deps.cloneMissing`:** clones every root `.path` dependency that has a
-  `.clone` and is absent, then exits 1 for a re-run. When nothing is missing
-  it only declares `-Dupdate` and checks the breadcrumb (see *Updates*), and
-  returns at once in a dependency's `build()`.
-  - **Siblings of siblings:** an unpinned `.path` outside `deps/` declared by
-    a sibling (`../tui` naming `../vaxis`) is cloned from the `.clone` in that
-    sibling's manifest, and its manifest is followed in turn (each path once,
-    so a cycle ends). Zig opens every `.path` package before the sibling's
-    own `build()` could clone it, and `Deps` runs for the root only. A
-    sibling's pinned dependencies belong to its own `deps/` and are skipped.
-  - **Detection:** `missingSibling` scans the runner's whole package table for
-    a `.path` package (keyed by its path, which equals its `build_root`; a
-    fetched one is keyed by hash) outside `deps/` with no `build_zig`, so the
-    clone path still compiles away in the steady state.
-- **`.archive` (3.4.0, `ZipArchive`):** a `.path` dependency fetched from a
-  zip URL instead of a `.clone`, handled wherever a `.clone` is (root,
-  siblings of siblings, unpinned under `deps/`), by `Sync.materialize`.
-  - **Unpack:** download into `<path>.zigbuildx-unpack/`, `std.zip.extract`
-    there, strip a single top-level folder (`std.zip.Diagnostics.root_dir`),
-    then rename into place, so a failed download leaves the old directory.
-  - **No re-run:** an unpack sets `Sync.unpacked`, not `changed`. Nothing
-    compiles an archive's Zig code, and `b.dependency(...).path(...)` on a
-    directory without `build.zig` resolves once the directory exists
-    (checked on 0.17.0), so the same `build()` goes on. `isCloneable` stays
-    clone-only, and `missingSibling`/`missingWorktree` skip the root's own
-    archive paths (`isRootArchive`, compared as the manifest writes them),
-    so a missing root archive never makes `cloneMissing` or `sync`
-    `noreturn`.
-  - **Stub `build.zig`:** written when the archive has none. The runner's
-    table marks a `.path` package present by its `build_zig`, which a
-    directory without `build.zig` lacks whether or not it exists. A
-    sibling's archive is not known at comptime, so the stub is what marks it
-    present; a missing one still costs one re-run.
-  - **Stamp:** `<path>/.zigbuildx-archive` holds the URL. A different URL
-    replaces the directory in the same build; a directory without the
-    stamp is refused, never replaced. `cloneMissing` reads the stamps on
-    every `build()` when the root has an `.archive` (`hasArchive`), since a
-    URL change leaves the package present; the root's `build.zig.zon` is a
-    configure input, so such a change re-runs `build()`. A sibling's changed
-    `.archive` is picked up by any build of a root that has one, or `-Dupdate`.
-  - **Not:** pinned (`.sha`/`.tag`/`.branch` with `.archive` fails), updated
-    by `updateSiblings`, or hash-checked.
-- **`Deps.sync`:** the successor, and it must come first in `build()`.
-  - **Pins:** `.sha` and `.tag` give a detached worktree; `.branch` gives the
-    branch `<consumer>/<branch>`, created at `origin/<branch>`. `<consumer>`
-    is the root's `.name`. More than one pin, or a pin on a `.path` outside
-    `deps/`, is an error. An unpinned `.path` is used as is, wherever it
-    points, cloned from `.clone` when absent: under `deps/` by the root only,
-    outside it by any sibling, as `cloneMissing` does.
-  - **Create and move:** a missing worktree is created from its checkout,
-    which is cloned if absent and fetched (`--tags --force`) if it lacks the
-    revision. A changed pin moves a clean worktree; one with uncommitted
-    changes or commits beyond its stamp stops the build. Anything cloned,
-    created or moved exits 1 for a re-run.
-  - **Steady state:** compares the manifests with `deps/.zigbuildx/*.rev`
-    stamps and runs no `git`.
-  - **Transitive:** each worktree's own manifest is read in the same pass. A
-    sibling path (`../x` from `deps/mid`) resolves to the consumer's
-    `deps/x`, so Zig sees one copy; the first declaration of a path wins,
-    the root's first. A dependency that itself uses `deps/` gets nested
-    worktrees on branches prefixed `<consumer>/<dep>/`.
-  - **Orphans:** a worktree no manifest claims is removed with its branch
-    when clean and not ahead; otherwise kept and listed. A worktree deleted
-    by hand is recreated, reusing any branch it left.
-  - **`zig build deps`** lists the worktrees; `-Dupdate` fetches checkouts
-    behind branch and tag pins, fast-forwards branch pins (skipping any with
-    work of their own, and failing at the end), and lets `status` report a
-    tag moved upstream. Since 3.3.0 `build()` has already done that under
-    `-Dupdate`, so the step's own `--update` finds nothing left to move.
-  - **Return type:** `noreturn` while a `deps/` package is missing from the
-    runner's table, so code after the call is not compiled; that lets a
-    transitive top-level `@import` wait. A worktree dependency must have a
-    `build.zig`, since Zig cannot tell one without from a missing one.
-  - **0.17:** the configurer still runs with a `.path` dependency missing,
-    and its `@import("root").dependencies` table still reports it. Its
-    `exit(1)` shows as `error: configure command exited with code 1`. `sync`
-    poisons the configure cache while worktrees or orphans exist; a root with
-    only unpinned dependencies keeps the cache. The `deps` step runs the host
-    tool's `deps` command, which reads the manifests again (no `git` in the
-    steady state) before `status` and `update`.
-- **Updates (`-Dupdate`, 3.3.0):** declared by `cloneMissing` and `sync` for
-  the root only; it poisons the configure cache, since upstream is nothing Zig
-  tracks.
-  - **Siblings** (`Sync.updateSiblings`, every unpinned `.path` outside
-    `deps/`, siblings of siblings included): `git fetch`, then `merge
-    --ff-only @{u}`. Skipped quietly when not its own checkout (no `.git`; a
-    directory inside another repository is left alone), detached, or with no
-    upstream; with a warning when dirty, ahead of `@{u}`, or the fetch fails.
-    A skipped sibling never fails the build.
-  - **Worktrees** (`sync` only): the existing `Sync.update`, run in
-    `build()`; one it skips fails the build, after everything else is updated.
-  - **Anything moved** exits 1 for a re-run, as a clone does.
-- **`Deps.guard` (the breadcrumb):** called last in the root's `build()`. It
-  walks the default step for every `Compile` (skipping the host tool), adds
-  `deps-mark set` (no ordering) and `deps-mark clear` (after `set` and every
-  `Compile`), and makes the default step wait for `clear`. The build runner
-  keeps running independent steps after a failure, so a compile error leaves
-  `<root>/.zig-cache/zigbuildx/update`; a failure after the compiles does not.
-  - **Consumed** by the next `cloneMissing` or `sync`: the directory's
-    contents are a configure input, so the file re-runs `build()`, which
-    updates as `-Dupdate` would and deletes it. Each failing build therefore
-    costs one fetch per sibling on the next.
-  - **Fixed path:** the configurer cannot learn the real cache directory, so
-    a `--cache-dir` elsewhere still uses `<root>/.zig-cache/zigbuildx/`.
-  - **Not covered:** steps that do not reach the default step (`test`), and a
-    compile error in `build.zig` itself, which stops before `build()` runs.
-- **`Git`:** one thin wrapper per command, given the directory git runs in;
-  no manifest knowledge. `Deps` owns the policy.
-- **`Xcode`:**
-  - `standardTargetOptions` adds `-Dmacos-min` on a macOS host; `-Dtarget`
-    overrides it, carrying its own floor (`aarch64-macos.26.0`).
-  - `init(b)` keeps the build graph and takes its allocator and io from it;
-    the unit tests, which have no graph, use the private `initWith`.
-  - `resolve()` asks `xcrun` for the Apple Silicon SDK and is idempotent.
-    `xcrun` names a versioned path (`MacOSX27.0.sdk`), so it makes the SDK's
-    `SDKSettings.json` a configure input; an Xcode update removes the path.
-  - `linkFramework` adds the SDK's `System/Library/Frameworks`, which a
-    floored (non-native) target otherwise never searches.
-- **`Swift.addDylib`:** an `@rpath` install name; every source and the
-  bridging header as file arguments, so edits rebuild it; two rpaths, the
-  build cache (for tests) and `@executable_path/../lib` (added as a special
-  rpath, since normalising collapses it); `-target` from the Zig target. It
-  returns null off macOS. `fromDependency` finds a dependency's dylib.
-- **`Android`:** `init(b)` keeps the build graph, as `Xcode` does, so
-  `resolve()` and `configure(lib)` take no `b`. `resolve` takes the SDK from `ANDROID_HOME`,
-  `ANDROID_SDK_ROOT` or Android Studio's default; the NDK from
-  `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT` or the newest under the SDK; and the
-  host's NDK prebuilt. Since 4.0.0 it no longer looks for build-tools, a
-  platform, `keytool` or a debug keystore: only `Apk` used them, and zigpkg's
-  `AndroidSdk` finds them now. `resolve`
-  poisons the configure cache (it reads the environment). `configure` adds a
-  libc file and 16 KB pages. Zig 0.17's libc file needs every field, including
-  `darwin_sdk_dir`, and takes a Linux target's `crtbegin`/`crtend` from
-  `cc_dir`, which is the NDK's per-API library directory, like `crt_dir`; a
-  test parses the file with `std.zig.LibCInstallation.parse`.
-- **`ZipWriter`:** what is left of `ApkZip`, stored entries and `finish`
-  only, for the `ZipArchive` and `Deps` tests' fixture zips (std reads zips
-  but cannot write one). Not re-exported from `build.zig`.
+- **`Deps.cloneMissing`:** clones each absent root `.path` dependency with a
+  `.clone`, then exits 1 for a re-run: a dependency cloned mid-`build()`
+  resolves, but its own `build()` never runs. It also follows siblings of
+  siblings (`../a` naming `../b`, from the sibling's manifest, each path
+  once), since Zig opens every `.path` package before a sibling's `build()`
+  could clone it. It runs for the root only. `missingSibling` scans the
+  runner's package table (a `.path` package's key is its path) for one
+  outside `deps/` with no `build_zig`, so the clone path compiles away in
+  the steady state. A lock, `<root>/.zig-cache/zigbuildx.lock`, is held from
+  before the first clone.
+- **`.archive` (`ZipArchive`):** a zip unpacked at a `.path` wherever a
+  `.clone` would be cloned. It is downloaded (`curl`; `file://` in process)
+  into `<path>.zigbuildx-unpack/`, extracted, stripped of a single top-level
+  folder, and renamed into place; the old directory waits in staging until
+  the new one is in. It needs no re-run, since no Zig code imports it, so
+  `missingSibling` and `missingWorktree` skip the root's archive paths. A stub
+  `build.zig` marks it present in the runner's table. `.zigbuildx-archive`
+  stamps the URL: a new URL replaces the directory, and a directory without
+  the stamp is refused. It cannot be pinned, is never updated, and is not
+  hash-checked.
+- **`Deps.sync`:** must come first in `build()`. `.sha` or `.tag` gives a
+  detached worktree under `deps/`; `.branch` gives the branch
+  `<consumer>/<branch>`. A worktree is created from its checkout (`.checkout`,
+  default `../<name>`), cloned or fetched as needed; a changed pin moves a
+  clean worktree, and one with work of its own stops the build. Anything
+  cloned, created or moved exits 1. The steady state compares manifests with
+  `deps/.zigbuildx/*.rev` stamps and runs no `git`. Each worktree's manifest
+  is read in the same pass; a `../x` from `deps/mid` resolves to the root's
+  `deps/x`, and the first declaration of a path wins. An unclaimed worktree
+  is removed when clean, else kept and listed. The return type is `noreturn`
+  while a `deps/` package is missing, so a transitive top-level `@import` can
+  wait; a worktree dependency must have a `build.zig`.
+- **`-Dupdate`:** fetches and fast-forwards siblings (skipping, with a
+  warning, any that is dirty or ahead; never failing the build) and, under
+  `sync`, branch worktrees (one it must skip fails the build). Anything moved
+  exits 1.
+- **`Deps.guard`:** called last. It makes the default step wait for
+  `deps-mark clear`, which runs after every `Compile` the default step
+  reaches, while `deps-mark set` runs unordered. A compile error therefore
+  leaves `<root>/.zig-cache/zigbuildx/update`, a configure input, and the
+  next build updates as `-Dupdate` would and deletes it. Steps outside the
+  default step, and compile errors in `build.zig`, are not covered.
+- **`zigbuildx-pin` (`Deps.pin`, `make buildxpin` in `Makefile.in`):**
+  declared by `cloneMissing` and `sync`. It reads this zigbuildx's `.url`
+  (named by `ToolArtifact.dependencyName`) and runs `zig fetch` in the root,
+  keeping the URL's form (`?ref=<ref>#<commit>` with `--save`, `#<ref>` with
+  `--save-exact`). A branch pin (`#main`) is refreshed on its branch, never
+  swapped for a tag. Otherwise it takes the newest `vX.Y.Z` from `git
+  ls-remote --tags` (an annotated tag's commit from its `^{}` line, so no
+  `--refs`) and re-pins when the tag or its commit differs, as after a
+  history rewrite. A pin newer than every tag is left alone.
+- **`Xcode`:** `initFor(b, target)` resolves the SDK of the target's own
+  platform on a Mac (`darwin.getSdk` maps every Apple OS and the simulator
+  ABI) and does nothing for a non-Apple target, so callers need no checks;
+  one handle serves one platform. `linkFramework` adds the SDK's
+  `System/Library/Frameworks` and `usr/lib`, which a non-native target never
+  searches; `usr/lib` holds what framework stubs name by install name
+  (CoreFoundation's `libobjc.A`). `configure(lib)` adds the libc file and
+  trapping sanitizers for Apple's other platforms. `addXcframework` groups
+  libraries by platform (`ios` vs `ios-simulator`), joins a platform's
+  architectures with `lipo`, and runs `xcodebuild -create-xcframework` with
+  `-output` inside the step's own directory (`suffix`), since `xcodebuild`
+  refuses an existing output; headers are copied through a `WriteFile` first,
+  so an edit changes their path and rebuilds. Static libraries work on stock
+  0.17.0 for every slice; a dynamic simulator library does not link there.
+  Bundling a dynamic framework (`Info.plist`, dSYMs) is out of scope.
+  `standardTargetOptions`
+  adds `-Dmacos-min` on a macOS host.
+- **`Swift.addDylib`:** an `@rpath` install name; sources and bridging header
+  as file arguments, so edits rebuild; rpaths for the build cache and
+  `@executable_path/../lib` (a special rpath, since a path would be
+  normalized); `-target` from the Zig target. Null off macOS.
+- **`Android`:** the SDK from `ANDROID_HOME`, `ANDROID_SDK_ROOT` or Android
+  Studio's default, the NDK from `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT` or
+  the newest under the SDK. `configure` adds a libc file and 16 KB pages;
+  Zig 0.17's libc file needs every field, and takes `crtbegin`/`crtend` from
+  `cc_dir`, the NDK's per-API directory like `crt_dir`.
 - **`Docs.includePrivate`:** the host tool's `docs-patch` copies the autodoc
   site and flips the two `include_private` call sites in `main.js`; each
   pattern must occur once, so a changed front end fails the build.
-- **Packaging (removed in 4.0.0):** `Pkg` (`.pkg`, `.deb`, `.msi` from
-  `zig build pkg`) and `Apk` moved to zigpkg, which closed the gaps first:
-  a recipe's `.domain` (the bundle id's first label), an unsigned `.pkg` for
-  a recipe with no account, a `.deb` description, a per-user or x86 `.msi`
-  (3.x's layout), and `--format apk`. Not carried over: running inside
-  `zig build`, `PkgOptions.scripts`, and Linux hosts. zigpkg's CLAUDE.md
-  *Origin* maps each piece.
 
-## Workarounds
+## Project-state heads-ups
 
-Five remain, because of Zig 0.17.0 or the macOS 27 SDK. Each can be deleted
-on its own when the cause goes away; a release for a later Zig starts by
-re-checking every one.
+- **`.paths` must list `build.zig` and `build.zig.zon`,** or a fetched copy
+  has no `build.zig` and consumers fail with "no module named 'zigbuildx'".
+- **A test that logs at error level fails.** Test a failure path through a
+  function that returns the error (or a message, as `Android.describeFailure`
+  does) and let its caller log.
+- **A tracked path must exist.** `dependOnFileMetadata` on a missing file
+  fails configuration with `FileSystemFailure`; track a directory that always
+  exists (create it in `build()`).
+- **No concrete paths at configure time.** `b.cache_root`,
+  `b.getInstallPath`, `b.pathFromRoot` and `LazyPath.getPath*` are gone; the
+  package root is `b.root`.
+- **Run steps hash a directory argument's path, not its contents.** Give such
+  a step `has_side_effects`, or add each file with `addFileInput`.
+- **A `.path` dependency is a compile error while missing.** zigbuildx itself
+  must be a `.url` + `.hash` dependency, and a top-level `@import` of a
+  missing dependency's `build.zig` needs `Deps.isPresent`.
+- **Name siblings `../x`, not `deps/x`.** A `.path` resolves as text, and its
+  path is its identity: `../x` from any depth is one package, while `deps/x`
+  under each declarer is a separate one, even through links to one checkout
+  (`expected type 'root.T', found 'root.T'`).
+- **Bump `.version` on any change.** Release: push `main`, then `make tag`;
+  a consumer on 4.1.0 or later moves to it with `zig build zigbuildx-pin`.
+  Before the push, `zig fetch .` here puts the same hash in the global cache
+  for local builds. Consumers pin a tag with its commit (`?ref=v4.1.0#<commit>`),
+  so a release that rewrites history breaks their URLs.
+- **Compatibility:** 4.1.0 needs no consumer change, though an iOS, tvOS,
+  visionOS or watchOS target must call `xcode.configure(lib)`. 4.0.0 removed
+  `Pkg` and `Apk`.
+
+### Workarounds
+
+Seven remain, each deletable on its own when its cause goes away; a release
+for a later Zig starts by re-checking every one.
 
 - **A floor loses the SDK's frameworks (`Xcode.linkFramework`).** Any
-  `os_version_min` makes the target non-native, and Zig then searches no SDK
-  framework directory ("searched paths: none"); `--sysroot` does not help.
-  Remove when a floored target finds frameworks with plain `linkFramework`.
+  `os_version_min` makes the target non-native, and Zig then searches neither
+  the SDK's frameworks nor its `usr/lib`; `--sysroot` does not help.
 - **Artifacts stamped with the host's macOS (`Xcode.standardTargetOptions`).**
-  A native build on macOS 27 is stamped 27.0, so older consumers' linkers warn
-  "built for newer 'macOS' version" and Swift shims see 27-only deprecations.
-  Never removed on its own: it is how a deployment target is stated.
-- **No Android C library (`Android.configure`).** Zig 0.17.0 ships no bionic;
-  a libc file points at the NDK sysroot. Remove when Zig ships it.
+  A native build on macOS 27 is stamped 27.0, so older linkers warn. Never
+  removed: it is how a deployment target is stated.
+- **No C library for Apple's other platforms (`Xcode.configure`).** Zig 0.17.0
+  finds an SDK only for macOS and ignores `--sysroot` there; a libc file names
+  the SDK (`../zig17` fix 2).
+- **No C sanitizer runtime for Apple's other platforms (`Xcode.configure`).**
+  The UBSan runtime is Zig code that 0.17.0 cannot compile for them, so
+  `sanitize_c = .trap` is set when the build chose no mode (`../zig17`
+  fix 1).
+- **No Android C library (`Android.configure`).** Zig ships no bionic; a libc
+  file points at the NDK sysroot.
 - **No TLS in `build()` (`ZipArchive.download`).** The configurer is compiled
-  with `.http_disable_tls = true` (`lib/compiler/configurer.zig`), so
-  `std.http.Client` hits `unreachable` on an `https://` URL; the download
-  runs `curl` instead. Remove when the configurer can fetch over TLS.
+  with `http_disable_tls`, so `std.http` cannot fetch `https://`; `curl` does.
 - **Autodoc hides private declarations (`Docs.includePrivate`).** The front
-  end passes `include_private = false` at two call sites. Remove when `zig
-  build docs` gains an option, or at once if the patch reports a change.
+  end passes `include_private = false` at two call sites.
 
-Removed in 2.0.0, both checked on 0.17.0 before removal: `Archive`, since Zig
-now 8-byte-aligns archive members (a 0.16 archive of seven objects had three
-misaligned, a 0.17 one none); and `Xcode.linkLibCpp`, since a C++20
-`std::uniform_real_distribution` program links with plain `link_libcpp` on
-SDK 27, native and floored at 26.0.
+Not worked around: a simulator executable fails in Zig's linker
+(`SDKSettings.json`'s "Simulator - X.Y", `../zig17` fix 3), and Zig code that
+reaches `std.debug.print` does not compile for Apple's other platforms.
 
-## Verifying
+## Not yet implemented
 
-Unit tests cannot cover how the build graph is wired. Use a scratch consumer
-package outside this repo:
-
-```sh
-zig17 fetch --save=zigbuildx ../zigbuildx   # from the scratch package; local url + hash
-```
-
-Re-run that fetch after every change to zigbuildx, because the hash pins the
-contents.
-
-- **Android without an SDK** (none is installed, and none should be): point
-  `ANDROID_HOME` at a fake tree holding
-  `ndk/<v>/toolchains/llvm/prebuilt/<host>/sysroot`. Build the `.so` without
-  libc; linking libc needs the real NDK, so check `configure` from the failing
-  link command instead, which shows `--libc` and `-z max-page-size=16384`.
-- **Linux:** run it in podman with Debian, installing `xz-utils curl git` and
-  extracting `https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz`
-  into `/opt`. One test is skipped there by design: the `xcrun` SDK lookup.
-- **Windows:** compile only, via `make cross`. Nothing here runs Windows
-  binaries.
-- **Configure caching:** run `zig build` twice; the second skips `build()`.
-  A `std.debug.print` in the scratch `build.zig` shows whether it ran.
-
-## Adopters
-
-Every Zig project under `~/src/mlavergn` that lists zigbuildx (34; the
-`~/src/inferise` tree is no longer used) tracks
-`git+https://github.com/mlavergn/zigbuildx#main` or a tag, with the `.hash`
-of the commit last fetched. Nearly all use `Xcode` and `Deps.cloneMissing`;
-beyond that:
-
-| Repo | Uses |
-|---|---|
-| zigstorage | `Xcode` floor 26.0 and `linkFramework`, `Docs` |
-| zigiptv | `Xcode` floor 26.0 and `linkFramework` |
-| zigwebrtc | `Xcode` floor |
-| ziglink, zigplan, zigprompt | `Pkg` until 4.0.0; now `package.zon` and `zpkg --package` from `make pkg` |
-
-- **Version bumps:** bump `.version` on any change, push `main` and the tag,
-  then in each adopter run `zig fetch --save-exact=zigbuildx
-  git+https://github.com/mlavergn/zigbuildx#main`, which keeps `#main` in the
-  URL and refreshes the hash. Before `main` is pushed, `zig fetch .` from this
-  repo puts the same hash in the global cache, so adopters build against it
-  locally.
-- **From 3.6 to 4.0.0:** delete `zigbuildx.Pkg.add(...)` and
-  `zigbuildx.Apk.add(...)`; add a `package.zon` and run `zpkg --package` after
-  `zig build` (README's *Migrating from 3.x*). `.bundle` is no longer read by
-  anything; Zig ignores it. `Android`'s `build_tools`,
-  `android_jar`, `tool()` and `javaTool()` are gone.
-- **From 3.2.0 to 3.3.0:** nothing required; add `zigbuildx.Deps.guard(b);`
-  last in `build()` to update after a compile error. Pilot: zigclaude.
-- **From 3.0.0 to 3.1.0:** a `Pkg` adopter's manifest replaces `.org` with a
-  three-label `.bundle` (zlintpre: `.bundle = "com.marclavergne.zlintpre"`).
-- **From 2.0.0 to 3.0.0:** `Xcode.init(b.allocator, b.graph.io)` becomes
-  `Xcode.init(b)` and `resolve(b)` becomes `resolve()`; `Android` likewise,
-  with `configure(b, lib)` becoming `configure(lib)`.
-- **From 1.x (Zig 0.16):** `Archive.install(b, lib)` becomes
-  `b.installArtifact(lib)`, `Archive.addInstall(b, lib)` becomes
-  `&b.addInstallArtifact(lib, .{}).step`, plus the project's own port
-  (`ZIGMIGRATE.md`'s 0.16-to-0.17 section).
-
-## Deferred
-
-- **ADB over TCP install step:** about 1,000–1,300 lines with tests.
-  - **Reuse:** zigunoq's `src/protocol.zig` and `src/adb.zig` (push and shell)
-    port over, swapping its USB transport for `std.Io.net`.
-  - **New:** RSA authentication.
-    - **Key loading:** read the PKCS#8 `~/.android/adbkey`.
-    - **Signing:** sign the 20-byte token with PKCS#1 v1.5 and a SHA-1
-      DigestInfo, using `std.crypto.ff` (std can only verify RSA).
-    - **Public key:** Android's custom format (`n0inv`, R² mod n) for the
-      first-time prompt.
-  - **Out of scope:** Android 11+ TLS pairing and USB. Key generation when no
-    `adbkey` exists, which needs a decision.
-  - **No test device here**, so real `adbd` compatibility goes unverified;
-    test against a loopback fake device.
-  - **Open:** is there a test device, how to handle a missing key, and
-    whether it lives here or in its own package shared with zigunoq.
-- **zigandroidtv** (`~/src/mlavergn/zigandroidtv`): convert its Makefile to a
-  `build.zig` using `Android`, giving that extension a real user. Its Makefile
-  currently references `src/main.zig`, but the file is at the root.
-- **zigagent:** adopt `Xcode.standardTargetOptions(b, "26.0")`. Without a
-  floor, the `libafm.dylib` it builds through zigafm is stamped macOS 27.0, and
-  `swiftc` warns about an API deprecated in 27.
-- **llama.cpp.zmake** (`~/src/mlavergn/llamazig`) could drop its Apple
-  libc++ workaround once on Zig 0.17, where plain `link_libcpp` links on SDK
-  27. The C++ runtime then changes from Apple's dylib to Zig's static libc++.
-  The owner's call.
-- **Other repos** could adopt `Docs.includePrivate`, a one-line change on each
-  docs install step.
-- **zigstorage's `make lint`** walks `zig-pkg/`. Give it an explicit file list,
-  as zigclaude does.
-- **Sibling pins as checks** (a 4.0.0 draft, abandoned 2026-10-23: no adopter
-  pins a sibling). `.sha`/`.tag`/`.branch` on a `../x` would set where a fresh
-  clone checks out and warn when a checkout is elsewhere, replacing
-  `Deps.sync`. Rejected with it: hashed SSH dependencies with a `--fork` per
-  sibling, since Zig reads `--fork` only from the command line
-  (`lib/compiler/Maker.zig`) and matches hashed packages by name and
-  fingerprint, never `.path` ones.
+- **ADB over TCP install step** (about 1,000–1,300 lines): the ADB protocol
+  (push and shell) on `std.Io.net`, plus RSA signing of the auth token with
+  `~/.android/adbkey` (`std.crypto.ff`; std can only verify RSA). Open: a
+  test device, a missing key, and whether it belongs in its own package.
+- **Rejected:** sibling pins (`.sha`/`.tag`/`.branch` on a `../x`) as
+  checks; and a `--fork` per sibling, since Zig reads `--fork` only from the
+  command line and matches only hashed packages.

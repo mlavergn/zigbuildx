@@ -22,11 +22,7 @@ pub const Docs = struct {
     };
 
     /// Returns autodoc site `docs` with private declarations listed alongside public ones.
-    ///
-    /// Zig's autodoc renders public declarations only, so helpers that carry the
-    /// same doc comments as everything else never appear. The site is copied with
-    /// its `main.js` patched by `patch`, which fails the build if Zig's front
-    /// end no longer has the code it patches.
+    /// Fails the build when Zig's front end no longer has the code it patches.
     ///
     /// Parameters:
     /// - `b`: the build graph.
@@ -34,18 +30,15 @@ pub const Docs = struct {
     ///
     /// Return: the patched site's directory, for `b.addInstallDirectory`.
     pub fn includePrivate(b: *std.Build, docs: std.Build.LazyPath) std.Build.LazyPath {
-        const run = b.addRunArtifact(mod.HostTool.add(b));
+        // Zig's autodoc renders public declarations only; the host tool copies the site, patching `main.js`.
+        const run = b.addRunArtifact(mod.ToolArtifact.add(b));
         run.setName("docs include private");
         run.addArg("docs-patch");
         run.addDirectoryArg2(docs, .{});
         return run.addOutputDirectoryArg2("docs", .{});
     }
 
-    /// Returns `js` with each replacement applied.
-    ///
-    /// Each pattern must occur exactly once. Anything else means the front end
-    /// changed, and patching blindly could leave private members hidden — or
-    /// break the site — with nothing reported.
+    /// Returns `js` with each replacement applied; each pattern must occur exactly once.
     ///
     /// Parameters:
     /// - `allocator`: owns the result.
@@ -56,6 +49,8 @@ pub const Docs = struct {
         var current = try allocator.dupe(u8, js);
         errdefer allocator.free(current);
         for (Self.replacements) |replacement| {
+            // Any count but one means the front end changed, and patching blindly could leave
+            // private members hidden, or break the site, with nothing reported.
             const count = std.mem.count(u8, current, replacement[0]);
             if (count != 1) {
                 log.err("main.js has {d} occurrences of '{s}', expected 1: Zig's autodoc changed", .{ count, replacement[0] });
@@ -74,8 +69,7 @@ pub const Docs = struct {
     /// - `process_init`: the process's allocator and IO.
     /// - `args`: the command line after the program's path; `args[0]` is the command.
     ///
-    /// Return: nothing; `error.InvalidArguments` on a bad command line,
-    /// `error.AutodocChanged` when the site has no patchable `main.js`, or IO errors.
+    /// Return: nothing; `error.InvalidArguments`, `error.AutodocChanged` when `main.js` is unpatchable, or IO errors.
     pub fn command(process_init: std.process.Init, args: []const [:0]const u8) !void {
         const allocator = process_init.gpa;
         const io = process_init.io;

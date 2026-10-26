@@ -1,12 +1,14 @@
 const std = @import("std");
 
-/// Writes a zip of stored (uncompressed) entries in memory, for the tests' fixture archives.
+/// Builds a zip of stored (uncompressed) entries in memory, for the tests' fixture archives.
 ///
-/// What is left of `ApkZip` now that packaging APKs is zigpkg's: the
-/// `ZipArchive` and `Deps` tests build the archives they unpack with it, since
+/// Add entries with `addStored`, then take the bytes from `finish`. It is not
+/// a `std.Io.Writer`, which is why it is no longer named `ZipWriter`.
+///
+/// The `ZipArchive` and `Deps` tests build the archives they unpack with it, since
 /// std can read a zip but not write one. Entries carry no real timestamp, so
 /// the same entries give the same bytes.
-pub const ZipWriter = struct {
+pub const ZipBuilder = struct {
     const Self = @This();
     const local_signature: u32 = 0x04034b50;
     const central_signature: u32 = 0x02014b50;
@@ -15,17 +17,19 @@ pub const ZipWriter = struct {
     /// 1980-01-01, the earliest date a zip can state.
     const dos_date: u16 = (0 << 9) | (1 << 5) | 1;
 
+    /// Allocates each central record while it is built.
     allocator: std.mem.Allocator,
     /// Local headers and data, in archive order.
     body: std.Io.Writer.Allocating,
     /// Central directory records, in the same order.
     central: std.Io.Writer.Allocating,
+    /// How many entries were added; a zip states at most 65,535.
     count: usize = 0,
 
     /// Creates an empty archive.
     ///
     /// Parameters:
-    /// - `allocator`: backs the archive being built.
+    /// - `allocator`: backs the archive.
     ///
     /// Return: the archive.
     pub fn init(allocator: std.mem.Allocator) Self {
@@ -48,8 +52,9 @@ pub const ZipWriter = struct {
     /// - `name`: the entry's path, with `/` separators.
     /// - `data`: the file's contents.
     ///
-    /// Return: nothing; `error.EntryTooLarge` past 4 GiB, `error.ArchiveTooLarge`, or allocation errors.
+    /// Return: nothing; `error.NameTooLong`, `error.EntryTooLarge` or `error.ArchiveTooLarge` past a zip's limits.
     pub fn addStored(self: *Self, name: []const u8, data: []const u8) !void {
+        if (name.len > std.math.maxInt(u16)) return error.NameTooLong;
         if (data.len >= 0xFFFFFFFF) return error.EntryTooLarge;
         const offset = self.body.written().len;
         if (offset >= 0xFFFFFFFF) return error.ArchiveTooLarge;
@@ -81,13 +86,12 @@ pub const ZipWriter = struct {
         self.count += 1;
     }
 
-    /// Writes the central directory and its end record, completing the archive.
+    /// Completes the archive; nothing may be added afterwards.
     ///
     /// Parameters:
-    /// - `self`: the archive; nothing may be added afterwards.
+    /// - `self`: the archive.
     ///
-    /// Return: the zip's bytes, owned by the archive; `error.TooManyEntries`,
-    /// `error.ArchiveTooLarge`, or allocation errors.
+    /// Return: the zip's bytes, owned by the archive; `error.TooManyEntries` or `error.ArchiveTooLarge` past a zip's limits.
     pub fn finish(self: *Self) ![]const u8 {
         if (self.count > 0xFFFF) return error.TooManyEntries;
         const central_offset = self.body.written().len;
@@ -114,7 +118,7 @@ test "addStored and finish produce a zip std.zip can read back" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var zip = ZipWriter.init(allocator);
+    var zip = ZipBuilder.init(allocator);
     defer zip.deinit();
     try zip.addStored("AndroidManifest.xml", "<manifest/>");
     try zip.addStored("lib/arm64-v8a/libmain.so", "\x7fELF");
@@ -138,4 +142,19 @@ test "addStored and finish produce a zip std.zip can read back" {
     const lib = try out.readFileAlloc(io, "lib/arm64-v8a/libmain.so", allocator, .unlimited);
     defer allocator.free(lib);
     try std.testing.expectEqualStrings("\x7fELF", lib);
+}
+
+test "addStored refuses a name longer than a zip can state" {
+    const allocator = std.testing.allocator;
+    var zip = ZipBuilder.init(allocator);
+    defer zip.deinit();
+    const longest = try allocator.alloc(u8, std.math.maxInt(u16));
+    defer allocator.free(longest);
+    @memset(longest, 'a');
+    try zip.addStored(longest, "");
+    const too_long = try allocator.alloc(u8, std.math.maxInt(u16) + 1);
+    defer allocator.free(too_long);
+    @memset(too_long, 'a');
+    try std.testing.expectError(error.NameTooLong, zip.addStored(too_long, ""));
+    try std.testing.expectEqual(1, zip.count);
 }

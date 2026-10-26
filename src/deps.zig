@@ -46,6 +46,8 @@ const Pin = struct {
 /// The steady state compares this file with the manifest and runs no `git`.
 const Stamp = struct {
     const Self = @This();
+    /// The largest stamp read; one is five short lines.
+    const max_bytes = 1 << 16;
     /// The pin the worktree was made for.
     pin: Pin,
     /// HEAD when the worktree was created, moved or updated.
@@ -88,6 +90,8 @@ const Stamp = struct {
 const Entry = struct {
     const Self = @This();
     name: []const u8,
+    /// Where a fetched dependency comes from; only `Deps.pin` reads it.
+    url: ?[]const u8 = null,
     path: ?[]const u8 = null,
     clone: ?[]const u8 = null,
     archive: ?[]const u8 = null,
@@ -112,6 +116,8 @@ const Source = union(enum) {
 /// Reading every manifest from disk keeps one code path for both.
 const Manifest = struct {
     const Self = @This();
+    /// The largest `build.zig.zon` read; a manifest is a few kilobytes.
+    const max_bytes = 1 << 20;
     /// The package's `.name`.
     name: []const u8,
     /// The package's `.dependencies`, in manifest order.
@@ -178,7 +184,7 @@ const Manifest = struct {
                     .string_literal => |text| text,
                     else => continue,
                 };
-                inline for (.{ "path", "clone", "archive", "checkout", "sha", "tag", "branch" }) |field| {
+                inline for (.{ "url", "path", "clone", "archive", "checkout", "sha", "tag", "branch" }) |field| {
                     if (std.mem.eql(u8, key.get(zoir), field)) @field(entry, field) = try allocator.dupe(u8, text);
                 }
             }
@@ -223,6 +229,7 @@ const Target = struct {
 
 /// What `Sync.update` did to the worktrees that follow a branch.
 const Updated = struct {
+    const Self = @This();
     /// Worktrees fast-forwarded.
     moved: usize = 0,
     /// Worktrees skipped (uncommitted changes, commits of their own, branch
@@ -281,18 +288,14 @@ const Sync = struct {
     ///
     /// Return: nothing; `error.DepsFailed` with `problem` set, or IO and spawn errors.
     fn run(self: *Self) !void {
+        const lock = try self.acquireLock();
+        defer lock.close(self.io);
         const manifest = try self.readManifest(self.root) orelse return self.fail("no build.zig.zon in {s}", .{self.root});
         self.consumer = manifest.name;
         try self.collect(manifest, self.root, self.root);
         try self.followSiblings();
         const deps = try std.Io.Dir.path.join(self.allocator, &.{ self.root, "deps" });
-        if (self.worktrees.items.len == 0 and !try self.exists(deps)) return;
-        const state = try std.Io.Dir.path.join(self.allocator, &.{ deps, ".zigbuildx" });
-        try std.Io.Dir.cwd().createDirPath(self.io, state);
-        const lock_path = try std.Io.Dir.path.join(self.allocator, &.{ state, "lock" });
-        // Serialises concurrent builds of this consumer; released when the file closes.
-        const lock = try std.Io.Dir.cwd().createFile(self.io, lock_path, .{ .lock = .exclusive });
-        defer lock.close(self.io);
+        if (self.worktrees.items.len == 0 and !try mod.File.exists(self.io, deps)) return;
         // Transitive manifests are read as their worktrees appear, so the list grows while it is walked.
         var i: usize = 0;
         while (i < self.worktrees.items.len) : (i += 1) {
@@ -307,20 +310,11 @@ const Sync = struct {
 
     /// Records `manifest`'s worktree dependencies and, for the root, clones missing sibling checkouts.
     ///
-    /// A dependency is **pinned** when it sets `.sha`, `.tag` or `.branch`; it
-    /// becomes a worktree, and its `.path`, resolved from the declaring
-    /// package, must be a direct child of a `deps` directory inside the
-    /// consumer. An **unpinned** dependency's `.path` is used as is, wherever
-    /// it points. The first declaration of a path wins, pinned or not; a later
-    /// one that pins it differently is ignored with a warning. An `.archive`
-    /// dependency is pinned by its URL alone, so it may not set a pin field.
-    ///
     /// Parameters:
     /// - `self`: the run.
     /// - `manifest`: the declaring package's manifest.
     /// - `dir`: where the declaring package is on disk.
-    /// - `home`: where the declaring package's own checkout is; its
-    ///   `.checkout` paths are relative to this, not to a worktree of it.
+    /// - `home`: the declaring package's own checkout, which its `.checkout` paths resolve against.
     ///
     /// Return: nothing; `error.DepsFailed` on a malformed root entry, or clone errors.
     fn collect(self: *Self, manifest: Manifest, dir: []const u8, home: []const u8) !void {
@@ -341,13 +335,13 @@ const Sync = struct {
                 if (is_root) return self.fail("{s} pins {s}, but a pinned dependency's .path must be under deps/", .{ manifest.name, entry.name });
                 continue;
             }
-            const rel = try std.Io.Dir.path.relativeAlloc(self.allocator, self.root, null, self.root, resolved);
+            const rel = try self.relativeToRoot(resolved);
             // The first declaration of a path wins, pinned or not.
             if (self.find(resolved)) |existing| {
                 if (pin) |wanted| if (!existing.pin.satisfies(wanted)) log.warn("{s} pins {s} to {t} {s}; using {s}'s {t} {s}", .{ manifest.name, existing.rel, wanted.kind, wanted.value, existing.declared_by, existing.pin.kind, existing.pin.value });
                 continue;
             }
-            if (self.isUnpinned(resolved)) {
+            if (Self.containsPath(self.unpinned.items, resolved)) {
                 if (pin) |wanted| log.warn("{s} pins {s} to {t} {s}; using the path as is, as an earlier declaration does", .{ manifest.name, rel, wanted.kind, wanted.value });
                 continue;
             }
@@ -405,8 +399,7 @@ const Sync = struct {
     /// - `package`: the declaring package, for the message.
     /// - `entry`: the dependency.
     ///
-    /// Return: the source, or `null` when it names none; `error.DepsFailed`
-    /// when it sets both `.clone` and `.archive`.
+    /// Return: the source, or `null` when it names none; `error.DepsFailed` when it sets both `.clone` and `.archive`.
     fn sourceOf(self: *Self, package: []const u8, entry: Entry) !?Source {
         if (entry.clone != null and entry.archive != null) return self.fail("{s}: {s} sets both .clone and .archive", .{ package, entry.name });
         if (entry.clone) |url| return .{ .clone = url };
@@ -429,9 +422,6 @@ const Sync = struct {
 
     /// Builds the branch prefix for a worktree at `rel`.
     ///
-    /// `deps/x` gets `<consumer>`; a nested `deps/mid/deps/x` gets
-    /// `<consumer>/mid`, so two worktrees of one checkout never want the same branch.
-    ///
     /// Parameters:
     /// - `self`: the run.
     /// - `rel`: the worktree's path relative to the consumer.
@@ -440,6 +430,7 @@ const Sync = struct {
     fn branchPrefix(self: *const Self, rel: []const u8) ![]const u8 {
         var prefix: std.ArrayList(u8) = .empty;
         try prefix.appendSlice(self.allocator, self.consumer);
+        // `deps/mid/deps/x` gets `<consumer>/mid`, so two worktrees of one checkout never want the same branch.
         var parts = std.mem.tokenizeAny(u8, std.Io.Dir.path.dirname(rel) orelse "", "/\\");
         while (parts.next()) |part| {
             if (std.mem.eql(u8, part, "deps")) continue;
@@ -463,24 +454,22 @@ const Sync = struct {
         return null;
     }
 
-    /// Reports whether `dir` was declared unpinned.
+    /// Reports whether `paths` holds `path`.
     ///
     /// Parameters:
-    /// - `self`: the run.
-    /// - `dir`: an absolute path.
+    /// - `paths`: absolute paths, as the run records them.
+    /// - `path`: an absolute path.
     ///
-    /// Return: `true` when an earlier declaration names it with no pin.
-    fn isUnpinned(self: *const Self, dir: []const u8) bool {
-        for (self.unpinned.items) |path| {
-            if (std.mem.eql(u8, path, dir)) return true;
+    /// Return: `true` when one of `paths` equals `path`.
+    fn containsPath(paths: []const []const u8, path: []const u8) bool {
+        // Few paths: a scan is cheaper than a map.
+        for (paths) |candidate| {
+            if (std.mem.eql(u8, candidate, path)) return true;
         }
         return false;
     }
 
     /// Clones or unpacks an unpinned dependency from `source`, as `cloneMissing` does.
-    ///
-    /// A clone happens only when the path is absent. An archive is also
-    /// unpacked again when its URL changed; see `ensureArchive`.
     ///
     /// Parameters:
     /// - `self`: the run.
@@ -491,34 +480,31 @@ const Sync = struct {
     fn materialize(self: *Self, path: []const u8, source: Source) !void {
         switch (source) {
             .clone => |url| {
-                if (try self.exists(path)) return;
+                if (try mod.File.exists(self.io, path)) return;
                 try mod.Git.clone(self.io, url, path);
                 self.changed = true;
             },
+            // Also unpacked again when its URL changed.
             .archive => |url| try self.ensureArchive(path, url),
         }
     }
 
     /// Unpacks an `.archive` dependency when it is absent or was unpacked from another URL.
     ///
-    /// The directory's stamp records its URL, so an unchanged one costs a
-    /// file read and no download. A directory without a stamp is not
-    /// zigbuildx's to replace.
-    ///
     /// Parameters:
     /// - `self`: the run.
     /// - `path`: the dependency's absolute path.
     /// - `url`: the zip's URL.
     ///
-    /// Return: nothing; `error.DepsFailed` when the path holds something else
-    /// or the archive cannot be fetched, or IO errors.
+    /// Return: nothing; `error.DepsFailed` when the path holds something else or cannot be unpacked, or IO errors.
     fn ensureArchive(self: *Self, path: []const u8, url: []const u8) !void {
-        if (!self.isArchive(path)) try self.archives.append(self.allocator, path);
-        const rel = try std.Io.Dir.path.relativeAlloc(self.allocator, self.root, null, self.root, path);
-        if (try self.exists(path)) {
+        if (!Self.containsPath(self.archives.items, path)) try self.archives.append(self.allocator, path);
+        const rel = try self.relativeToRoot(path);
+        if (try mod.File.exists(self.io, path)) {
             const unpacked = try mod.ZipArchive.source(self.allocator, self.io, path) orelse {
                 return self.fail("{s} exists but zigbuildx did not unpack it (it has no {s}); move it aside and re-run", .{ rel, mod.ZipArchive.stamp_name });
             };
+            // The stamp records the URL: an unchanged one costs a read and no download.
             if (std.mem.eql(u8, unpacked, url)) return;
             log.info("{s} was unpacked from {s}; replacing it", .{ rel, unpacked });
         }
@@ -528,24 +514,7 @@ const Sync = struct {
         self.unpacked = true;
     }
 
-    /// Reports whether `dir` was unpacked from an `.archive`.
-    ///
-    /// Parameters:
-    /// - `self`: the run.
-    /// - `dir`: an absolute path.
-    ///
-    /// Return: `true` when an `.archive` dependency names it.
-    fn isArchive(self: *const Self, dir: []const u8) bool {
-        for (self.archives.items) |path| {
-            if (std.mem.eql(u8, path, dir)) return true;
-        }
-        return false;
-    }
-
     /// Queues the sibling at `path`, cloning or unpacking it from `source` as `materialize` does.
-    ///
-    /// Each path is queued once, so a cycle of siblings ends. One that is absent
-    /// with no `source` is left for Zig to report.
     ///
     /// Parameters:
     /// - `self`: the run.
@@ -554,31 +523,28 @@ const Sync = struct {
     ///
     /// Return: nothing; `error.DepsFailed` for an archive, or clone errors, which `Git.clone` logs.
     fn addSibling(self: *Self, path: []const u8, source: ?Source) !void {
-        for (self.siblings.items) |seen| {
-            if (std.mem.eql(u8, seen, path)) return;
-        }
+        // Each path is queued once, so a cycle of siblings ends.
+        if (Self.containsPath(self.siblings.items, path)) return;
         try self.siblings.append(self.allocator, path);
+        // An absent one with no `source` is left for Zig to report.
         try self.materialize(path, source orelse return);
     }
 
     /// Reads each queued sibling's manifest and queues its unpinned `.path` dependencies outside `deps/`.
-    ///
-    /// Zig opens every `.path` package in the tree before `build()` can run, so
-    /// a sibling's own sibling must be on disk too, though only the root runs
-    /// `Deps`. A pinned dependency of a sibling belongs to that sibling's
-    /// `deps/`, not the consumer's, and is left alone. Siblings queued while
-    /// this runs are walked in the same pass.
     ///
     /// Parameters:
     /// - `self`: the run.
     ///
     /// Return: nothing; `error.DepsFailed` when a manifest does not parse, or IO and clone errors.
     fn followSiblings(self: *Self) !void {
+        // Zig opens every `.path` package before `build()` runs, and only the root runs `Deps`, so a
+        // sibling's own sibling must be on disk too. Siblings queued here are walked in the same pass.
         while (self.walked < self.siblings.items.len) : (self.walked += 1) {
             const dir = self.siblings.items[self.walked];
             const manifest = try self.readManifest(dir) orelse continue;
             for (manifest.entries) |entry| {
                 const path = entry.path orelse continue;
+                // A sibling's pinned dependency belongs to that sibling's own `deps/`.
                 if (entry.sha != null or entry.tag != null or entry.branch != null) continue;
                 const resolved = try std.Io.Dir.path.resolveAlloc(self.allocator, &.{ dir, path });
                 if (self.isWorktreePath(resolved)) continue;
@@ -589,15 +555,15 @@ const Sync = struct {
 
     /// Clones or unpacks every absent `.path` dependency of the root, then of its siblings, as `cloneMissing` does.
     ///
-    /// The root's entries are cloned whatever they pin, as `cloneMissing`
-    /// always has; no worktree is made.
-    ///
     /// Parameters:
     /// - `self`: the run.
     ///
     /// Return: nothing; `error.DepsFailed` with `problem` set, or IO and clone errors.
     fn cloneSiblings(self: *Self) !void {
+        const lock = try self.acquireLock();
+        defer lock.close(self.io);
         const manifest = try self.readManifest(self.root) orelse return self.fail("no build.zig.zon in {s}", .{self.root});
+        // Every `.path` is cloned whatever it pins; no worktree is made.
         for (manifest.entries) |entry| {
             const path = entry.path orelse continue;
             try self.addSibling(try std.Io.Dir.path.resolveAlloc(self.allocator, &.{ self.root, path }), try self.sourceOf(manifest.name, entry));
@@ -607,24 +573,19 @@ const Sync = struct {
 
     /// Fetches every sibling checkout and fast-forwards each one that is behind its upstream.
     ///
-    /// Siblings are the developer's own checkouts, so one is left alone, with
-    /// a warning, when it has uncommitted changes or commits its upstream
-    /// lacks; and quietly when it is not a repository of its own, is on a
-    /// detached HEAD, or its branch has no upstream. A fetch that fails (say,
-    /// offline) skips that sibling too. None of these fail the build.
-    ///
     /// Parameters:
     /// - `self`: the run, after `run` or `cloneSiblings` has queued the siblings.
     ///
     /// Return: whether any sibling moved; IO errors.
     fn updateSiblings(self: *Self) !bool {
         var moved = false;
+        // Siblings are the developer's own checkouts: a skip only logs, never fails the build.
         for (self.siblings.items) |dir| {
             // An archive's URL is its pin: `ensureArchive` has already brought it in line.
-            if (self.isArchive(dir)) continue;
-            const rel = try std.Io.Dir.path.relativeAlloc(self.allocator, self.root, null, self.root, dir);
+            if (Self.containsPath(self.archives.items, dir)) continue;
+            const rel = try self.relativeToRoot(dir);
             // A directory inside some other repository is not its own checkout: leave that repository alone.
-            if (!try self.exists(try std.Io.Dir.path.join(self.allocator, &.{ dir, ".git" }))) {
+            if (!try mod.File.exists(self.io, try std.Io.Dir.path.join(self.allocator, &.{ dir, ".git" }))) {
                 log.info("not updating {s}: it is not a git checkout", .{rel});
                 continue;
             }
@@ -643,10 +604,8 @@ const Sync = struct {
             const tip = (mod.Git.upstream(self.allocator, self.io, dir) catch null) orelse continue;
             const head = (mod.Git.revParse(self.allocator, self.io, dir, "HEAD") catch null) orelse continue;
             if (std.mem.eql(u8, tip, head)) continue;
-            const clean = mod.Git.isClean(self.allocator, self.io, dir) catch false;
-            const ahead = mod.Git.isAhead(self.allocator, self.io, dir, tip) catch true;
-            if (!clean or ahead) {
-                log.warn("not updating {s}: {s} has {s}", .{ rel, branch, if (!clean) "uncommitted changes" else "commits its upstream lacks" });
+            if (self.describeLocalWork(dir, tip)) |work| {
+                log.warn("not updating {s}: {s} has {s}", .{ rel, branch, work });
                 continue;
             }
             mod.Git.fastForward(self.allocator, self.io, dir, tip) catch continue;
@@ -666,7 +625,7 @@ const Sync = struct {
     fn ensure(self: *Self, index: usize) !void {
         const worktree = &self.worktrees.items[index];
         const stamp = try self.readStamp(worktree.dir);
-        if (!try self.exists(worktree.dir)) {
+        if (!try mod.File.exists(self.io, worktree.dir)) {
             // A stamp without its directory is from a worktree deleted by hand; it is replaced.
             try self.create(worktree);
         } else if (stamp) |found| {
@@ -679,7 +638,7 @@ const Sync = struct {
             return self.fail("{s} exists but zigbuildx did not create it (it has no stamp); move it aside and re-run", .{worktree.rel});
         }
         const build_zig = try std.Io.Dir.path.join(self.allocator, &.{ worktree.dir, "build.zig" });
-        if (!try self.exists(build_zig)) return self.fail("{s} has no build.zig; a worktree dependency must be a Zig package", .{worktree.rel});
+        if (!try mod.File.exists(self.io, build_zig)) return self.fail("{s} has no build.zig; a worktree dependency must be a Zig package", .{worktree.rel});
     }
 
     /// Creates a worktree, cloning its checkout first when that is absent.
@@ -690,13 +649,13 @@ const Sync = struct {
     ///
     /// Return: nothing; `error.DepsFailed`, or IO and git errors.
     fn create(self: *Self, worktree: *Worktree) !void {
-        if (!try self.exists(worktree.checkout)) {
+        if (!try mod.File.exists(self.io, worktree.checkout)) {
             const url = worktree.clone orelse return self.fail("{s} needs the checkout {s}, which is missing, and {s} has no .clone", .{ worktree.rel, worktree.checkout, worktree.name });
             try mod.Git.clone(self.io, url, worktree.checkout);
         }
         const target = try self.resolve(worktree);
         try mod.Git.worktreePrune(self.allocator, self.io, worktree.checkout);
-        try std.Io.Dir.cwd().createDirPath(self.io, std.Io.Dir.path.dirname(worktree.dir).?);
+        try mod.File.createParentDir(self.io, worktree.dir);
         if (target.branch.len == 0) {
             try mod.Git.worktreeAdd(self.allocator, self.io, worktree.checkout, worktree.dir, .{ .detached = target.sha });
         } else {
@@ -755,8 +714,6 @@ const Sync = struct {
 
     /// Looks a resolved pin up in a checkout without fetching.
     ///
-    /// A branch is looked up on `origin` first, then locally, so a checkout with no remote still works.
-    ///
     /// Parameters:
     /// - `self`: the run.
     /// - `checkout`: the checkout.
@@ -767,6 +724,7 @@ const Sync = struct {
         return switch (pin.kind) {
             .sha => mod.Git.revParse(self.allocator, self.io, checkout, pin.value),
             .tag => mod.Git.revParse(self.allocator, self.io, checkout, try self.allocator.print("refs/tags/{s}", .{pin.value})),
+            // `origin` first, then local, so a checkout with no remote still works.
             .branch => try mod.Git.revParse(self.allocator, self.io, checkout, try self.allocator.print("refs/remotes/origin/{s}", .{pin.value})) orelse
                 try mod.Git.revParse(self.allocator, self.io, checkout, try self.allocator.print("refs/heads/{s}", .{pin.value})),
         };
@@ -783,9 +741,7 @@ const Sync = struct {
         try dirs.append(self.allocator, try std.Io.Dir.path.join(self.allocator, &.{ self.root, "deps" }));
         for (self.worktrees.items) |worktree| {
             const parent = std.Io.Dir.path.dirname(worktree.dir).?;
-            for (dirs.items) |dir| {
-                if (std.mem.eql(u8, dir, parent)) break;
-            } else try dirs.append(self.allocator, parent);
+            if (!Self.containsPath(dirs.items, parent)) try dirs.append(self.allocator, parent);
         }
         for (dirs.items) |deps| {
             const state = try std.Io.Dir.path.join(self.allocator, &.{ deps, ".zigbuildx" });
@@ -802,7 +758,7 @@ const Sync = struct {
             for (names.items) |name| {
                 const path = try std.Io.Dir.path.join(self.allocator, &.{ deps, name[0 .. name.len - ".rev".len] });
                 // A path still declared unpinned keeps what is there; its old stamp is left alone.
-                if (self.find(path) == null and !self.isUnpinned(path)) try self.removeOrphan(path);
+                if (self.find(path) == null and !Self.containsPath(self.unpinned.items, path)) try self.removeOrphan(path);
             }
         }
     }
@@ -815,17 +771,15 @@ const Sync = struct {
     ///
     /// Return: nothing; IO errors.
     fn removeOrphan(self: *Self, path: []const u8) !void {
-        const rel = try std.Io.Dir.path.relativeAlloc(self.allocator, self.root, null, self.root, path);
+        const rel = try self.relativeToRoot(path);
         const stamp = try self.readStamp(path) orelse {
             log.warn("{s} is no longer a dependency, but its stamp is unreadable; left in place", .{rel});
             try self.orphans.append(self.allocator, rel);
             return;
         };
-        if (try self.exists(path)) {
-            const clean = mod.Git.isClean(self.allocator, self.io, path) catch false;
-            const ahead = mod.Git.isAhead(self.allocator, self.io, path, stamp.sha) catch true;
-            if (!clean or ahead) {
-                log.warn("{s} is no longer a dependency, but it has {s}; left in place", .{ rel, if (!clean) "uncommitted changes" else "commits of its own" });
+        if (try mod.File.exists(self.io, path)) {
+            if (self.describeLocalWork(path, stamp.sha)) |work| {
+                log.warn("{s} is no longer a dependency, but it has {s}; left in place", .{ rel, work });
                 try self.orphans.append(self.allocator, rel);
                 return;
             }
@@ -845,30 +799,30 @@ const Sync = struct {
 
     /// Fetches and fast-forwards every worktree that follows a branch.
     ///
-    /// Checkouts behind a tag pin are fetched too, so `status` can report a
-    /// tag moved upstream; those worktrees do not move. A worktree with
-    /// uncommitted changes or commits of its own is skipped with a warning,
-    /// and counted.
-    ///
     /// Parameters:
     /// - `self`: the run, after `run`.
     ///
     /// Return: how many worktrees moved, and how many were skipped or failed; IO errors.
     fn update(self: *const Self) !Updated {
         var updated: Updated = .{};
-        var fetched: std.ArrayList([]const u8) = .empty;
+        // Each checkout is fetched once, whether or not it worked: offline, a
+        // retry per worktree would only wait out the same failure again.
+        var fetched: std.StringHashMapUnmanaged(bool) = .empty;
         for (self.worktrees.items) |*worktree| {
             const stamp = worktree.stamp orelse continue;
             if (stamp.pin.kind == .sha) continue;
-            for (fetched.items) |checkout| {
-                if (std.mem.eql(u8, checkout, stamp.checkout)) break;
-            } else {
+            const fetch = try fetched.getOrPut(self.allocator, stamp.checkout);
+            if (!fetch.found_existing) {
+                fetch.value_ptr.* = true;
                 mod.Git.fetch(self.allocator, self.io, stamp.checkout) catch {
-                    updated.failed += 1;
-                    continue;
+                    fetch.value_ptr.* = false;
                 };
-                try fetched.append(self.allocator, stamp.checkout);
             }
+            if (!fetch.value_ptr.*) {
+                updated.failed += 1;
+                continue;
+            }
+            // A tag's checkout is fetched only so `status` can report the tag moved upstream.
             if (!stamp.pin.follows()) continue;
             const tip = (self.lookup(stamp.checkout, stamp.pin) catch null) orelse {
                 log.warn("skipped {s}: branch {s} is gone from {s}", .{ worktree.rel, stamp.pin.value, stamp.checkout });
@@ -876,10 +830,8 @@ const Sync = struct {
                 continue;
             };
             if (std.mem.eql(u8, tip, stamp.sha)) continue;
-            const clean = mod.Git.isClean(self.allocator, self.io, worktree.dir) catch false;
-            const ahead = mod.Git.isAhead(self.allocator, self.io, worktree.dir, stamp.sha) catch true;
-            if (!clean or ahead) {
-                log.warn("skipped {s}: it has {s}", .{ worktree.rel, if (!clean) "uncommitted changes" else "commits of its own" });
+            if (self.describeLocalWork(worktree.dir, stamp.sha)) |work| {
+                log.warn("skipped {s}: it has {s}", .{ worktree.rel, work });
                 updated.failed += 1;
                 continue;
             }
@@ -923,14 +875,10 @@ const Sync = struct {
     /// - `self`: the run.
     /// - `dir`: a package directory.
     ///
-    /// Return: the manifest, or `null` when there is none; `error.DepsFailed`
-    /// when it does not parse, or IO errors.
+    /// Return: the manifest, or `null` when there is none; `error.DepsFailed` when it does not parse, or IO errors.
     fn readManifest(self: *Self, dir: []const u8) !?Manifest {
         const path = try std.Io.Dir.path.join(self.allocator, &.{ dir, "build.zig.zon" });
-        const source = std.Io.Dir.cwd().readFileAllocOptions(self.io, path, self.allocator, .limited(1 << 20), .of(u8), 0) catch |err| switch (err) {
-            error.FileNotFound => return null,
-            else => return err,
-        };
+        const source = try mod.File.readOptionalZ(self.allocator, self.io, path, .limited(Manifest.max_bytes)) orelse return null;
         return Manifest.parse(self.allocator, source) catch |err| switch (err) {
             error.InvalidManifest => return self.fail("cannot parse {s}", .{path}),
             else => return err,
@@ -957,10 +905,7 @@ const Sync = struct {
     ///
     /// Return: the stamp, or `null` when there is none or it does not parse; IO errors.
     fn readStamp(self: *const Self, dir: []const u8) !?Stamp {
-        const text = std.Io.Dir.cwd().readFileAlloc(self.io, try self.stampPath(dir), self.allocator, .limited(1 << 16)) catch |err| switch (err) {
-            error.FileNotFound => return null,
-            else => return err,
-        };
+        const text = try mod.File.readOptional(self.allocator, self.io, try self.stampPath(dir), .limited(Stamp.max_bytes)) orelse return null;
         return Stamp.parse(text);
     }
 
@@ -976,24 +921,51 @@ const Sync = struct {
         const head = try mod.Git.revParse(self.allocator, self.io, worktree.dir, "HEAD") orelse target.sha;
         const stamp = Stamp{ .pin = target.pin, .sha = head, .branch = target.branch, .checkout = worktree.checkout };
         const path = try self.stampPath(worktree.dir);
-        try std.Io.Dir.cwd().createDirPath(self.io, std.Io.Dir.path.dirname(path).?);
+        try mod.File.createParentDir(self.io, path);
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = try stamp.serialize(self.allocator) });
         worktree.stamp = stamp;
     }
 
-    /// Reports whether `path` exists.
+    /// Returns `path` relative to the consumer's root, for messages.
     ///
     /// Parameters:
     /// - `self`: the run.
     /// - `path`: an absolute path.
     ///
-    /// Return: `true` when it exists; IO errors other than "not found".
-    fn exists(self: *const Self, path: []const u8) !bool {
-        std.Io.Dir.cwd().access(self.io, path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return false,
-            else => return err,
-        };
-        return true;
+    /// Return: the relative path; allocation errors.
+    fn relativeToRoot(self: *const Self, path: []const u8) ![]const u8 {
+        return std.Io.Dir.path.relativeAlloc(self.allocator, self.root, null, self.root, path);
+    }
+
+    /// Describes the work of its own a checkout or worktree holds, which moving it would put at risk.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    /// - `dir`: the checkout or worktree.
+    /// - `base`: the commit that HEAD is compared with; commits beyond it are its own.
+    ///
+    /// Return: "uncommitted changes" or "commits of its own", or `null` when it has neither.
+    fn describeLocalWork(self: *const Self, dir: []const u8, base: []const u8) ?[]const u8 {
+        // A `git` failure counts as work, so a checkout that cannot be inspected is left alone.
+        const clean = mod.Git.isClean(self.allocator, self.io, dir) catch false;
+        if (!clean) return "uncommitted changes";
+        const ahead = mod.Git.isAhead(self.allocator, self.io, dir, base) catch true;
+        if (ahead) return "commits of its own";
+        return null;
+    }
+
+    /// Takes the lock that serialises concurrent builds of this consumer.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    ///
+    /// Return: the locked file, released when it is closed; IO errors.
+    fn acquireLock(self: *const Self) !std.Io.File {
+        const dir = try std.Io.Dir.path.join(self.allocator, &.{ self.root, ".zig-cache" });
+        try std.Io.Dir.cwd().createDirPath(self.io, dir);
+        // Beside the breadcrumb's directory, not in it: that directory's contents are a configure input.
+        const path = try std.Io.Dir.path.join(self.allocator, &.{ dir, "zigbuildx.lock" });
+        return std.Io.Dir.cwd().createFile(self.io, path, .{ .lock = .exclusive });
     }
 
     /// Shortens a SHA for messages.
@@ -1017,6 +989,21 @@ const Sync = struct {
     fn fail(self: *Self, comptime fmt: []const u8, args: anytype) error{ DepsFailed, OutOfMemory } {
         self.problem = try self.allocator.print(fmt, args);
         return error.DepsFailed;
+    }
+
+    /// Logs why the run failed: the `problem` `fail` recorded, or else the error itself.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    /// - `err`: the error the run returned.
+    /// - `action`: what the run was doing, for the message (`"clone"`, `"sync"`).
+    fn logFailure(self: *const Self, err: anyerror, action: []const u8) void {
+        if (err == error.DepsFailed) {
+            log.err("{s}", .{self.problem});
+        } else {
+            // `Git.clone` has already logged git's reason; this names what the run was doing.
+            log.err("cannot {s} dependencies [{any}]", .{ action, err });
+        }
     }
 };
 
@@ -1060,7 +1047,7 @@ const Breadcrumb = struct {
     ///
     /// Return: nothing; IO errors.
     fn prepare(io: std.Io, file: []const u8) !void {
-        try std.Io.Dir.cwd().createDirPath(io, std.Io.Dir.path.dirname(file).?);
+        try mod.File.createParentDir(io, file);
     }
 
     /// Leaves the breadcrumb.
@@ -1083,25 +1070,7 @@ const Breadcrumb = struct {
     ///
     /// Return: nothing; IO errors other than "not found".
     fn clear(io: std.Io, file: []const u8) !void {
-        std.Io.Dir.cwd().deleteFile(io, file) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-    }
-
-    /// Reports whether the breadcrumb is there.
-    ///
-    /// Parameters:
-    /// - `io`: IO for the filesystem.
-    /// - `file`: its absolute path.
-    ///
-    /// Return: `true` when it exists; IO errors other than "not found".
-    fn isSet(io: std.Io, file: []const u8) !bool {
-        std.Io.Dir.cwd().access(io, file, .{}) catch |err| switch (err) {
-            error.FileNotFound => return false,
-            else => return err,
-        };
-        return true;
+        try mod.File.deleteIfPresent(io, file);
     }
 };
 
@@ -1124,6 +1093,129 @@ const UpdateRequest = struct {
     }
 };
 
+/// Reads the `git+` URLs `zig fetch` writes and `git ls-remote` listings, for `Deps.pin`.
+/// A release tag and the commit it names.
+const Release = struct {
+    const Self = @This();
+    /// The tag, `v` and a semantic version.
+    tag: []const u8,
+    /// The commit it names; for an annotated tag, the commit, not the tag object.
+    commit: []const u8,
+    /// The tag's version.
+    version: std.SemanticVersion,
+};
+
+const ReleasePin = struct {
+    const Self = @This();
+
+    /// Returns the repository a `git+` dependency URL names, without its scheme prefix, ref or commit.
+    ///
+    /// Parameters:
+    /// - `url`: a `.url`, such as `git+https://host/x?ref=v1.0.0#<sha>` or `git+https://host/x#main`.
+    ///
+    /// Return: `https://host/x`, or null when `url` is not a `git+` URL.
+    fn repository(url: []const u8) ?[]const u8 {
+        const prefix = "git+";
+        if (!std.mem.startsWith(u8, url, prefix)) return null;
+        const rest = url[prefix.len..];
+        return rest[0 .. std.mem.findAny(u8, rest, "?#") orelse rest.len];
+    }
+
+    /// Returns what a `git+` dependency URL is pinned to: its `?ref=`, else what follows `#`.
+    ///
+    /// Parameters:
+    /// - `url`: a `.url`.
+    ///
+    /// Return: the tag or branch (`v1.0.0`, `main`), a commit, or "" when it names none.
+    fn ref(url: []const u8) []const u8 {
+        const query = "?ref=";
+        if (std.mem.find(u8, url, query)) |start| {
+            const rest = url[start + query.len ..];
+            return rest[0 .. std.mem.findScalar(u8, rest, '#') orelse rest.len];
+        }
+        const hash = std.mem.findScalar(u8, url, '#') orelse return "";
+        return url[hash + 1 ..];
+    }
+
+    /// Returns the commit a `?ref=<ref>#<commit>` URL pins, as `zig fetch --save` writes it.
+    ///
+    /// Parameters:
+    /// - `url`: a `.url`.
+    ///
+    /// Return: the commit, or "" when `url` names none (`#<ref>` alone, as `zig fetch --save-exact` keeps it).
+    fn commit(url: []const u8) []const u8 {
+        if (std.mem.find(u8, url, "?ref=") == null) return "";
+        const hash = std.mem.findScalar(u8, url, '#') orelse return "";
+        return url[hash + 1 ..];
+    }
+
+    /// Reports whether a ref is a full commit hash rather than a tag or branch.
+    ///
+    /// Parameters:
+    /// - `pinned`: a ref from a `.url`.
+    ///
+    /// Return: `true` for 40 or 64 hex digits.
+    fn isCommit(pinned: []const u8) bool {
+        if (pinned.len != 40 and pinned.len != 64) return false;
+        for (pinned) |c| if (!std.ascii.isHex(c)) return false;
+        return true;
+    }
+
+    /// Reports whether a ref is a branch to follow: neither a release tag nor a commit.
+    ///
+    /// Parameters:
+    /// - `pinned`: a ref from a `.url`; "" is the default branch.
+    ///
+    /// Return: `true` for a branch.
+    fn isBranch(pinned: []const u8) bool {
+        return Self.releaseVersion(pinned) == null and !Self.isCommit(pinned);
+    }
+
+    /// Reads the version of a release tag: `v` and a semantic version, with no pre-release or build part.
+    ///
+    /// Parameters:
+    /// - `tag`: a tag or ref, such as `v3.6.0`, `v5.0.0-rc1` or `main`.
+    ///
+    /// Return: the version, or null when `tag` is not a release tag.
+    fn releaseVersion(tag: []const u8) ?std.SemanticVersion {
+        if (!std.mem.startsWith(u8, tag, "v")) return null;
+        const version = std.SemanticVersion.parse(tag[1..]) catch return null;
+        if (version.pre != null or version.build != null) return null;
+        return version;
+    }
+
+    /// Returns the newest release tag in a `git ls-remote --tags` listing, with the commit it names.
+    ///
+    /// Parameters:
+    /// - `listing`: `<sha>\trefs/tags/<tag>` lines, and `<commit>\trefs/tags/<tag>^{}` for annotated tags.
+    ///
+    /// Return: the release, borrowed from `listing`, or null when there is no release tag.
+    fn newestRelease(listing: []const u8) ?Release {
+        var newest: ?Release = null;
+        var lines = std.mem.tokenizeScalar(u8, listing, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            const marker = "\trefs/tags/";
+            const start = std.mem.find(u8, line, marker) orelse continue;
+            const sha = line[0..start];
+            const name = line[start + marker.len ..];
+            const peeled = std.mem.endsWith(u8, name, "^{}");
+            const tag = if (peeled) name[0 .. name.len - "^{}".len] else name;
+            const version = Self.releaseVersion(tag) orelse continue;
+            if (newest) |best| {
+                // The peeled line follows its tag's own: it replaces the tag object with the commit.
+                if (std.mem.eql(u8, best.tag, tag)) {
+                    if (peeled) newest.?.commit = sha;
+                    continue;
+                }
+                if (version.order(best.version) != .gt) continue;
+            }
+            newest = .{ .tag = tag, .commit = sha, .version = version };
+        }
+        return newest;
+    }
+};
+
 /// Walks a package's `build.zig.zon` dependencies and fetches the ones missing from disk.
 ///
 /// A dependency that names a sibling checkout by `.path` can also name the
@@ -1140,30 +1232,11 @@ pub const Deps = struct {
 
     /// Clones every missing cloneable dependency, transitive ones included, and exits 1; returns when none are missing.
     ///
-    /// The exit is not optional. The build runner was compiled before the clone
-    /// existed, so a dependency cloned mid-`build()` resolves but its own `build()`
-    /// never runs; only a fresh `zig build` picks it up. When nothing is missing the
-    /// return type is `void`.
-    ///
-    /// A `.path` dependency of a sibling (`../tui` declaring `../vaxis`) is
-    /// cloned from the `.clone` in the sibling's manifest: Zig opens it before
-    /// the sibling's own `build()` could, and `Deps` runs for the root only.
-    ///
-    /// A `.path` dependency with an `.archive` instead of a `.clone` is
-    /// downloaded and unpacked there (see `ZipArchive`), and the build goes
-    /// on: no Zig code imports an archive, so no re-run is needed. Its stamp
-    /// is checked whenever `build()` runs, so a new `.archive` URL in the
-    /// root's manifest replaces it the same way.
-    ///
-    /// Also declares `-Dupdate`, which fetches every sibling checkout and
-    /// fast-forwards those behind their upstream, then exits 1 for a re-run
-    /// when any moved. A breadcrumb left by `guard` asks for the same once.
-    ///
     /// Parameters:
     /// - `b`: the build graph.
     /// - `zon`: the caller's `@import("build.zig.zon")`.
     ///
-    /// Return: nothing when all are present; otherwise never.
+    /// Return: `void` when every dependency is present; otherwise `noreturn`.
     pub fn cloneMissing(b: *std.Build, comptime zon: anytype) if (Self.allPresent(zon) and Self.siblingsPresent(zon)) void else noreturn {
         const present = comptime Self.allPresent(zon) and Self.siblingsPresent(zon);
         // In a dependency's build() the root's has already run.
@@ -1173,6 +1246,7 @@ pub const Deps = struct {
             std.process.exit(1);
         };
         const request: UpdateRequest = if (present) Self.updateRequest(b, root) else .{ .flag = false, .breadcrumb = null };
+        if (present) Self.addPinStep(b);
         // An archive's URL can change without it going missing: its stamp is read each time.
         if (present and !request.any() and comptime !Self.hasArchive(zon)) return;
         var run = Sync.init(b.allocator, b.graph.io, root) catch |err| {
@@ -1182,14 +1256,10 @@ pub const Deps = struct {
         // With everything present this queues the siblings, for the update, and
         // unpacks any archive whose URL changed.
         run.cloneSiblings() catch |err| {
-            if (err == error.DepsFailed) {
-                log.err("{s}", .{run.problem});
-            } else {
-                // Git.clone logs its own failure.
-                log.err("cannot clone dependencies [{any}]", .{err});
-            }
+            run.logFailure(err, "clone");
             std.process.exit(1);
         };
+        // The runner was compiled without a fresh clone: its build() would never run, so only a re-run picks it up.
         if (present) {
             if (run.changed) {
                 log.info("dependencies changed; re-run zig build", .{});
@@ -1200,6 +1270,9 @@ pub const Deps = struct {
         }
         if (run.changed or run.unpacked) {
             log.info("fetched missing dependencies; re-run zig build", .{});
+        } else if (Self.appearedOnDisk(b, root, comptime Self.missingSibling(zon))) {
+            // A concurrent build fetched it while this one waited for the lock.
+            log.info("another build fetched the missing dependencies; re-run zig build", .{});
         } else {
             log.err("{s} is missing: give it a .clone or an .archive, or put a Zig package there", .{comptime Self.missingSibling(zon) orelse "a .path dependency"});
         }
@@ -1207,44 +1280,17 @@ pub const Deps = struct {
     }
 
     /// Clones missing sibling checkouts and brings every worktree dependency in line with its pin.
-    ///
-    /// Call it first in `build()`. A pinned dependency (`.sha`, `.tag` or
-    /// `.branch`, with a `.path` under `deps/`) gets its own git worktree of the shared checkout
-    /// (`.checkout`, default `../<name>`), detached at `.sha` or `.tag`, or on
-    /// the branch `<consumer>/<branch>` for `.branch`. An unpinned dependency's
-    /// `.path` is used as is, and cloned from `.clone` when absent, exactly as
-    /// `cloneMissing` does. Transitive dependencies are followed through each
-    /// worktree's manifest, and through each unpinned sibling's outside `deps/`.
-    ///
-    /// Anything cloned, created or moved exits 1 for a re-run, as
-    /// `cloneMissing` does. While a worktree dependency is missing the return
-    /// type is `noreturn`, so nothing after the call is compiled: a transitive
-    /// package's top-level `@import` of a missing dependency would otherwise
-    /// fail to compile before `sync` could create it. An unchanged build reads
-    /// stamp files and runs no `git`.
-    ///
-    /// Zig 0.17 skips `build()` when nothing it tracks has changed, and a
-    /// worktree deleted by hand or a stamp left behind is nothing it tracks; so
-    /// while there are worktrees this poisons the configure cache, and
-    /// `build()` runs on every build, as it did before 0.17.
-    ///
-    /// Also declares the `deps` step, which lists the worktrees, and
-    /// `-Dupdate`, which fetches every sibling checkout and worktree checkout
-    /// and fast-forwards the siblings and branch worktrees that are behind,
-    /// then exits 1 for a re-run when any moved. A branch worktree it must
-    /// skip (uncommitted changes, commits of its own) fails the build; a
-    /// sibling it skips only warns. A breadcrumb left by `guard` asks for the
-    /// same once.
+    /// Call it first in `build()`.
     ///
     /// Parameters:
     /// - `b`: the build graph.
     /// - `zon`: the caller's `@import("build.zig.zon")`.
     ///
-    /// Return: nothing when everything is in place; otherwise never.
+    /// Return: `void` when everything is in place; otherwise `noreturn`.
     pub fn sync(b: *std.Build, comptime zon: anytype) if (Self.allPresent(zon) and Self.worktreesPresent(zon) and Self.siblingsPresent(zon)) void else noreturn {
         const present = comptime Self.allPresent(zon) and Self.worktreesPresent(zon) and Self.siblingsPresent(zon);
         // In a dependency's build() the root's sync has already run.
-        if (b.pkg_hash.len != 0) {
+        if (!b.isRoot()) {
             if (present) return;
             log.err("a worktree dependency is missing; the root package's build() must call Deps.sync first", .{});
             std.process.exit(1);
@@ -1259,25 +1305,26 @@ pub const Deps = struct {
             std.process.exit(1);
         };
         run.run() catch |err| {
-            if (err == error.DepsFailed) {
-                log.err("{s}", .{run.problem});
-            } else {
-                log.err("cannot sync dependencies [{any}]", .{err});
-            }
+            run.logFailure(err, "sync");
             std.process.exit(1);
         };
+        // Anything cloned, created or moved needs a re-run, as in cloneMissing.
         if (run.changed) {
             log.info("dependencies changed; re-run zig build", .{});
             std.process.exit(1);
         }
+        // noreturn while one is missing, so nothing after the call compiles: a transitive
+        // top-level @import of the missing package would otherwise fail before sync could create it.
         if (comptime !present) {
             log.err("{s} is still missing; an unpinned .path is used as is, so put it there or give it a .clone or an .archive", .{comptime Self.missingWorktree(zon) orelse (Self.missingSibling(zon) orelse "a .path dependency")});
             std.process.exit(1);
         }
+        // Zig 0.17 skips build() when nothing it tracks changed, and a worktree deleted by hand or a
+        // stamp left behind is nothing it tracks: poison the configure cache while worktrees exist.
         if (run.worktrees.items.len > 0 or run.orphans.items.len > 0) b.graph.poisonCache();
         const request = Self.updateRequest(b, root);
         if (request.any()) Self.applyUpdate(&run, request, true);
-        const list = b.addRunArtifact(mod.HostTool.add(b));
+        const list = b.addRunArtifact(mod.ToolArtifact.add(b));
         list.setName("deps");
         list.addArg("deps");
         list.addDirectoryArg2(b.path("."), .{});
@@ -1286,20 +1333,96 @@ pub const Deps = struct {
         list.has_side_effects = true;
         const top = b.step("deps", "List worktree dependencies; -Dupdate fast-forwards those that follow a branch");
         top.dependOn(&list.step);
+        Self.addPinStep(b);
     }
 
-    /// `zigbuildx deps <root> [--update]`: lists the worktree dependencies and, with `--update`, fast-forwards those that follow a branch.
-    ///
-    /// Runs as the `deps` step. It reads the manifests again, which in the
-    /// steady state runs no `git`, then reports each worktree's state.
+    /// `zigbuildx pin <root> <name> <zig>`: pins dependency `name`, this zigbuildx, to its repository's newest release tag.
+    /// Runs as the `zigbuildx-pin` step.
     ///
     /// Parameters:
     /// - `process_init`: the process's allocator and IO.
     /// - `args`: the command line after the program's path; `args[0]` is the command.
     ///
-    /// Return: nothing; `error.InvalidArguments` on a bad command line,
-    /// `error.DepsFailed` when the worktrees are not in line or `--update`
-    /// skipped or failed one, or IO errors.
+    /// Return: nothing; `error.InvalidArguments` on a bad command line, `error.DepsFailed` when no release can be pinned or `zig fetch` fails, or IO and git errors.
+    pub fn pin(process_init: std.process.Init, args: []const [:0]const u8) !void {
+        if (args.len != 4) {
+            log.err("usage: zigbuildx pin <root> <dependency-name> <zig>", .{});
+            return error.InvalidArguments;
+        }
+        const allocator = process_init.arena.allocator();
+        const io = process_init.io;
+        const root = try std.Io.Dir.cwd().realPathFileAlloc(io, args[1], allocator);
+        const name = args[2];
+        const manifest_path = try std.Io.Dir.path.join(allocator, &.{ root, "build.zig.zon" });
+        const source = try mod.File.readOptionalZ(allocator, io, manifest_path, .limited(Manifest.max_bytes)) orelse {
+            log.err("no build.zig.zon in {s}", .{root});
+            return error.DepsFailed;
+        };
+        const manifest = Manifest.parse(allocator, source) catch |err| {
+            log.err("cannot parse {s} [{any}]", .{ manifest_path, err });
+            return error.DepsFailed;
+        };
+        const entry = for (manifest.entries) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) break entry;
+        } else {
+            log.err("{s} has no dependency named {s}", .{ manifest_path, name });
+            return error.DepsFailed;
+        };
+        const url = entry.url orelse {
+            log.err("{s} has no .url: zigbuildx must be a .url + .hash dependency", .{name});
+            return error.DepsFailed;
+        };
+        const repository = ReleasePin.repository(url) orelse {
+            log.err("{s}'s .url is not a git+ URL, so it has no tags to pin to: {s}", .{ name, url });
+            return error.DepsFailed;
+        };
+        const current = ReleasePin.ref(url);
+        // The URL keeps its form: `?ref=<ref>#<commit>` from `zig fetch --save`, or `#<ref>` from `--save-exact`.
+        const save = try allocator.print("{s}={s}", .{ if (std.mem.find(u8, url, "?ref=") == null) "--save-exact" else "--save", name });
+        if (ReleasePin.isBranch(current)) {
+            // A branch is followed, never swapped for a tag: refresh its commit and hash.
+            const target = if (current.len == 0) try allocator.print("git+{s}", .{repository}) else try allocator.print("git+{s}#{s}", .{ repository, current });
+            try Self.zigFetch(io, args[3], root, save, target);
+            log.info("refreshed {s} on {s}; the next zig build uses it", .{ name, if (current.len == 0) "its default branch" else current });
+            return;
+        }
+        const listing = mod.Git.remoteTags(allocator, io, root, repository) catch {
+            log.err("cannot list the tags of {s}", .{repository});
+            return error.DepsFailed;
+        };
+        const release = ReleasePin.newestRelease(listing) orelse {
+            log.err("{s} has no release tag (vX.Y.Z)", .{repository});
+            return error.DepsFailed;
+        };
+        const pinned_commit = ReleasePin.commit(url);
+        if (std.mem.eql(u8, current, release.tag)) {
+            if (std.mem.eql(u8, pinned_commit, release.commit)) {
+                log.info("{s} is already pinned to {s}, the newest release", .{ name, release.tag });
+                return;
+            }
+            // The tag now names another commit (history rewritten), or the URL names none.
+            if (pinned_commit.len > 0) log.info("{s} moved from {s} to {s}; re-pinning", .{ release.tag, Sync.short(pinned_commit), Sync.short(release.commit) });
+        } else if (ReleasePin.releaseVersion(current)) |pinned| if (pinned.order(release.version) == .gt) {
+            // A pin ahead of every tag (a release not tagged yet) is never moved back.
+            log.warn("{s} is pinned to {s}, newer than {s}, the newest release tag; left as it is", .{ name, current, release.tag });
+            return;
+        };
+        try Self.zigFetch(io, args[3], root, save, try allocator.print("git+{s}#{s}", .{ repository, release.tag }));
+        if (std.mem.eql(u8, current, release.tag)) {
+            log.info("pinned {s} to {s} at {s}; the next zig build uses it", .{ name, release.tag, Sync.short(release.commit) });
+        } else {
+            log.info("pinned {s} to {s} (was {s}); the next zig build uses it", .{ name, release.tag, if (current.len == 0) "unpinned" else current });
+        }
+    }
+
+    /// `zigbuildx deps <root> [--update]`: lists the worktree dependencies and, with `--update`, fast-forwards those that follow a branch.
+    /// Runs as the `deps` step.
+    ///
+    /// Parameters:
+    /// - `process_init`: the process's allocator and IO.
+    /// - `args`: the command line after the program's path; `args[0]` is the command.
+    ///
+    /// Return: nothing; `error.InvalidArguments` on a bad command line, `error.DepsFailed` when a worktree is out of line or not updated, or IO errors.
     pub fn command(process_init: std.process.Init, args: []const [:0]const u8) !void {
         const io = process_init.io;
         const update = args.len == 3 and std.mem.eql(u8, args[2], "--update");
@@ -1310,6 +1433,7 @@ pub const Deps = struct {
         const allocator = process_init.arena.allocator();
         const root = try std.Io.Dir.cwd().realPathFileAlloc(io, args[1], allocator);
         var run = try Sync.init(allocator, io, root);
+        // In the steady state this reads stamps and runs no `git`.
         run.run() catch |err| {
             if (err == error.DepsFailed) log.err("{s}", .{run.problem});
             return err;
@@ -1327,48 +1451,45 @@ pub const Deps = struct {
     }
 
     /// Leaves a breadcrumb while `zig build` compiles, so that a compile error makes the next build update dependencies.
-    ///
-    /// Call it last in the root's `build()`, after `cloneMissing` or `sync`
-    /// and once every artifact is declared. It wraps the default step only:
-    /// one step leaves the breadcrumb, another removes it once every `Compile`
-    /// the default step reaches has succeeded, and the default step waits for
-    /// that. A compile error stops the removal, so the breadcrumb stays, and
-    /// the next build's `cloneMissing` or `sync` updates as `-Dupdate` would,
-    /// then deletes it. A failure after the compiles (an install, a run step)
-    /// leaves none. The build runner keeps running independent steps after a
-    /// failure, so the breadcrumb is left even when a compile fails first.
-    ///
-    /// zigbuildx's own host tool is not watched, since the marks run on it.
+    /// Call it last in the root's `build()`, after `cloneMissing` or `sync` and once every artifact is declared.
     ///
     /// Parameters:
     /// - `b`: the root package's build graph.
-    ///
-    /// Return: nothing.
     pub fn guard(b: *std.Build) void {
         if (!b.isRoot()) return;
-        const tool = mod.HostTool.add(b);
-        const install = b.getInstallStep();
+        // Whatever plain `zig build` runs, which a consumer may have set to other than install.
+        const top = b.default_step;
         var compiles: std.ArrayList(*std.Build.Step) = .empty;
         var seen: std.AutoHashMapUnmanaged(*std.Build.Step, void) = .empty;
         var pending: std.ArrayList(*std.Build.Step) = .empty;
-        pending.append(b.allocator, install) catch @panic("OOM");
+        pending.append(b.allocator, top) catch @panic("OOM");
         while (pending.pop()) |step| {
-            if (step == &tool.step) continue;
             const visit = seen.getOrPut(b.allocator, step) catch @panic("OOM");
             if (visit.found_existing) continue;
             if (step.cast(std.Build.Step.Compile) != null) compiles.append(b.allocator, step) catch @panic("OOM");
             pending.appendSlice(b.allocator, step.dependencies.items) catch @panic("OOM");
         }
         if (compiles.items.len == 0) return;
+        // Declared only once there is something to watch. The tool is in the
+        // walk only when another step runs it (`Docs.includePrivate`), and is
+        // never watched itself: the marks run on it.
+        const tool = mod.ToolArtifact.add(b);
+        for (compiles.items, 0..) |compile, i| {
+            if (compile != &tool.step) continue;
+            _ = compiles.swapRemove(i);
+            break;
+        }
+        if (compiles.items.len == 0) return;
+        // `set` has no ordering and `clear` waits for every compile, so a compile error leaves the
+        // breadcrumb; the runner keeps running independent steps after a failure, so `set` still runs.
         const arm = Self.addMark(b, tool, "set");
         const disarm = Self.addMark(b, tool, "clear");
         disarm.step.dependOn(&arm.step);
         for (compiles.items) |compile| disarm.step.dependOn(compile);
-        install.dependOn(&disarm.step);
+        top.dependOn(&disarm.step);
     }
 
     /// `zigbuildx deps-mark set|clear <root>`: leaves or removes the breadcrumb that makes the next build update dependencies.
-    ///
     /// Runs as the two steps `guard` adds.
     ///
     /// Parameters:
@@ -1385,6 +1506,93 @@ pub const Deps = struct {
         }
         const file = try Breadcrumb.path(process_init.arena.allocator(), args[2]);
         if (set) try Breadcrumb.set(process_init.io, file) else try Breadcrumb.clear(process_init.io, file);
+    }
+
+    /// Reports whether every cloneable dependency is present.
+    ///
+    /// Parameters:
+    /// - `zon`: the caller's `@import("build.zig.zon")`.
+    ///
+    /// Return: `true` when none is missing.
+    pub fn allPresent(comptime zon: anytype) bool {
+        inline for (@typeInfo(@TypeOf(zon.dependencies)).@"struct".field_names) |field_name| {
+            if (Self.isCloneable(zon, field_name) and !Self.isPresent(field_name)) return false;
+        }
+        return true;
+    }
+
+    /// Reports whether dependency `name` was present when the build runner was compiled.
+    /// Use it to guard a top-level `@import` of a dependency's `build.zig`.
+    ///
+    /// Parameters:
+    /// - `name`: the dependency's field name in `build.zig.zon`.
+    ///
+    /// Return: `true` when present, when this package is not the root, or when the root is not a build runner.
+    pub fn isPresent(comptime name: []const u8) bool {
+        // The runner's generated table answers for the root package only.
+        const root = @import("root");
+        if (!@hasDecl(root, "dependencies")) return true;
+        const deps = root.dependencies;
+        for (deps.root_deps) |dep| {
+            if (std.mem.eql(u8, dep[0], name)) return @hasDecl(@field(deps.packages, dep[1]), "build_zig");
+        }
+        return true;
+    }
+
+    /// Reports whether dependency `name` declares both a `.path` and a `.clone`.
+    ///
+    /// Parameters:
+    /// - `zon`: the caller's `@import("build.zig.zon")`.
+    /// - `name`: the dependency's field name in `build.zig.zon`.
+    ///
+    /// Return: `true` when both fields are present.
+    pub fn isCloneable(comptime zon: anytype, comptime name: []const u8) bool {
+        // An `.archive` is not cloneable: it is unpacked in the same build, so never makes cloneMissing noreturn.
+        const Dep = @TypeOf(@field(zon.dependencies, name));
+        return @hasField(Dep, "path") and @hasField(Dep, "clone");
+    }
+
+    /// Runs `zig fetch` in `root` to rewrite a dependency's `.url` and `.hash`.
+    ///
+    /// Parameters:
+    /// - `io`: IO the child is spawned on.
+    /// - `zig`: the `zig` executable.
+    /// - `root`: the package whose `build.zig.zon` is rewritten.
+    /// - `save`: `--save=<name>` or `--save-exact=<name>`.
+    /// - `target`: the `git+` URL to fetch.
+    ///
+    /// Return: nothing; `error.DepsFailed` when `zig fetch` fails, or spawn errors.
+    fn zigFetch(io: std.Io, zig: []const u8, root: []const u8, save: []const u8, target: []const u8) !void {
+        var child = try std.process.spawn(io, .{ .argv = &.{ zig, "fetch", save, target }, .cwd = .{ .path = root } });
+        const term = try child.wait(io);
+        switch (term) {
+            .exited => |code| if (code == 0) return,
+            else => {},
+        }
+        log.err("zig fetch {s} failed [{any}]", .{ target, term });
+        return error.DepsFailed;
+    }
+
+    /// Declares the `zigbuildx-pin` step, which pins this zigbuildx in the root's `build.zig.zon` to its newest release.
+    ///
+    /// Parameters:
+    /// - `b`: the root package's build graph.
+    fn addPinStep(b: *std.Build) void {
+        const top = b.step("zigbuildx-pin", "Pin zigbuildx in build.zig.zon to its newest release tag");
+        // Found by identity, whatever the root named it; none when zigbuildx comes only through another dependency.
+        const name = mod.ToolArtifact.dependencyName() orelse {
+            top.dependOn(&b.addFail("zigbuildx-pin: build.zig.zon does not list zigbuildx itself, so there is nothing to pin").step);
+            return;
+        };
+        const run = b.addRunArtifact(mod.ToolArtifact.add(b));
+        run.setName("zigbuildx-pin");
+        run.addArg("pin");
+        run.addDirectoryArg2(b.path("."), .{});
+        run.addArg(name);
+        run.addArg(b.graph.zig_exe);
+        // It asks the network and rewrites build.zig.zon: never cached.
+        run.has_side_effects = true;
+        top.dependOn(&run.step);
     }
 
     /// Declares `-Dupdate` and makes the breadcrumb a configure input, then reports what asks for an update.
@@ -1405,21 +1613,16 @@ pub const Deps = struct {
             std.process.exit(1);
         };
         b.dependOnDirectoryContents(b.path(Breadcrumb.dir_sub_path));
-        const left = Breadcrumb.isSet(b.graph.io, file) catch false;
+        const left = mod.File.exists(b.graph.io, file) catch false;
         return .{ .flag = flag, .breadcrumb = if (left) file else null };
     }
 
     /// Updates the siblings and, for `sync`, the branch worktrees; exits when anything moved or a worktree was skipped.
     ///
-    /// A consumed breadcrumb is deleted either way, so the build after this
-    /// one is an ordinary one.
-    ///
     /// Parameters:
     /// - `run`: the run, after `run` or `cloneSiblings`.
     /// - `request`: what asked for the update.
     /// - `worktrees`: whether to update worktrees too (`sync`).
-    ///
-    /// Return: nothing when nothing moved and no worktree was skipped; otherwise it exits 1.
     fn applyUpdate(run: *Sync, request: UpdateRequest, worktrees: bool) void {
         if (request.breadcrumb != null) log.info("the last build failed to compile; updating dependencies", .{});
         const moved = run.updateSiblings() catch |err| {
@@ -1430,6 +1633,7 @@ pub const Deps = struct {
             log.err("cannot update dependencies [{any}]", .{err});
             std.process.exit(1);
         } else .{};
+        // A consumed breadcrumb is deleted either way, so the next build is an ordinary one.
         if (request.breadcrumb) |file| Breadcrumb.clear(run.io, file) catch |err| log.warn("cannot delete {s} [{any}]", .{ file, err });
         if (updated.failed > 0) log.err("{d} worktree dependencies were not updated; see the warnings above", .{updated.failed});
         if (moved or updated.moved > 0) {
@@ -1468,53 +1672,18 @@ pub const Deps = struct {
         return b.root.root_dir.handle.realPathFileAlloc(b.graph.io, b.root.subPathOrDot(), b.allocator);
     }
 
-    /// Reports whether every cloneable dependency is present.
+    /// Reports whether a package the build runner was compiled without is now a Zig package on disk.
     ///
     /// Parameters:
-    /// - `zon`: the caller's `@import("build.zig.zon")`.
+    /// - `b`: the root package's build graph.
+    /// - `root`: its absolute root.
+    /// - `missing`: the runner's key for the missing package (its path from the root), or null when none is known.
     ///
-    /// Return: `true` when none is missing.
-    pub fn allPresent(comptime zon: anytype) bool {
-        inline for (@typeInfo(@TypeOf(zon.dependencies)).@"struct".field_names) |field_name| {
-            if (Self.isCloneable(zon, field_name) and !Self.isPresent(field_name)) return false;
-        }
-        return true;
-    }
-
-    /// Reports whether dependency `name` was present when the build runner was compiled.
-    ///
-    /// Reads the runner's generated dependency table, so it answers for the root
-    /// package only. Use it to guard a top-level `@import` of a dependency's
-    /// `build.zig`, which is a compile error while the dependency is absent.
-    ///
-    /// Parameters:
-    /// - `name`: the dependency's field name in `build.zig.zon`.
-    ///
-    /// Return: `true` when present, when this package is not the root, or when
-    /// the root is not a build runner.
-    pub fn isPresent(comptime name: []const u8) bool {
-        const root = @import("root");
-        if (!@hasDecl(root, "dependencies")) return true;
-        const deps = root.dependencies;
-        for (deps.root_deps) |dep| {
-            if (std.mem.eql(u8, dep[0], name)) return @hasDecl(@field(deps.packages, dep[1]), "build_zig");
-        }
-        return true;
-    }
-
-    /// Reports whether dependency `name` declares both a `.path` and a `.clone`.
-    ///
-    /// An `.archive` dependency is not cloneable: no Zig code imports it, so it
-    /// is unpacked in the same build and never makes `cloneMissing` `noreturn`.
-    ///
-    /// Parameters:
-    /// - `zon`: the caller's `@import("build.zig.zon")`.
-    /// - `name`: the dependency's field name in `build.zig.zon`.
-    ///
-    /// Return: `true` when both fields are present.
-    pub fn isCloneable(comptime zon: anytype, comptime name: []const u8) bool {
-        const Dep = @TypeOf(@field(zon.dependencies, name));
-        return @hasField(Dep, "path") and @hasField(Dep, "clone");
+    /// Return: `true` when its `build.zig` exists now.
+    fn appearedOnDisk(b: *std.Build, root: []const u8, missing: ?[]const u8) bool {
+        const path = missing orelse return false;
+        const build_zig = std.Io.Dir.path.join(b.allocator, &.{ root, path, "build.zig" }) catch return false;
+        return mod.File.exists(b.graph.io, build_zig) catch false;
     }
 
     /// Reports whether any root dependency is unpacked from an `.archive`.
@@ -1532,9 +1701,6 @@ pub const Deps = struct {
 
     /// Reports whether `path` is the `.path` of one of the root's `.archive` dependencies.
     ///
-    /// The runner keys a `.path` package by its `.path` as the manifest
-    /// writes it, so the two compare as written.
-    ///
     /// Parameters:
     /// - `zon`: the caller's `@import("build.zig.zon")`.
     /// - `path`: a key of the runner's package table.
@@ -1544,16 +1710,13 @@ pub const Deps = struct {
         inline for (@typeInfo(@TypeOf(zon.dependencies)).@"struct".field_names) |field_name| {
             const dep = @field(zon.dependencies, field_name);
             const Dep = @TypeOf(dep);
+            // The runner keys a `.path` package by its `.path` as the manifest writes it: compare as written.
             if (@hasField(Dep, "archive") and @hasField(Dep, "path") and std.mem.eql(u8, dep.path, path)) return true;
         }
         return false;
     }
 
     /// Reports whether every worktree dependency, transitive ones included, was present when the build runner was compiled.
-    ///
-    /// The runner keys a `.path` package by its path from the root, so a
-    /// worktree dependency is any key under `deps/`. Unlike `isPresent`, this
-    /// checks the whole package table, not just the root's dependencies.
     ///
     /// Parameters:
     /// - `zon`: the caller's `@import("build.zig.zon")`; its `.archive` paths are skipped.
@@ -1568,15 +1731,14 @@ pub const Deps = struct {
     /// Parameters:
     /// - `zon`: the caller's `@import("build.zig.zon")`; its `.archive` paths are skipped.
     ///
-    /// Return: its path from the root, or `null` when none is missing or the
-    /// root is not a build runner.
+    /// Return: its path from the root, or `null` when none is missing or the root is not a build runner.
     fn missingWorktree(comptime zon: anytype) ?[]const u8 {
         const root = @import("root");
         if (!@hasDecl(root, "dependencies")) return null;
         const packages = root.dependencies.packages;
+        // A `.path` package is keyed by its path from the root: a worktree is any key under `deps/`, transitive ones included.
         for (@typeInfo(packages).@"struct".decl_names) |decl_name| {
-            const under_deps = std.mem.startsWith(u8, decl_name, "deps/") or std.mem.startsWith(u8, decl_name, "deps\\");
-            if (under_deps and !@hasDecl(@field(packages, decl_name), "build_zig") and !Self.isRootArchive(zon, decl_name)) return decl_name;
+            if (Self.isUnderDeps(decl_name) and !@hasDecl(@field(packages, decl_name), "build_zig") and !Self.isRootArchive(zon, decl_name)) return decl_name;
         }
         return null;
     }
@@ -1593,29 +1755,33 @@ pub const Deps = struct {
 
     /// Names the first `.path` package outside `deps/` that was missing when the build runner was compiled.
     ///
-    /// The runner keys a `.path` package by its path from the root, which is
-    /// also its `build_root`; a fetched package is keyed by its hash and lives
-    /// in a cache, so an unfetched lazy dependency is not mistaken for one.
-    /// The root's own `.archive` paths are skipped: `cloneMissing` unpacks
-    /// them in the same build. A sibling's archive is not known at comptime,
-    /// so a missing one still costs a re-run.
-    ///
     /// Parameters:
-    /// - `zon`: the caller's `@import("build.zig.zon")`.
+    /// - `zon`: the caller's `@import("build.zig.zon")`; its `.archive` paths are skipped.
     ///
-    /// Return: its path from the root, or `null` when none is missing or the
-    /// root is not a build runner.
+    /// Return: its path from the root, or `null` when none is missing or the root is not a build runner.
     fn missingSibling(comptime zon: anytype) ?[]const u8 {
         const root = @import("root");
         if (!@hasDecl(root, "dependencies")) return null;
         const packages = root.dependencies.packages;
         for (@typeInfo(packages).@"struct".decl_names) |decl_name| {
             const package = @field(packages, decl_name);
+            // A `.path` package's key is its `build_root`; a fetched one is keyed by hash and lives in a
+            // cache, so an unfetched lazy dependency is not mistaken for one.
             const is_path = std.mem.eql(u8, package.build_root, decl_name);
-            const under_deps = std.mem.startsWith(u8, decl_name, "deps/") or std.mem.startsWith(u8, decl_name, "deps\\");
-            if (is_path and !under_deps and !@hasDecl(package, "build_zig") and !Self.isRootArchive(zon, decl_name)) return decl_name;
+            // The root's own archives are unpacked in the same build; a sibling's is unknown at comptime and costs a re-run.
+            if (is_path and !Self.isUnderDeps(decl_name) and !@hasDecl(package, "build_zig") and !Self.isRootArchive(zon, decl_name)) return decl_name;
         }
         return null;
+    }
+
+    /// Reports whether a key of the build runner's package table is a path under the root's `deps/`.
+    ///
+    /// Parameters:
+    /// - `key`: a package's key; a `.path` package's is its path from the root, with the host's separator.
+    ///
+    /// Return: `true` for `deps/<x>` or `deps\<x>`.
+    fn isUnderDeps(comptime key: []const u8) bool {
+        return std.mem.startsWith(u8, key, "deps/") or std.mem.startsWith(u8, key, "deps\\");
     }
 };
 
@@ -1683,6 +1849,56 @@ test "Stamp round-trips" {
     try std.testing.expectEqual(null, Stamp.parse("bogus\n"));
     try std.testing.expect(parsed.pin.satisfies(.{ .kind = .branch, .value = "main" }));
     try std.testing.expect(!parsed.pin.satisfies(.{ .kind = .tag, .value = "main" }));
+}
+
+test "ReleasePin reads a git+ URL's repository and ref" {
+    try std.testing.expectEqualStrings("https://github.com/x/zigbuildx", ReleasePin.repository("git+https://github.com/x/zigbuildx?ref=v3.6.0#fba04ba852fc06317207bdc7119b58dc13638ac0").?);
+    try std.testing.expectEqualStrings("https://github.com/x/zigbuildx", ReleasePin.repository("git+https://github.com/x/zigbuildx#main").?);
+    try std.testing.expectEqual(null, ReleasePin.repository("https://example.com/zigbuildx.tar.gz"));
+    try std.testing.expectEqualStrings("v3.6.0", ReleasePin.ref("git+https://github.com/x/zigbuildx?ref=v3.6.0#fba04ba852fc06317207bdc7119b58dc13638ac0"));
+    try std.testing.expectEqualStrings("main", ReleasePin.ref("git+https://github.com/x/zigbuildx#main"));
+    try std.testing.expectEqualStrings("", ReleasePin.ref("git+https://github.com/x/zigbuildx"));
+}
+
+test "ReleasePin takes an annotated tag's commit from its peeled line" {
+    const listing =
+        "1111111111111111111111111111111111111111\trefs/tags/v4.1.0\n" ++
+        "2222222222222222222222222222222222222222\trefs/tags/v4.1.0^{}\n" ++
+        "3333333333333333333333333333333333333333\trefs/tags/v4.0.0\n" ++
+        "4444444444444444444444444444444444444444\trefs/tags/v4.0.0^{}\n";
+    const newest = ReleasePin.newestRelease(listing).?;
+    try std.testing.expectEqualStrings("v4.1.0", newest.tag);
+    // The commit, not the tag object: a `?ref=v4.1.0#<commit>` URL names the commit.
+    try std.testing.expectEqualStrings("2222222222222222222222222222222222222222", newest.commit);
+}
+
+test "ReleasePin reads the pinned commit and tells a branch from a tag or a commit" {
+    try std.testing.expectEqualStrings("fba04ba852fc06317207bdc7119b58dc13638ac0", ReleasePin.commit("git+https://github.com/x/zigbuildx?ref=v3.6.0#fba04ba852fc06317207bdc7119b58dc13638ac0"));
+    // `--save-exact` keeps `#<ref>`, which names no commit.
+    try std.testing.expectEqualStrings("", ReleasePin.commit("git+https://github.com/x/zigbuildx#main"));
+    try std.testing.expect(ReleasePin.isBranch("main"));
+    try std.testing.expect(ReleasePin.isBranch(""));
+    try std.testing.expect(!ReleasePin.isBranch("v4.1.0"));
+    try std.testing.expect(!ReleasePin.isBranch("fba04ba852fc06317207bdc7119b58dc13638ac0"));
+    try std.testing.expect(ReleasePin.isCommit("fba04ba852fc06317207bdc7119b58dc13638ac0"));
+    try std.testing.expect(!ReleasePin.isCommit("fba04ba"));
+}
+
+test "ReleasePin picks the newest release tag by version, not by listing order" {
+    const listing =
+        "cc0f3e78820c1f628de09fd3cddb83d795a25542\trefs/tags/v1.0.0\n" ++
+        "7075087e013cd2313cfa7ce1b603a8d2388632d5\trefs/tags/v3.10.0\n" ++
+        "fba04ba852fc06317207bdc7119b58dc13638ac0\trefs/tags/v3.6.0\r\n" ++
+        "4618f3da19ff5b7b259ad67b0c4ee22d5a1892ab\trefs/tags/v9.0.0-rc1\n" ++
+        "6b20787689b19cad79ef2f1b2520b28dadf34299\trefs/tags/nightly\n";
+    const newest = ReleasePin.newestRelease(listing).?;
+    try std.testing.expectEqualStrings("v3.10.0", newest.tag);
+    try std.testing.expectEqualStrings("7075087e013cd2313cfa7ce1b603a8d2388632d5", newest.commit);
+    try std.testing.expectEqual(null, ReleasePin.newestRelease("6b20787689b19cad79ef2f1b2520b28dadf34299\trefs/tags/nightly\n"));
+    try std.testing.expectEqual(null, ReleasePin.newestRelease(""));
+    try std.testing.expectEqual(std.SemanticVersion{ .major = 4, .minor = 1, .patch = 0 }, ReleasePin.releaseVersion("v4.1.0").?);
+    try std.testing.expectEqual(null, ReleasePin.releaseVersion("main"));
+    try std.testing.expectEqual(null, ReleasePin.releaseVersion("4.1.0"));
 }
 
 /// A scratch tree for `Sync`: a consumer, origin repositories, and shared checkouts.
@@ -1820,12 +2036,12 @@ const TestTree = struct {
         return error.TestUnexpectedResult;
     }
 
-    /// Resolves `rev` in the repository at `sub`.
+    /// Resolves `rev_` in the repository at `sub`.
     ///
     /// Parameters:
     /// - `self`: the fixture.
     /// - `sub`: the repository, relative to the scratch root.
-    /// - `rev`: the revision.
+    /// - `rev_`: the revision.
     ///
     /// Return: the SHA; `error.TestUnexpectedResult` when it is not there.
     fn rev(self: *Self, sub: []const u8, rev_: []const u8) ![]const u8 {
@@ -1841,7 +2057,7 @@ const TestTree = struct {
     ///
     /// Return: its `file://` URL; IO and zip errors.
     fn zip(self: *Self, sub: []const u8, entries: []const [2][]const u8) ![]const u8 {
-        var archive = mod.ZipWriter.init(self.allocator());
+        var archive = mod.ZipBuilder.init(self.allocator());
         defer archive.deinit();
         for (entries) |entry| try archive.addStored(entry[0], entry[1]);
         try self.write(sub, try archive.finish());
@@ -2244,11 +2460,11 @@ test "Breadcrumb is set, found and cleared, each idempotently" {
     defer tree.deinit();
     const file = try Breadcrumb.path(tree.allocator(), try tree.path("consumer"));
     try std.testing.expect(std.mem.endsWith(u8, file, try std.Io.Dir.path.join(tree.allocator(), &.{ ".zig-cache", "zigbuildx", "update" })));
-    try std.testing.expect(!try Breadcrumb.isSet(tree.io, file));
+    try std.testing.expect(!try mod.File.exists(tree.io, file));
     try Breadcrumb.set(tree.io, file);
     try Breadcrumb.set(tree.io, file);
-    try std.testing.expect(try Breadcrumb.isSet(tree.io, file));
+    try std.testing.expect(try mod.File.exists(tree.io, file));
     try Breadcrumb.clear(tree.io, file);
     try Breadcrumb.clear(tree.io, file);
-    try std.testing.expect(!try Breadcrumb.isSet(tree.io, file));
+    try std.testing.expect(!try mod.File.exists(tree.io, file));
 }

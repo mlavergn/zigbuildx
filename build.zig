@@ -16,7 +16,7 @@ comptime {
 pub const Deps = mod.Deps;
 /// Runs `git` for the build; see `src/git.zig`.
 pub const Git = mod.Git;
-/// Locates the macOS SDK and pins the macOS deployment floor; see `src/xcode.zig`.
+/// Locates an Apple platform's SDK and pins the macOS deployment floor; see `src/xcode.zig`.
 pub const Xcode = mod.Xcode;
 /// Builds Swift dylibs and links modules against them; see `src/swift.zig`.
 pub const Swift = mod.Swift;
@@ -27,23 +27,18 @@ pub const AndroidAbi = mod.AndroidAbi;
 /// Extends Zig's generated documentation; see `src/docs.zig`.
 pub const Docs = mod.Docs;
 
-/// Declares zigbuildx's host tool and the test step for its own suite.
-///
-/// A consumer never calls this directly: it imports the package's `build.zig`
-/// by dependency name and calls its extensions. Zig runs it when an extension
-/// asks for the host tool (see `src/host_tool.zig`), which is why the tool is
-/// installed: an installed artifact is what `Dependency.artifact` finds.
+/// Declares zigbuildx's host tool and its own test step; a consumer never calls it.
 ///
 /// Parameters:
-/// - `b`: the build graph the steps are registered on.
-///
-/// Return: nothing.
+/// - `b`: the build graph.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const test_filter = b.option([]const u8, "test-filter", "Run unit tests that match filter");
 
-    b.installArtifact(b.addExecutable(.{ .name = mod.HostTool.name, .root_module = b.createModule(.{
+    // Installed, because an installed artifact is what `Dependency.artifact` finds
+    // when an extension asks for the host tool (`src/tool_artifact.zig`).
+    b.installArtifact(b.addExecutable(.{ .name = mod.ToolArtifact.name, .root_module = b.createModule(.{
         .root_source_file = b.path("src/tool.zig"),
         .target = b.graph.host,
         .optimize = .safe,

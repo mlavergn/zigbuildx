@@ -4,7 +4,7 @@ const log = std.log.scoped(.zigbuildx_swift);
 /// What `Swift.addDylib` compiles.
 pub const SwiftDylib = struct {
     const Self = @This();
-    /// The library's name: `afm` builds `libafm.dylib`, linked as `-lafm`.
+    /// The library's name: `shim` builds `libshim.dylib`, linked as `-lshim`.
     name: []const u8,
     /// The Swift sources, in `swiftc` argument order.
     sources: []const std.Build.LazyPath,
@@ -14,7 +14,9 @@ pub const SwiftDylib = struct {
     bridging_header: ?std.Build.LazyPath = null,
     /// The target: its architecture and macOS floor become `swiftc`'s `-target`.
     target: std.Build.ResolvedTarget,
+    /// The optimize mode, mapped to `swiftc`'s `-Onone`, `-Osize` or `-O`.
     optimize: std.lang.Optimize,
+    /// `swiftc`'s `-swift-version`, the language mode.
     swift_version: []const u8 = "6",
 };
 
@@ -27,21 +29,11 @@ pub const Swift = struct {
 
     /// Compiles `options.sources` into `lib<name>.dylib` and registers it as `lib<name>`.
     ///
-    /// The install name is `@rpath/lib<name>.dylib`: without one, linked binaries
-    /// record the dylib's cache path, which does not survive a cache clean. Every
-    /// source and the bridging header are file arguments, so editing any of them
-    /// — the header included — rebuilds the dylib, and `swiftc` finds them from
-    /// whatever directory the root build runs in.
-    ///
-    /// Registering the dylib as a named lazy path is what lets a package that
-    /// depends on this one find it through `Swift.fromDependency`.
-    ///
     /// Parameters:
     /// - `b`: the build graph.
     /// - `options`: what to compile.
     ///
-    /// Return: the dylib, or null when the target is not macOS or the host
-    /// cannot run `swiftc`.
+    /// Return: the dylib, or null when the target is not macOS or the host cannot run `swiftc`.
     pub fn addDylib(b: *std.Build, options: SwiftDylib) ?std.Build.LazyPath {
         const target = options.target.result;
         if (target.os.tag != .macos or b.graph.host.result.os.tag != .macos) return null;
@@ -59,30 +51,28 @@ pub const Swift = struct {
                 .small => "-Osize",
                 .safe, .fast => "-O",
             },
+            // Without an `@rpath` install name, linked binaries record the cache path, which a cache clean breaks.
             "-Xlinker",
             "-install_name",
             "-Xlinker",
             b.fmt("@rpath/{s}", .{file_name}),
         });
         swiftc.setName(b.fmt("swiftc {s}", .{file_name}));
+        // Every source and the header are file arguments, so an edit to any rebuilds the dylib,
+        // and `swiftc` finds them from whatever directory the root build runs in.
         if (options.bridging_header) |header| {
             swiftc.addArg("-import-objc-header");
-            swiftc.addFileArg(header);
+            swiftc.addFileArg2(header, .{});
         }
         swiftc.addArg("-o");
         const dylib = swiftc.addOutputFileArg2(file_name, .{});
-        for (options.sources) |source| swiftc.addFileArg(source);
+        for (options.sources) |source| swiftc.addFileArg2(source, .{});
+        // Lets a package that depends on this one find the dylib through `Swift.fromDependency`.
         b.addNamedLazyPath(b.fmt("lib{s}", .{options.name}), dylib);
         return dylib;
     }
 
     /// Links `module` against a dylib from `addDylib`, from the build cache and once installed.
-    ///
-    /// Two rpaths, because the binary runs from two places: the build cache under
-    /// `zig build test`, and the install prefix, where `addInstall` puts the dylib
-    /// beside `bin/`. The second is special, not a path: a path is normalized,
-    /// which collapses `@executable_path/..` into a bare `lib` relative to
-    /// wherever the binary is launched from.
     ///
     /// Parameters:
     /// - `module`: the module to link; mutated in place.
@@ -92,7 +82,11 @@ pub const Swift = struct {
         const path = dylib orelse return;
         module.addLibraryPath(path.dirname());
         module.linkSystemLibrary(name, .{});
+        // Two rpaths: the build cache under `zig build test`, and the install prefix, where
+        // `addInstall` puts the dylib beside `bin/`.
         module.addRPath(path.dirname());
+        // Special, not a path: normalizing collapses `@executable_path/..` into a bare `lib`
+        // relative to wherever the binary is launched from.
         module.addRPathSpecial("@executable_path/../lib");
     }
 
@@ -110,9 +104,6 @@ pub const Swift = struct {
 
     /// Returns the dylib a dependency built with `addDylib`.
     ///
-    /// For a consumer that installs its own executables, which must install the
-    /// dependency's dylib beside them.
-    ///
     /// Parameters:
     /// - `dep`: the dependency.
     /// - `name`: the library's name, as the dependency gave it to `addDylib`.
@@ -129,19 +120,17 @@ pub const Swift = struct {
 
     /// Returns `swiftc`'s `-target` for `target`: `<arch>-apple-macos<major>.<minor>`.
     ///
-    /// The version is the target's own macOS floor — `Xcode.standardTargetOptions`
-    /// sets it — so the Swift side and the Zig side state the same minimum.
-    ///
     /// Parameters:
     /// - `allocator`: owns the returned string.
     /// - `target`: a macOS target.
     ///
-    /// Return: the triple; allocation errors.
+    /// Return: the triple, owned by the caller; allocation errors.
     fn triple(allocator: std.mem.Allocator, target: std.Target) ![]u8 {
         const arch = switch (target.cpu.arch) {
             .aarch64 => "arm64",
             else => @tagName(target.cpu.arch),
         };
+        // The target's own floor (`Xcode.standardTargetOptions`), so Swift and Zig state the same minimum.
         const min = target.os.version_range.semver.min;
         return allocator.print("{s}-apple-macos{d}.{d}", .{ arch, min.major, min.minor });
     }

@@ -2,7 +2,8 @@
 #
 # Makefile — Zig Build Extensions
 #
-# `make validate` is the gate; `make` is the inner loop.
+# `make validate` is the gate; `make` is the inner loop. format, lint and
+# validate come from ../styleguide/Makefile.in.
 #
 ###############################################
 
@@ -11,34 +12,40 @@
 
 .DEFAULT_GOAL := all
 
+.PHONY: all validate build test cross tag clean
+
 # ---------------------------------------------
 # Configuration
 # ---------------------------------------------
 
-# The released version, read from build.zig.zon (the source of truth).
-VERSION := $(shell sed -n -E 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.zig.zon)
-
 # The Zig 0.17 compiler; `make ZIG=zig17 ...` where `zig` is another release.
 ZIG ?= zig
 
-.PHONY: all build test cross tag clean
+# The released version, read from build.zig.zon (the source of truth).
+VERSION := $(shell sed -n -E 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.zig.zon)
+
+# The release tag: `v` and the version, the form `zig build zigbuildx-pin` finds.
+TAG := v$(VERSION)
+
+# The hosts `cross` compiles for, beside this one.
+CROSS_TARGETS := x86_64-windows aarch64-windows x86_64-linux aarch64-linux
 
 # ---------------------------------------------
-# Primary workflows
+# Workflows
 # ---------------------------------------------
 
-# Format and test.
+# Format and test: the inner loop.
 all: format test
 	@echo "done"
 
-# Extend the canonical pre-commit gate with the cross-compile check.
+# The pre-commit gate: Makefile.in's clean, format, lint, build and test, then cross.
 validate: cross
 
 # ---------------------------------------------
 # Build & test
 # ---------------------------------------------
 
-# Build the library and host tool.
+# Build the library and the host tool.
 build:
 	$(ZIG) build
 
@@ -46,13 +53,11 @@ build:
 test:
 	$(ZIG) build test --summary all
 
-# Compile the suite and the host tool for the hosts this one cannot run.
+# Compile the suite and the host tool for CROSS_TARGETS, without running them.
 #
 # zigbuildx runs inside other projects' build runners, on whatever host they
 # build on. Its host-specific paths are runtime branches, so a Windows-only
-# mistake compiles fine on macOS until something instantiates it for Windows;
-# this does, without running anything.
-CROSS_TARGETS := x86_64-windows aarch64-windows x86_64-linux aarch64-linux
+# mistake compiles fine on macOS until something instantiates it for Windows.
 cross:
 	@mkdir -p zig-out/cross
 	@for t in $(CROSS_TARGETS); do \
@@ -65,12 +70,12 @@ cross:
 # Release
 # ---------------------------------------------
 
-# Tag the build.zig.zon version and push it.
+# Tag the build.zig.zon version as TAG, then push the branch and that tag.
 tag:
-	@test -n "$(VERSION)" || { echo "could not read .version from build.zig.zon"; exit 1; }
-	git tag -a "$(VERSION)" -m "$(VERSION)"
+	@test -n "$(VERSION)" || { echo "tag: cannot read .version from build.zig.zon"; exit 1; }
+	git tag -a "$(TAG)" -m "$(TAG)"
 	git push
-	git push --tags
+	git push origin "$(TAG)"
 
 # ---------------------------------------------
 # Housekeeping
@@ -78,5 +83,4 @@ tag:
 
 # Remove every build artifact.
 clean:
-	rm -rf .zig-cache
-	rm -rf zig-out
+	rm -rf .zig-cache zig-out
