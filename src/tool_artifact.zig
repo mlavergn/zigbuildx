@@ -6,7 +6,7 @@ const mod = @import("module.zig");
 /// `Tool` is the program, run by `Run` steps while the build runs; this is
 /// what a consumer's `build()` asks for it with, while the graph is declared.
 /// Since Zig 0.17 a step cannot run code of its own, so work that must happen
-/// while the build runs (listing worktrees, the breadcrumb, patching docs) is
+/// while the build runs (listing worktrees, pinning zigbuildx, patching docs) is
 /// done by the program, which also behaves the same on every host and needs
 /// no shell tools. It is built for the build host, never the target:
 /// zigbuildx's `build.zig` declares it, and a consumer's build compiles and

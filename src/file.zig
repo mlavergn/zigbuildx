@@ -55,20 +55,6 @@ pub const File = struct {
         };
     }
 
-    /// Deletes the file at `path` when there is one.
-    ///
-    /// Parameters:
-    /// - `io`: IO for the filesystem.
-    /// - `path`: the file.
-    ///
-    /// Return: nothing; IO errors other than "not found".
-    pub fn deleteIfPresent(io: std.Io, path: []const u8) !void {
-        std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-    }
-
     /// Creates the directory `path` goes in, and any missing above it.
     ///
     /// Parameters:
@@ -84,7 +70,7 @@ pub const File = struct {
 // -----------------------------------------------------------------------------
 // Unit Tests
 
-test "exists, readOptional and deleteIfPresent treat a missing file as an answer" {
+test "exists and readOptional treat a missing file as an answer" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -97,7 +83,6 @@ test "exists, readOptional and deleteIfPresent treat a missing file as an answer
     try std.testing.expect(!try File.exists(io, path));
     try std.testing.expectEqual(null, try File.readOptional(allocator, io, path, .limited(64)));
     try std.testing.expectEqual(null, try File.readOptionalZ(allocator, io, path, .limited(64)));
-    try File.deleteIfPresent(io, path);
 
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "hello" });
     try std.testing.expect(try File.exists(io, path));
@@ -106,9 +91,6 @@ test "exists, readOptional and deleteIfPresent treat a missing file as an answer
     try std.testing.expectEqualStrings("hello", terminated);
     try std.testing.expectEqual(0, terminated[terminated.len]);
     try std.testing.expectError(error.StreamTooLong, File.readOptional(allocator, io, path, .limited(2)));
-
-    try File.deleteIfPresent(io, path);
-    try std.testing.expect(!try File.exists(io, path));
 }
 
 test "createParentDir creates every missing directory above a path" {

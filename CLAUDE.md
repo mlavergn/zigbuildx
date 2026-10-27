@@ -64,7 +64,7 @@ zig fetch --save=zigbuildx ../zigbuildx   # from the scratch package
 build.zig              the public surface: re-exports Deps, Git, Xcode, Swift,
                        Android, AndroidAbi and Docs; installs the host tool
 src/module.zig         the barrel the tests compile
-src/deps.zig           Deps (clone, sync, update, guard, pin) and its private Sync
+src/deps.zig           Deps (clone, sync, update, pin) and its private Sync
 src/git.zig            Git: one thin wrapper per git command
 src/xcode.zig          Xcode: Apple SDKs, the macOS floor, frameworks, xcframeworks
 src/swift.zig          Swift: swiftc dylibs
@@ -118,8 +118,9 @@ additions to ZIGSTYLE:
   it tracks changed (`-D` options, build scripts, manifests, `b.dependOn*`
   paths). Declare anything else: `b.dependOnFileMetadata` and friends where
   a path captures it, else `b.graph.poisonCache()`. `Xcode.resolveFor`
-  tracks `SDKSettings.json`; `Deps` tracks `.zig-cache/zigbuildx/`;
-  `Android.resolve`, `Deps.sync` with worktrees, and `-Dupdate` poison.
+  tracks `SDKSettings.json`; `Android.resolve` and `Deps.sync` with
+  worktrees poison. Upstream is not tracked: `Deps` updates only when
+  `build()` runs for some other reason.
 - **Work at build time goes in the host tool.** A Zig 0.17 step cannot run
   code of its own, and cache and install paths exist only when steps run.
   `src/tool.zig` is one program, `zigbuildx <command>`; each command is a
@@ -165,16 +166,25 @@ additions to ZIGSTYLE:
   is removed when clean, else kept and listed. The return type is `noreturn`
   while a `deps/` package is missing, so a transitive top-level `@import` can
   wait; a worktree dependency must have a `build.zig`.
-- **`-Dupdate`:** fetches and fast-forwards siblings (skipping, with a
-  warning, any that is dirty or ahead; never failing the build) and, under
-  `sync`, branch worktrees (one it must skip fails the build). Anything moved
-  exits 1.
-- **`Deps.guard`:** called last. It makes the default step wait for
-  `deps-mark clear`, which runs after every `Compile` the default step
-  reaches, while `deps-mark set` runs unordered. A compile error therefore
-  leaves `<root>/.zig-cache/zigbuildx/update`, a configure input, and the
-  next build updates as `-Dupdate` would and deletes it. Steps outside the
-  default step, and compile errors in `build.zig`, are not covered.
+- **The update:** whenever `build()` runs, `Deps` fast-forwards siblings
+  and, under `sync`, `.branch` worktrees. Everything that rules one out is
+  checked first and locally (not a checkout, detached, on another branch
+  than its `.branch`, no upstream, dirty, or ahead of the tip as last
+  fetched), so a skipped checkout never reaches the network. The rest are
+  fetched at once (`Sync.fetchAll`: every `git fetch` child is started
+  before any is waited for; a build runner is single-threaded, so a
+  `std.Io.Group` would run them one by one). `.sha` and
+  `.tag` worktrees and archives are never fetched. A skip or a failed fetch
+  warns and never fails the build; anything moved exits 1.
+- **Sibling `.branch`:** a `../x` may follow a branch: cloned on it
+  (`git clone --branch`), and fast-forwarded to `origin/<branch>`. `.sha`
+  and `.tag` there are refused. Two manifests naming different branches for
+  one sibling: the first found (root first) wins, with a warning.
+- **Empty checkouts (`Sync.repair`):** a sibling path that exists with
+  neither `build.zig.zon` nor `build.zig` is filled in only when it holds
+  nothing but `.git` and has no commits (an interrupted clone): `.branch`
+  or the remote's HEAD (`ls-remote --symref`) is fetched and checked out,
+  tracking. Anything else without a manifest is refused, never touched.
 - **`zigbuildx-pin` (`Deps.pin`, `make buildxpin` in `Makefile.in`):**
   declared by `cloneMissing` and `sync`. It reads this zigbuildx's `.url`
   (named by `ToolArtifact.dependencyName`) and runs `zig fetch` in the root,
@@ -241,9 +251,10 @@ additions to ZIGSTYLE:
   Before the push, `zig fetch .` here puts the same hash in the global cache
   for local builds. Consumers pin a tag with its commit (`?ref=v4.1.0#<commit>`),
   so a release that rewrites history breaks their URLs.
-- **Compatibility:** 4.1.0 needs no consumer change, though an iOS, tvOS,
-  visionOS or watchOS target must call `xcode.configure(lib)`. 4.0.0 removed
-  `Pkg` and `Apk`.
+- **Compatibility:** 5.0.0 removed `-Dupdate`, `Deps.guard`, `Deps.mark`
+  and `deps-mark`; the update runs on every configure. 4.1.0 needs no
+  consumer change, though an iOS, tvOS, visionOS or watchOS target must call
+  `xcode.configure(lib)`. 4.0.0 removed `Pkg` and `Apk`.
 
 ### Workarounds
 
@@ -280,6 +291,7 @@ reaches `std.debug.print` does not compile for Apple's other platforms.
   (push and shell) on `std.Io.net`, plus RSA signing of the auth token with
   `~/.android/adbkey` (`std.crypto.ff`; std can only verify RSA). Open: a
   test device, a missing key, and whether it belongs in its own package.
-- **Rejected:** sibling pins (`.sha`/`.tag`/`.branch` on a `../x`) as
-  checks; and a `--fork` per sibling, since Zig reads `--fork` only from the
-  command line and matches only hashed packages.
+- **Rejected:** sibling pins (`.sha`/`.tag` on a `../x`) as checks
+  (`.branch` is followed, not checked); and a `--fork` per sibling, since
+  Zig reads `--fork` only from the command line and matches only hashed
+  packages.

@@ -17,17 +17,21 @@ pub const WorktreeHead = union(enum) {
 pub const Git = struct {
     const Self = @This();
 
-    /// Clones the repository at `url` into `dest`.
+    /// Clones the repository at `url` into `dest`, on `branch` or the remote's default.
     ///
     /// Parameters:
     /// - `io`: IO the `git` child is spawned on.
     /// - `url`: the repository to clone.
     /// - `dest`: the directory to clone into.
+    /// - `branch`: the branch to check out; null for the remote's HEAD.
     ///
     /// Return: nothing; `error.GitCloneFailed` when `git` fails, or spawn errors.
-    pub fn clone(io: std.Io, url: []const u8, dest: []const u8) !void {
+    pub fn clone(io: std.Io, url: []const u8, dest: []const u8, branch: ?[]const u8) !void {
         // `--` ends the options, so a URL from a manifest cannot pass as one (`--upload-pack=...`).
-        var child = std.process.spawn(io, .{ .argv = &.{ "git", "clone", "--quiet", "--", url, dest } }) catch |err| {
+        const default_argv = [_][]const u8{ "git", "clone", "--quiet", "--", url, dest };
+        const branch_argv = [_][]const u8{ "git", "clone", "--quiet", "--branch", branch orelse "", "--", url, dest };
+        const argv: []const []const u8 = if (branch != null) &branch_argv else &default_argv;
+        var child = std.process.spawn(io, .{ .argv = argv }) catch |err| {
             log.err("cannot run git [{any}]", .{err});
             return err;
         };
@@ -55,6 +59,52 @@ pub const Git = struct {
         // `--force`: without it a tag moved upstream makes `--tags` exit 1 ("would clobber existing tag").
         // The checkout's tag then follows upstream; a worktree pinned to it keeps its stamped commit.
         try Self.runVoid(allocator, io, repo, &.{ "fetch", "--tags", "--force", "--quiet" });
+    }
+
+    /// Starts the fetch `fetch` runs without waiting for it, so several can overlap.
+    ///
+    /// Parameters:
+    /// - `io`: IO the `git` child is spawned on.
+    /// - `repo`: the checkout to fetch into.
+    ///
+    /// Return: the running child, for `finishFetch`; spawn errors.
+    pub fn startFetch(io: std.Io, repo: []const u8) !std.process.Child {
+        // The arguments `fetch` passes; git's own errors reach stderr, as `clone`'s do.
+        return std.process.spawn(io, .{ .argv = &.{ "git", "-C", repo, "fetch", "--tags", "--force", "--quiet" }, .stdin = .ignore, .stdout = .ignore });
+    }
+
+    /// Waits for a child that `startFetch` began.
+    ///
+    /// Parameters:
+    /// - `io`: IO the child was spawned on.
+    /// - `child`: the running child.
+    ///
+    /// Return: `true` when the fetch succeeded.
+    pub fn finishFetch(io: std.Io, child: *std.process.Child) bool {
+        const term = child.wait(io) catch return false;
+        return switch (term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+    }
+
+    /// Names the branch the `origin` remote's HEAD points at, asking the remote.
+    ///
+    /// Parameters:
+    /// - `allocator`: allocator for the returned name.
+    /// - `io`: IO the `git` child is spawned on.
+    /// - `repo`: a checkout with an `origin` remote.
+    ///
+    /// Return: the branch without `refs/heads/`, owned by the caller; `null` when the remote has no commits; `error.GitFailed` or spawn errors.
+    pub fn remoteHead(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !?[]u8 {
+        // An empty remote lists nothing and exits 0; otherwise the first line is `ref: refs/heads/<b>\tHEAD`.
+        const out = try Self.run(allocator, io, repo, &.{ "ls-remote", "--symref", "origin", "HEAD" });
+        defer allocator.free(out);
+        const prefix = "ref: refs/heads/";
+        if (!std.mem.startsWith(u8, out, prefix)) return null;
+        const rest = out[prefix.len..];
+        const end = std.mem.findScalar(u8, rest, '\t') orelse return null;
+        return try allocator.dupe(u8, rest[0..end]);
     }
 
     /// Resolves `rev` to the full SHA of the commit it names.
@@ -171,6 +221,21 @@ pub const Git = struct {
         } else {
             try Self.runVoid(allocator, io, repo, &.{ "checkout", "--quiet", name });
         }
+    }
+
+    /// Creates branch `name` at `origin/<name>`, tracking it, and checks it out.
+    ///
+    /// Parameters:
+    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `io`: IO the `git` child is spawned on.
+    /// - `repo`: the checkout; `origin/<name>` must have been fetched.
+    /// - `name`: the branch.
+    ///
+    /// Return: nothing; `error.GitFailed` when `git` fails, or spawn errors.
+    pub fn checkoutTracking(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, name: []const u8) !void {
+        const start = try allocator.print("refs/remotes/origin/{s}", .{name});
+        defer allocator.free(start);
+        try Self.runVoid(allocator, io, repo, &.{ "checkout", "--quiet", "--track", "-b", name, start });
     }
 
     /// Fast-forwards the checked-out branch to `commit`; git refuses anything but a fast-forward.
@@ -447,8 +512,70 @@ test "clone copies a repository" {
     defer allocator.free(origin);
     const dest = try repo.path("clone");
     defer allocator.free(dest);
-    try Git.clone(io, origin, dest);
+    try Git.clone(io, origin, dest, null);
     try repo.tmp.dir.access(io, "clone/.git", .{});
+}
+
+test "clone checks out the branch asked for" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TestRepo.init(allocator, io);
+    defer repo.deinit();
+    const origin = try repo.path("origin");
+    defer allocator.free(origin);
+    try repo.git(&.{ "git", "-C", origin, "branch", "dev" });
+    const dest = try repo.path("clone");
+    defer allocator.free(dest);
+    try Git.clone(io, origin, dest, "dev");
+    const branch = (try Git.currentBranch(allocator, io, dest)).?;
+    defer allocator.free(branch);
+    try std.testing.expectEqualStrings("dev", branch);
+}
+
+test "remoteHead names the remote's default branch, and null for an empty remote" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TestRepo.init(allocator, io);
+    defer repo.deinit();
+    const origin = try repo.path("origin");
+    defer allocator.free(origin);
+    const dest = try repo.path("clone");
+    defer allocator.free(dest);
+    try Git.clone(io, origin, dest, null);
+    const head = (try Git.remoteHead(allocator, io, dest)).?;
+    defer allocator.free(head);
+    try std.testing.expectEqualStrings("main", head);
+
+    const empty = try repo.path("empty");
+    defer allocator.free(empty);
+    try repo.git(&.{ "git", "init", "--quiet", "--bare", empty });
+    const local = try repo.path("local");
+    defer allocator.free(local);
+    try repo.git(&.{ "git", "init", "--quiet", local });
+    try repo.git(&.{ "git", "-C", local, "remote", "add", "origin", empty });
+    try std.testing.expectEqual(null, try Git.remoteHead(allocator, io, local));
+}
+
+test "checkoutTracking puts a repository with no commits on a fetched branch" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TestRepo.init(allocator, io);
+    defer repo.deinit();
+    const origin = try repo.path("origin");
+    defer allocator.free(origin);
+    const local = try repo.path("local");
+    defer allocator.free(local);
+    try repo.git(&.{ "git", "init", "--quiet", "--initial-branch=main", local });
+    try repo.git(&.{ "git", "-C", local, "remote", "add", "origin", origin });
+    var child = try Git.startFetch(io, local);
+    try std.testing.expect(Git.finishFetch(io, &child));
+    try Git.checkoutTracking(allocator, io, local, "main");
+    try repo.tmp.dir.access(io, "local/one", .{});
+    const tip = (try Git.upstream(allocator, io, local)).?;
+    defer allocator.free(tip);
+    const want = (try Git.revParse(allocator, io, origin, "main")).?;
+    defer allocator.free(want);
+    try std.testing.expectEqualStrings(want, tip);
 }
 
 test "revParse resolves tags and branches and reports a missing revision" {
@@ -476,7 +603,7 @@ test "fetch brings a new tag into a clone" {
     defer allocator.free(origin);
     const checkout = try repo.path("checkout");
     defer allocator.free(checkout);
-    try Git.clone(io, origin, checkout);
+    try Git.clone(io, origin, checkout, null);
     try repo.commit("origin", "two");
     try repo.git(&.{ "git", "-C", origin, "tag", "v2" });
     try std.testing.expectEqual(null, try Git.revParse(allocator, io, checkout, "refs/tags/v2"));
@@ -494,7 +621,7 @@ test "fetch accepts a tag moved upstream" {
     defer allocator.free(origin);
     const checkout = try repo.path("checkout");
     defer allocator.free(checkout);
-    try Git.clone(io, origin, checkout);
+    try Git.clone(io, origin, checkout, null);
     try repo.commit("origin", "two");
     try repo.git(&.{ "git", "-C", origin, "tag", "--force", "v1" });
     try Git.fetch(allocator, io, checkout);
@@ -514,7 +641,7 @@ test "currentBranch and upstream follow a clone's branch and report a detached H
     defer allocator.free(origin);
     const checkout = try repo.path("checkout");
     defer allocator.free(checkout);
-    try Git.clone(io, origin, checkout);
+    try Git.clone(io, origin, checkout, null);
 
     // A clone's branch tracks origin's; origin's own branch tracks nothing.
     const branch = (try Git.currentBranch(allocator, io, checkout)).?;
