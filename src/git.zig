@@ -17,20 +17,21 @@ pub const WorktreeHead = union(enum) {
 pub const Git = struct {
     const Self = @This();
 
-    /// Clones the repository at `url` into `dest`, on `branch` or the remote's default.
+    /// Clones the repository at `url` into `dest`, at `ref` or the remote's default branch.
     ///
     /// Parameters:
     /// - `io`: IO the `git` child is spawned on.
     /// - `url`: the repository to clone.
     /// - `dest`: the directory to clone into.
-    /// - `branch`: the branch to check out; null for the remote's HEAD.
+    /// - `ref`: the branch, or the tag (HEAD then detached), to check out; null for the remote's HEAD.
     ///
     /// Return: nothing; `error.GitCloneFailed` when `git` fails, or spawn errors.
-    pub fn clone(io: std.Io, url: []const u8, dest: []const u8, branch: ?[]const u8) !void {
+    pub fn clone(io: std.Io, url: []const u8, dest: []const u8, ref: ?[]const u8) !void {
         // `--` ends the options, so a URL from a manifest cannot pass as one (`--upload-pack=...`).
+        // A tag detaches HEAD, and `--quiet` does not silence git's advice about that.
         const default_argv = [_][]const u8{ "git", "clone", "--quiet", "--", url, dest };
-        const branch_argv = [_][]const u8{ "git", "clone", "--quiet", "--branch", branch orelse "", "--", url, dest };
-        const argv: []const []const u8 = if (branch != null) &branch_argv else &default_argv;
+        const ref_argv = [_][]const u8{ "git", "-c", "advice.detachedHead=false", "clone", "--quiet", "--branch", ref orelse "", "--", url, dest };
+        const argv: []const []const u8 = if (ref != null) &ref_argv else &default_argv;
         var child = std.process.spawn(io, .{ .argv = argv }) catch |err| {
             log.err("cannot run git [{any}]", .{err});
             return err;
@@ -282,6 +283,22 @@ pub const Git = struct {
         return !std.mem.eql(u8, out, "0");
     }
 
+    /// Reports whether `ancestor` is reachable from `descendant`, so moving `ancestor`'s branch there loses nothing.
+    ///
+    /// Parameters:
+    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `io`: IO the `git` child is spawned on.
+    /// - `repo`: the checkout to inspect.
+    /// - `ancestor`: a revision, e.g. `refs/heads/<branch>`.
+    /// - `descendant`: a revision, e.g. a fetched commit.
+    ///
+    /// Return: `true` when it is an ancestor or the same commit; `error.GitFailed` when `git` fails, or spawn errors.
+    pub fn isAncestor(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, ancestor: []const u8, descendant: []const u8) !bool {
+        const out = try Self.runOptional(allocator, io, repo, &.{ "merge-base", "--is-ancestor", ancestor, descendant }) orelse return false;
+        allocator.free(out);
+        return true;
+    }
+
     /// Reports whether local branch `name` exists.
     ///
     /// Parameters:
@@ -516,7 +533,7 @@ test "clone copies a repository" {
     try repo.tmp.dir.access(io, "clone/.git", .{});
 }
 
-test "clone checks out the branch asked for" {
+test "clone checks out the branch or tag asked for" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var repo = try TestRepo.init(allocator, io);
@@ -530,6 +547,12 @@ test "clone checks out the branch asked for" {
     const branch = (try Git.currentBranch(allocator, io, dest)).?;
     defer allocator.free(branch);
     try std.testing.expectEqualStrings("dev", branch);
+
+    // A tag leaves HEAD detached there.
+    const tagged = try repo.path("tagged");
+    defer allocator.free(tagged);
+    try Git.clone(io, origin, tagged, "v1");
+    try std.testing.expectEqual(null, try Git.currentBranch(allocator, io, tagged));
 }
 
 test "remoteHead names the remote's default branch, and null for an empty remote" {
@@ -691,6 +714,10 @@ test "worktrees: add, inspect, move, remove" {
     const moved = (try Git.revParse(allocator, io, branched, "HEAD")).?;
     defer allocator.free(moved);
     try std.testing.expectEqualStrings(two, moved);
+
+    // The first commit is an ancestor of the second, not the reverse.
+    try std.testing.expect(try Git.isAncestor(allocator, io, origin, one, two));
+    try std.testing.expect(!try Git.isAncestor(allocator, io, origin, two, one));
 
     // A dirty worktree is not clean.
     try repo.tmp.dir.writeFile(io, .{ .sub_path = "branched/scratch", .data = "x" });

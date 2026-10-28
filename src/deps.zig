@@ -221,10 +221,31 @@ const Sibling = struct {
     const Self = @This();
     /// The checkout's absolute path.
     dir: []const u8,
-    /// The branch it follows (`.branch`); null for whatever branch it is on.
-    branch: ?[]const u8,
+    /// The branch it follows (`.branch`) or the tag it is held at (`.tag`); null for none.
+    ref: ?Pin,
     /// The package whose manifest declared it first.
     declared_by: []const u8,
+};
+
+/// Where CI mode puts a sibling checkout.
+const SiblingTarget = struct {
+    const Self = @This();
+    /// The sibling.
+    sibling: Sibling,
+    /// The ref it is brought to: its own, or the remote's default branch.
+    ref: Pin,
+    /// The revision checked out once fetched: `refs/tags/<tag>` or `refs/remotes/origin/<branch>`.
+    rev: []const u8,
+    /// Whether the checkout is fetched first.
+    fetch: bool,
+};
+
+/// How `Deps` treats sibling checkouts.
+const Mode = enum {
+    /// The developer's checkouts: fast-forwarded when clean, otherwise left alone.
+    develop,
+    /// A CI build: each sibling is brought to the ref its manifest declares, or the build fails.
+    ci,
 };
 
 /// Where a pin resolves to in a checkout.
@@ -260,6 +281,8 @@ const Sync = struct {
     root: []const u8,
     /// The root package's `.name`.
     consumer: []const u8 = "",
+    /// How siblings are updated: fast-forwarded (`develop`) or brought to their refs (`ci`).
+    mode: Mode = .develop,
     /// Every worktree dependency, the root's first.
     worktrees: std.ArrayList(Worktree) = .empty,
     /// Unpinned paths under a `deps` directory: used as is, and never orphans.
@@ -343,12 +366,12 @@ const Sync = struct {
             const resolved = try std.Io.Dir.path.resolveAlloc(self.allocator, &.{ dir, path });
             const pinnable = self.isWorktreePath(resolved);
             if (pin) |outside| if (!pinnable) {
-                // A sibling may follow a branch; only a worktree can be frozen at a SHA or tag.
-                if (outside.follows()) {
-                    try self.addSibling(resolved, source, outside.value, manifest.name);
+                // A sibling may follow a branch or sit at a tag; only a worktree can be frozen at a SHA.
+                if (outside.kind != .sha) {
+                    try self.addSibling(resolved, source, outside, manifest.name);
                     continue;
                 }
-                if (is_root) return self.fail("{s} pins {s} to a {t}, but a .sha or .tag dependency's .path must be under deps/", .{ manifest.name, entry.name, outside.kind });
+                if (is_root) return self.fail("{s} pins {s} to a {t}, but a .sha dependency's .path must be under deps/", .{ manifest.name, entry.name, outside.kind });
                 continue;
             };
             const rel = try self.relativeToRoot(resolved);
@@ -400,12 +423,84 @@ const Sync = struct {
         var count: usize = 0;
         inline for (.{ "sha", "tag", "branch" }) |field| {
             if (@field(entry, field)) |value| {
+                // A value git could read as an option (`-f`, `--orphan`) is no ref name git accepts either.
+                if (value.len == 0 or value[0] == '-') return self.fail("{s}: {s} has an invalid .{s}: \"{s}\"", .{ package, entry.name, field, value });
                 pin = .{ .kind = @field(PinKind, field), .value = value };
                 count += 1;
             }
         }
         if (count > 1) return self.fail("{s}: {s} sets more than one of .sha, .tag and .branch", .{ package, entry.name });
         return pin;
+    }
+
+    /// Reads the ref a sibling is cloned at: its `.branch` or `.tag`.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    /// - `package`: the declaring package, for the message.
+    /// - `entry`: the dependency.
+    ///
+    /// Return: the ref, or `null` for none or a `.sha`; `error.DepsFailed` when it sets more than one pin.
+    fn siblingRef(self: *Self, package: []const u8, entry: Entry) !?Pin {
+        const pin = try self.pinOf(package, entry) orelse return null;
+        // Only a worktree is frozen at a SHA.
+        return if (pin.kind == .sha) null else pin;
+    }
+
+    /// Names a sibling's ref for messages.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    /// - `ref`: the ref, or null for none.
+    ///
+    /// Return: `branch <b>`, `tag <t>`, or what no ref means in this mode; allocation errors.
+    fn describeRef(self: *const Self, ref: ?Pin) ![]const u8 {
+        const pin = ref orelse return switch (self.mode) {
+            .develop => "its current branch",
+            .ci => "the remote's default branch",
+        };
+        return self.allocator.print("{t} {s}", .{ pin.kind, pin.value });
+    }
+
+    /// Names a tag's ref.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    /// - `tag`: the tag.
+    ///
+    /// Return: `refs/tags/<tag>`; allocation errors.
+    fn tagRef(self: *const Self, tag: []const u8) ![]const u8 {
+        return self.allocator.print("refs/tags/{s}", .{tag});
+    }
+
+    /// Names a branch's ref on the `origin` remote, as last fetched.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    /// - `branch`: the branch.
+    ///
+    /// Return: `refs/remotes/origin/<branch>`; allocation errors.
+    fn originRef(self: *const Self, branch: []const u8) ![]const u8 {
+        return self.allocator.print("refs/remotes/origin/{s}", .{branch});
+    }
+
+    /// Reports whether a sibling is a git checkout of its own, which an update or CI mode may move.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    /// - `dir`: the sibling's absolute path.
+    /// - `action`: what is skipped, for the message (`"updating"`, `"checking"`).
+    ///
+    /// Return: `false` for an archive or a directory with no `.git`; IO errors.
+    fn isOwnCheckout(self: *const Self, dir: []const u8, action: []const u8) !bool {
+        // An archive's URL is its pin: `ensureArchive` has already brought it in line.
+        if (Self.containsPath(self.archives.items, dir)) return false;
+        // A directory inside some other repository is not its own checkout: leave that repository alone.
+        if (!try mod.File.exists(self.io, try std.Io.Dir.path.join(self.allocator, &.{ dir, ".git" }))) {
+            log.info("not {s} {s}: it is not a git checkout", .{ action, try self.relativeToRoot(dir) });
+            return false;
+        }
+        return true;
     }
 
     /// Reads where an entry is fetched from when it is absent.
@@ -491,20 +586,20 @@ const Sync = struct {
     /// - `self`: the run.
     /// - `path`: the dependency's absolute path.
     /// - `source`: where it comes from.
-    /// - `branch`: the branch a clone checks out; null for the remote's default.
+    /// - `ref`: the branch or tag a clone checks out; null for the remote's default branch.
     ///
     /// Return: nothing; `error.DepsFailed` for an archive or a directory that is no package, or clone errors, which `Git.clone` logs.
-    fn materialize(self: *Self, path: []const u8, source: Source, branch: ?[]const u8) !void {
+    fn materialize(self: *Self, path: []const u8, source: Source, ref: ?Pin) !void {
         switch (source) {
             .clone => |url| {
                 if (!try mod.File.exists(self.io, path)) {
-                    try mod.Git.clone(self.io, url, path, branch);
+                    try mod.Git.clone(self.io, url, path, if (ref) |pin| pin.value else null);
                     self.changed = true;
                     return;
                 }
                 // The steady state: a stat or two, no git.
                 if (try self.isPackage(path)) return;
-                try self.repair(path, url, branch);
+                try self.repair(path, url, ref);
             },
             // Also unpacked again when its URL changed.
             .archive => |url| try self.ensureArchive(path, url),
@@ -531,20 +626,30 @@ const Sync = struct {
     /// - `self`: the run.
     /// - `path`: the dependency's absolute path; it exists and holds no package.
     /// - `url`: its `.clone`, for messages.
-    /// - `branch`: the branch to check out; null for the remote's default.
+    /// - `ref`: the branch or tag to check out; null for the remote's default branch.
     ///
     /// Return: nothing; `error.DepsFailed` when it holds anything of its own or the remote has nothing to check out, or IO and git errors.
-    fn repair(self: *Self, path: []const u8, url: []const u8, branch: ?[]const u8) !void {
+    fn repair(self: *Self, path: []const u8, url: []const u8, ref: ?Pin) !void {
         const rel = try self.relativeToRoot(path);
         // Only an empty repository is filled in: anything else may be someone's work.
         if (!try self.holdsOnlyGit(path) or try mod.Git.revParse(self.allocator, self.io, path, "HEAD") != null) {
             return self.fail("{s} exists but is not a Zig package (no build.zig.zon); move it aside and re-run", .{rel});
         }
-        const wanted = branch orelse try mod.Git.remoteHead(self.allocator, self.io, path) orelse {
+        if (ref) |pin| if (pin.kind == .tag) {
+            try mod.Git.fetch(self.allocator, self.io, path);
+            const sha = try mod.Git.revParse(self.allocator, self.io, path, try self.tagRef(pin.value)) orelse {
+                return self.fail("{s} is an empty checkout and {s} has no tag {s}", .{ rel, url, pin.value });
+            };
+            try mod.Git.checkoutDetached(self.allocator, self.io, path, sha);
+            log.info("filled in the empty checkout {s} from {s} (tag {s})", .{ rel, url, pin.value });
+            self.changed = true;
+            return;
+        };
+        const wanted = (if (ref) |pin| pin.value else null) orelse try mod.Git.remoteHead(self.allocator, self.io, path) orelse {
             return self.fail("{s} is an empty checkout and {s} has no commits yet; push, then re-run", .{ rel, url });
         };
         try mod.Git.fetch(self.allocator, self.io, path);
-        if (try mod.Git.revParse(self.allocator, self.io, path, try self.allocator.print("refs/remotes/origin/{s}", .{wanted})) == null) {
+        if (try mod.Git.revParse(self.allocator, self.io, path, try self.originRef(wanted)) == null) {
             return self.fail("{s} is an empty checkout and {s} has no branch {s}", .{ rel, url, wanted });
         }
         try mod.Git.checkoutTracking(self.allocator, self.io, path, wanted);
@@ -602,23 +707,23 @@ const Sync = struct {
     /// - `self`: the run.
     /// - `path`: the dependency's absolute path.
     /// - `source`: where it comes from, if anywhere.
-    /// - `branch`: the branch it follows (`.branch`), or null.
+    /// - `ref`: the branch it follows (`.branch`) or the tag it sits at (`.tag`), or null.
     /// - `declared_by`: the package whose manifest names it.
     ///
     /// Return: nothing; `error.DepsFailed` for an archive, or clone errors, which `Git.clone` logs.
-    fn addSibling(self: *Self, path: []const u8, source: ?Source, branch: ?[]const u8, declared_by: []const u8) !void {
+    fn addSibling(self: *Self, path: []const u8, source: ?Source, ref: ?Pin, declared_by: []const u8) !void {
         // Each path is queued once, so a cycle of siblings ends; the first declaration wins.
         if (self.findSibling(path)) |first| {
-            // A later declaration that names no branch has nothing to disagree with.
-            if (branch) |want| {
-                const agrees = if (first.branch) |had| std.mem.eql(u8, had, want) else false;
-                if (!agrees) log.warn("{s} wants {s} on branch {s}; using {s}'s {s}", .{ declared_by, try self.relativeToRoot(path), want, first.declared_by, first.branch orelse "current branch" });
+            // A later declaration that names no ref has nothing to disagree with.
+            if (ref) |want| {
+                const agrees = if (first.ref) |had| had.satisfies(want) else false;
+                if (!agrees) log.warn("{s} wants {s} at {t} {s}; {s}'s declaration wins ({s})", .{ declared_by, try self.relativeToRoot(path), want.kind, want.value, first.declared_by, try self.describeRef(first.ref) });
             }
             return;
         }
-        try self.siblings.append(self.allocator, .{ .dir = path, .branch = branch, .declared_by = declared_by });
+        try self.siblings.append(self.allocator, .{ .dir = path, .ref = ref, .declared_by = declared_by });
         // An absent one with no `source` is left for Zig to report.
-        try self.materialize(path, source orelse return, branch);
+        try self.materialize(path, source orelse return, ref);
     }
 
     /// Finds the sibling queued at `dir`.
@@ -649,13 +754,12 @@ const Sync = struct {
             const manifest = try self.readManifest(dir) orelse continue;
             for (manifest.entries) |entry| {
                 const path = entry.path orelse continue;
-                // Only a worktree is frozen at a SHA or tag, and that one is the sibling's own.
-                if (entry.sha != null or entry.tag != null) continue;
                 const resolved = try std.Io.Dir.path.resolveAlloc(self.allocator, &.{ dir, path });
                 if (self.isWorktreePath(resolved)) continue;
-                // A branch pin under the sibling's own `deps/` is its worktree, not a sibling.
-                if (entry.branch != null and std.mem.eql(u8, std.Io.Dir.path.basename(std.Io.Dir.path.dirname(resolved) orelse ""), "deps")) continue;
-                try self.addSibling(resolved, try self.sourceOf(manifest.name, entry), entry.branch, manifest.name);
+                const pin = try self.pinOf(manifest.name, entry);
+                // Only a worktree is frozen at a SHA, and a pin under the sibling's own `deps/` is its worktree, not a sibling.
+                if (pin) |pinned| if (pinned.kind == .sha or std.mem.eql(u8, std.Io.Dir.path.basename(std.Io.Dir.path.dirname(resolved) orelse ""), "deps")) continue;
+                try self.addSibling(resolved, try self.sourceOf(manifest.name, entry), pin, manifest.name);
             }
         }
     }
@@ -673,7 +777,7 @@ const Sync = struct {
         // Every `.path` is cloned whatever it pins; no worktree is made.
         for (manifest.entries) |entry| {
             const path = entry.path orelse continue;
-            try self.addSibling(try std.Io.Dir.path.resolveAlloc(self.allocator, &.{ self.root, path }), try self.sourceOf(manifest.name, entry), entry.branch, manifest.name);
+            try self.addSibling(try std.Io.Dir.path.resolveAlloc(self.allocator, &.{ self.root, path }), try self.sourceOf(manifest.name, entry), try self.siblingRef(manifest.name, entry), manifest.name);
         }
         try self.followSiblings();
     }
@@ -721,24 +825,26 @@ const Sync = struct {
     /// Return: the revision to fast-forward to (`@{u}` or `refs/remotes/origin/<branch>`), or `null` when it is left alone; IO errors.
     fn siblingTip(self: *Self, sibling: Sibling) !?[]const u8 {
         const dir = sibling.dir;
-        // An archive's URL is its pin: `ensureArchive` has already brought it in line.
-        if (Self.containsPath(self.archives.items, dir)) return null;
+        if (!try self.isOwnCheckout(dir, "updating")) return null;
         const rel = try self.relativeToRoot(dir);
-        // A directory inside some other repository is not its own checkout: leave that repository alone.
-        if (!try mod.File.exists(self.io, try std.Io.Dir.path.join(self.allocator, &.{ dir, ".git" }))) {
-            log.info("not updating {s}: it is not a git checkout", .{rel});
+        if (sibling.ref) |ref| if (ref.kind == .tag) {
+            // A tag is never fetched or moved; a sibling that left it is the developer's choice, but worth a word.
+            const tag = mod.Git.revParse(self.allocator, self.io, dir, try self.tagRef(ref.value)) catch null;
+            const head = mod.Git.revParse(self.allocator, self.io, dir, "HEAD") catch null;
+            const at_tag = tag != null and head != null and std.mem.eql(u8, tag.?, head.?);
+            if (!at_tag) log.warn("{s} is not at tag {s}, which {s} wants; left as it is", .{ rel, ref.value, sibling.declared_by });
             return null;
-        }
+        };
         const current = (mod.Git.currentBranch(self.allocator, self.io, dir) catch return null) orelse {
             log.info("not updating {s}: HEAD is detached", .{rel});
             return null;
         };
-        const tip_ref = if (sibling.branch) |wanted| blk: {
-            if (!std.mem.eql(u8, current, wanted)) {
-                log.warn("not updating {s}: it is on {s}, and {s} wants {s}", .{ rel, current, sibling.declared_by, wanted });
+        const tip_ref = if (sibling.ref) |wanted| blk: {
+            if (!std.mem.eql(u8, current, wanted.value)) {
+                log.warn("not updating {s}: it is on {s}, and {s} wants {s}", .{ rel, current, sibling.declared_by, wanted.value });
                 return null;
             }
-            break :blk try self.allocator.print("refs/remotes/origin/{s}", .{wanted});
+            break :blk try self.originRef(wanted.value);
         } else "@{u}";
         // Compared with the tip as last fetched: commits of its own are local, whatever upstream did since.
         const base = (mod.Git.revParse(self.allocator, self.io, dir, tip_ref) catch null) orelse {
@@ -750,6 +856,117 @@ const Sync = struct {
             return null;
         }
         return tip_ref;
+    }
+
+    /// Brings every sibling checkout to the ref its manifest declares, for a CI build.
+    ///
+    /// Parameters:
+    /// - `self`: the run, after `run` or `cloneSiblings` has queued the siblings.
+    ///
+    /// Return: whether any sibling moved; `error.DepsFailed` when one has work of its own, cannot be fetched, or lacks its ref, or IO and git errors.
+    fn enforceSiblings(self: *Self) !bool {
+        // As in `updateSiblings`, everything that fails a sibling is checked before the network.
+        var targets: std.ArrayList(SiblingTarget) = .empty;
+        var dirs: std.ArrayList([]const u8) = .empty;
+        for (self.siblings.items) |sibling| {
+            const target = try self.siblingTarget(sibling) orelse continue;
+            try targets.append(self.allocator, target);
+            if (target.fetch) try dirs.append(self.allocator, sibling.dir);
+        }
+        const fetched = try self.fetchAll(dirs.items);
+        // CI builds what the manifests declare or nothing: unlike an update, a failed fetch fails the build.
+        for (dirs.items, fetched) |dir, ok| {
+            if (!ok) return self.fail("cannot fetch {s}; CI mode needs its remote", .{try self.relativeToRoot(dir)});
+        }
+        var moved = false;
+        for (targets.items) |target| {
+            if (try self.moveSibling(target)) moved = true;
+        }
+        return moved;
+    }
+
+    /// Decides where CI mode puts a sibling, refusing one with work of its own.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    /// - `sibling`: the sibling.
+    ///
+    /// Return: the target, or `null` for an archive or a directory that is no git checkout; `error.DepsFailed` when it has work of its own or its remote has no commits, or IO and git errors.
+    fn siblingTarget(self: *Self, sibling: Sibling) !?SiblingTarget {
+        const dir = sibling.dir;
+        if (!try self.isOwnCheckout(dir, "checking")) return null;
+        const rel = try self.relativeToRoot(dir);
+        // Work of its own is never moved, and a build of something else is no CI build: fail.
+        if (!try mod.Git.isClean(self.allocator, self.io, dir)) {
+            return self.fail("{s} has uncommitted changes, so CI mode cannot move it to {s}; discard them, or build with -Dci=false", .{ rel, try self.describeRef(sibling.ref) });
+        }
+        // Detached, it holds nothing a move loses; on a branch, commits its upstream lacks are its own.
+        if (try mod.Git.currentBranch(self.allocator, self.io, dir)) |branch| {
+            const base = try mod.Git.upstream(self.allocator, self.io, dir) orelse {
+                return self.fail("{s} is on {s}, which has no upstream, so it may hold unpushed work; push it, or build with -Dci=false", .{ rel, branch });
+            };
+            if (try mod.Git.isAhead(self.allocator, self.io, dir, base)) {
+                return self.fail("{s} has commits of its own on {s}; push or drop them, or build with -Dci=false", .{ rel, branch });
+            }
+        }
+        const ref: Pin = sibling.ref orelse .{
+            .kind = .branch,
+            .value = try mod.Git.remoteHead(self.allocator, self.io, dir) orelse return self.fail("{s}: its remote has no commits", .{rel}),
+        };
+        return switch (ref.kind) {
+            .tag => blk: {
+                const rev = try self.tagRef(ref.value);
+                // A tag the checkout already has is not fetched again: a tag is not expected to move.
+                const known = try mod.Git.revParse(self.allocator, self.io, dir, rev) != null;
+                break :blk .{ .sibling = sibling, .ref = ref, .rev = rev, .fetch = !known };
+            },
+            .branch => .{ .sibling = sibling, .ref = ref, .rev = try self.originRef(ref.value), .fetch = true },
+            // `siblingRef` and `collect` never give a sibling a SHA.
+            .sha => unreachable,
+        };
+    }
+
+    /// Moves a sibling to its CI target: detached at a tag, or on its branch at `origin/<branch>`.
+    ///
+    /// Parameters:
+    /// - `self`: the run.
+    /// - `target`: where the sibling goes; its checkout has been fetched when it needed it.
+    ///
+    /// Return: whether it moved; `error.DepsFailed` when the ref is not on its remote or the branch has commits of its own, or IO and git errors.
+    fn moveSibling(self: *Self, target: SiblingTarget) !bool {
+        const dir = target.sibling.dir;
+        const rel = try self.relativeToRoot(dir);
+        const sha = try mod.Git.revParse(self.allocator, self.io, dir, target.rev) orelse {
+            return self.fail("{s}: {t} {s}, which {s} wants, is not on its remote", .{ rel, target.ref.kind, target.ref.value, target.sibling.declared_by });
+        };
+        const head = try mod.Git.revParse(self.allocator, self.io, dir, "HEAD") orelse "";
+        // The build reads files, not refs: a checkout already at the commit is left on its branch or detached.
+        if (std.mem.eql(u8, head, sha)) return false;
+        switch (target.ref.kind) {
+            .tag => try mod.Git.checkoutDetached(self.allocator, self.io, dir, sha),
+            .branch => {
+                const branch = target.ref.value;
+                const exists = try mod.Git.branchExists(self.allocator, self.io, dir, branch);
+                // Checked before anything moves: a local branch with commits `origin/<branch>` lacks is work of its own.
+                if (exists and !try mod.Git.isAncestor(self.allocator, self.io, dir, try self.allocator.print("refs/heads/{s}", .{branch}), sha)) {
+                    return self.fail("{s} has commits of its own on {s}; push or drop them, or build with -Dci=false", .{ rel, branch });
+                }
+                const current = try mod.Git.currentBranch(self.allocator, self.io, dir);
+                const on_branch = if (current) |name| std.mem.eql(u8, name, branch) else false;
+                if (!on_branch) {
+                    if (exists) {
+                        try mod.Git.checkoutBranch(self.allocator, self.io, dir, branch, null);
+                    } else {
+                        try mod.Git.checkoutTracking(self.allocator, self.io, dir, branch);
+                    }
+                }
+                try mod.Git.fastForward(self.allocator, self.io, dir, sha);
+            },
+            // `siblingTarget` never targets a SHA.
+            .sha => unreachable,
+        }
+        log.info("moved {s} to {t} {s} ({s})", .{ rel, target.ref.kind, target.ref.value, Self.short(sha) });
+        return true;
     }
 
     /// Fetches every repository in `dirs` at once.
@@ -877,9 +1094,9 @@ const Sync = struct {
     fn lookup(self: *const Self, checkout: []const u8, pin: Pin) !?[]const u8 {
         return switch (pin.kind) {
             .sha => mod.Git.revParse(self.allocator, self.io, checkout, pin.value),
-            .tag => mod.Git.revParse(self.allocator, self.io, checkout, try self.allocator.print("refs/tags/{s}", .{pin.value})),
+            .tag => mod.Git.revParse(self.allocator, self.io, checkout, try self.tagRef(pin.value)),
             // `origin` first, then local, so a checkout with no remote still works.
-            .branch => try mod.Git.revParse(self.allocator, self.io, checkout, try self.allocator.print("refs/remotes/origin/{s}", .{pin.value})) orelse
+            .branch => try mod.Git.revParse(self.allocator, self.io, checkout, try self.originRef(pin.value)) orelse
                 try mod.Git.revParse(self.allocator, self.io, checkout, try self.allocator.print("refs/heads/{s}", .{pin.value})),
         };
     }
@@ -1299,6 +1516,12 @@ const ReleasePin = struct {
 /// `.tag` or `.branch`.
 pub const Deps = struct {
     const Self = @This();
+    /// The `-D` option that turns CI mode on.
+    const ci_option = "ci";
+    /// The step `sync` declares to list worktrees.
+    const deps_step = "deps";
+    /// The step that repins zigbuildx.
+    const pin_step = "zigbuildx-pin";
 
     /// Clones every missing cloneable dependency, transitive ones included, and exits 1; returns when none are missing.
     ///
@@ -1311,6 +1534,11 @@ pub const Deps = struct {
         const present = comptime Self.allPresent(zon) and Self.siblingsPresent(zon);
         // In a dependency's build() the root's has already run.
         if (present and !b.isRoot()) return;
+        if (Self.ranBefore(b)) {
+            // A second `cloneMissing` has nothing left to do; one after `sync` is a mix-up.
+            if (present and !b.top_level_steps.contains(Self.deps_step)) return;
+            Self.failMixed();
+        }
         const root = Self.rootPath(b) catch |err| {
             log.err("cannot resolve the build root [{any}]", .{err});
             std.process.exit(1);
@@ -1320,6 +1548,7 @@ pub const Deps = struct {
             log.err("cannot clone dependencies [{any}]", .{err});
             std.process.exit(1);
         };
+        run.mode = Self.modeOf(b);
         // With everything present this queues the siblings, for the update, fills in
         // an empty checkout, and unpacks any archive whose URL changed.
         run.cloneSiblings() catch |err| {
@@ -1362,6 +1591,11 @@ pub const Deps = struct {
             log.err("a worktree dependency is missing; the root package's build() must call Deps.sync first", .{});
             std.process.exit(1);
         }
+        if (Self.ranBefore(b)) {
+            // A second `sync` has nothing left to do; one after `cloneMissing`, which cloned `deps/` paths as plain checkouts, cannot make worktrees of them.
+            if (present and b.top_level_steps.contains(Self.deps_step)) return;
+            Self.failMixed();
+        }
         const io = b.graph.io;
         const root = Self.rootPath(b) catch |err| {
             log.err("cannot resolve the build root [{any}]", .{err});
@@ -1371,6 +1605,7 @@ pub const Deps = struct {
             log.err("cannot sync dependencies [{any}]", .{err});
             std.process.exit(1);
         };
+        run.mode = Self.modeOf(b);
         run.run() catch |err| {
             run.logFailure(err, "sync");
             std.process.exit(1);
@@ -1391,12 +1626,12 @@ pub const Deps = struct {
         if (run.worktrees.items.len > 0 or run.orphans.items.len > 0) b.graph.poisonCache();
         Self.applyUpdate(&run, true);
         const list = b.addRunArtifact(mod.ToolArtifact.add(b));
-        list.setName("deps");
+        list.setName(Self.deps_step);
         list.addArg("deps");
         list.addDirectoryArg2(b.path("."), .{});
         // It reads and moves worktrees: never cached.
         list.has_side_effects = true;
-        const top = b.step("deps", "List worktree dependencies: pin, commit, clean or dirty");
+        const top = b.step(Self.deps_step, "List worktree dependencies: pin, commit, clean or dirty");
         top.dependOn(&list.step);
         Self.addPinStep(b);
     }
@@ -1579,14 +1814,14 @@ pub const Deps = struct {
     /// Parameters:
     /// - `b`: the root package's build graph.
     fn addPinStep(b: *std.Build) void {
-        const top = b.step("zigbuildx-pin", "Pin zigbuildx in build.zig.zon to its newest release tag");
+        const top = b.step(Self.pin_step, "Pin zigbuildx in build.zig.zon to its newest release tag");
         // Found by identity, whatever the root named it; none when zigbuildx comes only through another dependency.
         const name = mod.ToolArtifact.dependencyName() orelse {
             top.dependOn(&b.addFail("zigbuildx-pin: build.zig.zon does not list zigbuildx itself, so there is nothing to pin").step);
             return;
         };
         const run = b.addRunArtifact(mod.ToolArtifact.add(b));
-        run.setName("zigbuildx-pin");
+        run.setName(Self.pin_step);
         run.addArg("pin");
         run.addDirectoryArg2(b.path("."), .{});
         run.addArg(name);
@@ -1596,26 +1831,88 @@ pub const Deps = struct {
         top.dependOn(&run.step);
     }
 
-    /// Updates the siblings and, for `sync`, the branch worktrees; exits when anything moved.
+    /// Updates the siblings, or in CI mode brings them to their refs, and for `sync` the branch worktrees; exits when anything moved.
     ///
     /// Parameters:
     /// - `run`: the run, after `run` or `cloneSiblings`.
     /// - `worktrees`: whether to update worktrees too (`sync`).
     fn applyUpdate(run: *Sync, worktrees: bool) void {
-        const moved = run.updateSiblings() catch |err| {
-            log.err("cannot update dependencies [{any}]", .{err});
+        // `Sync.run` released the lock on return: hold it again, so two builds never move one checkout at once.
+        const lock = run.acquireLock() catch |err| {
+            log.err("cannot lock dependencies [{any}]", .{err});
             std.process.exit(1);
+        };
+        defer lock.close(run.io);
+        const moved = switch (run.mode) {
+            .develop => run.updateSiblings() catch |err| {
+                log.err("cannot update dependencies [{any}]", .{err});
+                std.process.exit(1);
+            },
+            // Unlike an update, a sibling CI mode cannot bring to its ref fails the build.
+            .ci => run.enforceSiblings() catch |err| {
+                run.logFailure(err, "update");
+                std.process.exit(1);
+            },
         };
         const updated: Updated = if (worktrees) run.update() catch |err| {
             log.err("cannot update dependencies [{any}]", .{err});
             std.process.exit(1);
         } else .{};
-        // Every build updates, so a skip or an offline fetch only warns: it must not stop the build.
-        if (updated.failed > 0) log.warn("{d} worktree dependencies were not updated; see the warnings above", .{updated.failed});
+        if (updated.failed > 0) switch (run.mode) {
+            // Every build updates, so a skip or an offline fetch only warns: it must not stop the build.
+            .develop => log.warn("{d} worktree dependencies were not updated; see the warnings above", .{updated.failed}),
+            // CI builds what the manifests declare or nothing, as for siblings.
+            .ci => {
+                log.err("{d} worktree dependencies could not be brought to their branch tips; see the warnings above, or build with -Dci=false", .{updated.failed});
+                std.process.exit(1);
+            },
+        };
         if (moved or updated.moved > 0) {
             log.info("dependencies updated; re-run zig build", .{});
             std.process.exit(1);
         }
+    }
+
+    /// Reads `-Dci`, which defaults to on when the `CI` environment variable is set.
+    /// In CI mode the configure cache is poisoned, so every configure checks the remotes.
+    ///
+    /// Parameters:
+    /// - `b`: the root package's build graph.
+    ///
+    /// Return: `.ci` or `.develop`.
+    fn modeOf(b: *std.Build) Mode {
+        const ci = b.option(bool, Self.ci_option, "Bring each sibling to the ref its manifest declares (default: on when CI is set)") orelse Self.isCiValue(b.graph.environ_map.get("CI"));
+        if (!ci) return .develop;
+        // Zig tracks neither the environment nor the remotes, so a cached configure would skip the check.
+        b.graph.poisonCache();
+        return .ci;
+    }
+
+    /// Reports whether an earlier `cloneMissing` or `sync` ran in this build().
+    ///
+    /// Parameters:
+    /// - `b`: the root package's build graph.
+    ///
+    /// Return: `true` once `-Dci` is declared, as both do.
+    fn ranBefore(b: *std.Build) bool {
+        return b.available_options_map.contains(Self.ci_option);
+    }
+
+    /// Stops a build() that calls both `cloneMissing` and `sync`, which would panic on their second declarations.
+    fn failMixed() noreturn {
+        log.err("call Deps.cloneMissing or Deps.sync, not both: sync does everything cloneMissing does", .{});
+        std.process.exit(1);
+    }
+
+    /// Reports whether a `CI` environment variable's value turns CI mode on.
+    ///
+    /// Parameters:
+    /// - `value`: the variable's value, or null when it is unset.
+    ///
+    /// Return: `true` for any non-empty value but `0` and `false`.
+    fn isCiValue(value: ?[]const u8) bool {
+        const text = value orelse return false;
+        return text.len > 0 and !std.mem.eql(u8, text, "0") and !std.ascii.eqlIgnoreCase(text, "false");
     }
 
     /// Returns the absolute, resolved path of `b`'s package.
@@ -1957,9 +2254,33 @@ const TestTree = struct {
     ///
     /// Return: the finished run; its errors.
     fn sync(self: *Self) !Sync {
+        return self.syncIn(.develop);
+    }
+
+    /// Runs a sync of the consumer in `mode`.
+    ///
+    /// Parameters:
+    /// - `self`: the fixture.
+    /// - `mode`: how siblings are treated.
+    ///
+    /// Return: the finished run; its errors.
+    fn syncIn(self: *Self, mode: Mode) !Sync {
         var run_ = try Sync.init(self.allocator(), self.io, try self.path("consumer"));
+        run_.mode = mode;
         try run_.run();
         return run_;
+    }
+
+    /// Writes the dependency text for sibling `name` at `../<name>`, cloned from its upstream, plus `extra`.
+    ///
+    /// Parameters:
+    /// - `self`: the fixture.
+    /// - `name`: the dependency.
+    /// - `extra`: more fields, e.g. `.tag = "v1",`.
+    ///
+    /// Return: the text.
+    fn siblingWith(self: *Self, name: []const u8, extra: []const u8) ![]const u8 {
+        return self.allocator().print(".{s} = .{{ .path = \"../{s}\", .clone = \"{s}/origin/{s}\", {s} }},", .{ name, name, self.root, name, extra });
     }
 
     /// Runs a sync of the consumer that must fail, and returns its problem.
@@ -2158,12 +2479,12 @@ test "update never fetches the checkout of a tag or a SHA" {
     try std.testing.expectEqualStrings(pinned, try tree.rev("leaf", "refs/tags/v1"));
 }
 
-test "sync rejects two pin fields and a pin on a path outside deps/" {
+test "sync rejects two pin fields and a SHA on a path outside deps/" {
     var tree = try TestTree.init();
     defer tree.deinit();
     try tree.consumer(".leaf = .{ .path = \"deps/leaf\", .tag = \"v1\", .branch = \"main\" },");
     try std.testing.expect(std.mem.find(u8, try tree.syncFails(), "more than one") != null);
-    try tree.consumer(".leaf = .{ .path = \"../leaf\", .tag = \"v1\" },");
+    try tree.consumer(".leaf = .{ .path = \"../leaf\", .sha = \"0123456789\" },");
     try std.testing.expect(std.mem.find(u8, try tree.syncFails(), "must be under deps/") != null);
 }
 
@@ -2375,7 +2696,7 @@ test "two manifests naming different branches for one sibling: the first found w
     try tree.consumer(try tree.allocator().print("{s} .leaf = .{{ .path = \"../leaf\", .clone = \"{s}\", .branch = \"main\" }},", .{ try tree.sibling("mid"), leaf_origin }));
     const run_ = try tree.sync();
     const leaf = run_.findSibling(try tree.path("leaf")).?;
-    try std.testing.expectEqualStrings("main", leaf.branch.?);
+    try std.testing.expectEqualStrings("main", leaf.ref.?.value);
     try std.testing.expectEqualStrings("consumer", leaf.declared_by);
     try std.testing.expectEqualStrings("main", (try mod.Git.currentBranch(tree.allocator(), tree.io, try tree.path("leaf"))).?);
 }
@@ -2482,4 +2803,182 @@ test "sync refuses to replace a directory it did not unpack, a pinned archive, a
     try std.testing.expect(std.mem.find(u8, try tree.syncFails(), "pinned by its URL") != null);
     try tree.consumer(".amalg = .{ .path = \"../other\", .archive = \"file:///x.zip\", .clone = \"git@example.com:x.git\" },");
     try std.testing.expect(std.mem.find(u8, try tree.syncFails(), "both .clone and .archive") != null);
+}
+
+test "isCiValue turns CI mode on for any non-empty value but 0 and false" {
+    try std.testing.expect(Deps.isCiValue("true"));
+    try std.testing.expect(Deps.isCiValue("1"));
+    try std.testing.expect(Deps.isCiValue("woodpecker"));
+    try std.testing.expect(!Deps.isCiValue(null));
+    try std.testing.expect(!Deps.isCiValue(""));
+    try std.testing.expect(!Deps.isCiValue("0"));
+    try std.testing.expect(!Deps.isCiValue("false"));
+    try std.testing.expect(!Deps.isCiValue("False"));
+}
+
+test "a sibling with a .tag is cloned at it, then never fetched or moved" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.upstream("mid", "");
+    const origin = try tree.path("origin/mid");
+    try tree.commit(origin, "two");
+    try tree.consumer(try tree.siblingWith("mid", ".tag = \"v1\","));
+    const first = try tree.sync();
+    try std.testing.expect(first.changed);
+    try std.testing.expectEqualStrings(try tree.rev("origin/mid", "v1"), try tree.rev("mid", "HEAD"));
+    try std.testing.expectEqual(null, try mod.Git.currentBranch(tree.allocator(), tree.io, try tree.path("mid")));
+
+    var run_ = try tree.sync();
+    try std.testing.expect(!run_.changed);
+    try std.testing.expect(!try run_.updateSiblings());
+    try std.testing.expectEqualStrings(try tree.rev("origin/mid", "v1"), try tree.rev("mid", "HEAD"));
+
+    // Moved off the tag by hand: warned about, and left there.
+    try tree.run(&.{ "git", "-C", try tree.path("mid"), "checkout", "--quiet", "--detach", "origin/main" });
+    var moved = try tree.sync();
+    try std.testing.expect(!try moved.updateSiblings());
+    try std.testing.expectEqualStrings(try tree.rev("origin/mid", "main"), try tree.rev("mid", "HEAD"));
+}
+
+test "a sibling's own tagged sibling is cloned at its tag, and the root's ref wins" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.upstream("leaf", "");
+    try tree.commit(try tree.path("origin/leaf"), "two");
+    try tree.upstream("other", "");
+    try tree.commit(try tree.path("origin/other"), "two");
+    try tree.upstream("mid", try std.mem.concat(tree.allocator(), u8, &.{ try tree.siblingWith("leaf", ".tag = \"v1\","), try tree.siblingWith("other", ".tag = \"v1\",") }));
+    try tree.consumer(try std.mem.concat(tree.allocator(), u8, &.{ try tree.sibling("mid"), try tree.siblingWith("other", ".branch = \"main\",") }));
+    const run_ = try tree.sync();
+    try std.testing.expectEqualStrings(try tree.rev("origin/leaf", "v1"), try tree.rev("leaf", "HEAD"));
+    try std.testing.expectEqualStrings(try tree.rev("origin/other", "main"), try tree.rev("other", "HEAD"));
+    try std.testing.expectEqual(PinKind.branch, run_.findSibling(try tree.path("other")).?.ref.?.kind);
+}
+
+test "cloneSiblings fills in an empty checkout at its tag" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.upstream("mid", "");
+    try tree.commit(try tree.path("origin/mid"), "two");
+    const empty = try tree.path("mid");
+    try tree.run(&.{ "git", "init", "--quiet", "--initial-branch=main", empty });
+    try tree.run(&.{ "git", "-C", empty, "remote", "add", "origin", try tree.path("origin/mid") });
+    try tree.consumer(try tree.siblingWith("mid", ".tag = \"v1\","));
+    var run_ = try Sync.init(tree.allocator(), tree.io, try tree.path("consumer"));
+    try run_.cloneSiblings();
+    try std.testing.expect(run_.changed);
+    try std.testing.expectEqualStrings(try tree.rev("origin/mid", "v1"), try tree.rev("mid", "HEAD"));
+}
+
+test "CI mode moves clean siblings to their refs, then stays put" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    for ([_][]const u8{ "bytag", "bybranch", "noref" }) |name| try tree.upstream(name, "");
+    // bytag is cloned on main, past v1; bybranch on main, not dev; noref on feature, not the default main.
+    try tree.commit(try tree.path("origin/bytag"), "two");
+    const bybranch = try tree.path("origin/bybranch");
+    try tree.run(&.{ "git", "-C", bybranch, "checkout", "--quiet", "-b", "dev" });
+    try tree.commit(bybranch, "two");
+    try tree.run(&.{ "git", "-C", bybranch, "checkout", "--quiet", "main" });
+    const noref = try tree.path("origin/noref");
+    try tree.run(&.{ "git", "-C", noref, "branch", "feature" });
+    try tree.commit(noref, "two");
+    for ([_][]const u8{ "bytag", "bybranch" }) |name| try tree.run(&.{ "git", "clone", "--quiet", try tree.path(try tree.allocator().print("origin/{s}", .{name})), try tree.path(name) });
+    try tree.run(&.{ "git", "clone", "--quiet", "--branch", "feature", noref, try tree.path("noref") });
+    try tree.consumer(try std.mem.concat(tree.allocator(), u8, &.{ try tree.siblingWith("bytag", ".tag = \"v1\","), try tree.siblingWith("bybranch", ".branch = \"dev\","), try tree.sibling("noref") }));
+
+    var run_ = try tree.syncIn(.ci);
+    try std.testing.expect(!run_.changed);
+    try std.testing.expect(try run_.enforceSiblings());
+    try std.testing.expectEqualStrings(try tree.rev("origin/bytag", "v1"), try tree.rev("bytag", "HEAD"));
+    try std.testing.expectEqualStrings(try tree.rev("origin/bybranch", "dev"), try tree.rev("bybranch", "HEAD"));
+    try std.testing.expectEqualStrings("dev", (try mod.Git.currentBranch(tree.allocator(), tree.io, try tree.path("bybranch"))).?);
+    try std.testing.expectEqualStrings(try tree.rev("origin/noref", "main"), try tree.rev("noref", "HEAD"));
+    try std.testing.expectEqualStrings("main", (try mod.Git.currentBranch(tree.allocator(), tree.io, try tree.path("noref"))).?);
+
+    var again = try tree.syncIn(.ci);
+    try std.testing.expect(!try again.enforceSiblings());
+
+    // A branch that moved upstream is followed.
+    try tree.run(&.{ "git", "-C", bybranch, "checkout", "--quiet", "dev" });
+    try tree.commit(bybranch, "three");
+    var moved = try tree.syncIn(.ci);
+    try std.testing.expect(try moved.enforceSiblings());
+    try std.testing.expectEqualStrings(try tree.rev("origin/bybranch", "dev"), try tree.rev("bybranch", "HEAD"));
+}
+
+test "CI mode refuses a dirty sibling, commits of its own, and a branch with no upstream" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.upstream("mid", "");
+    try tree.consumer(try tree.siblingWith("mid", ".branch = \"main\","));
+    _ = try tree.sync();
+    const mid = try tree.path("mid");
+
+    try tree.write("mid/scratch", "x");
+    var dirty = try tree.syncIn(.ci);
+    try std.testing.expectError(error.DepsFailed, dirty.enforceSiblings());
+    try std.testing.expect(std.mem.find(u8, dirty.problem, "uncommitted changes") != null);
+    try tree.tmp.dir.deleteFile(tree.io, "mid/scratch");
+
+    try tree.commit(mid, "mine");
+    var ahead = try tree.syncIn(.ci);
+    try std.testing.expectError(error.DepsFailed, ahead.enforceSiblings());
+    try std.testing.expect(std.mem.find(u8, ahead.problem, "commits of its own") != null);
+    try tree.run(&.{ "git", "-C", mid, "reset", "--quiet", "--hard", "HEAD~1" });
+
+    try tree.run(&.{ "git", "-C", mid, "branch", "--unset-upstream" });
+    var untracked = try tree.syncIn(.ci);
+    try std.testing.expectError(error.DepsFailed, untracked.enforceSiblings());
+    try std.testing.expect(std.mem.find(u8, untracked.problem, "no upstream") != null);
+}
+
+test "a ref value git could read as an option is refused" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.consumer(".leaf = .{ .path = \"../leaf\", .branch = \"--orphan\" },");
+    try std.testing.expect(std.mem.find(u8, try tree.syncFails(), "invalid .branch") != null);
+    try tree.consumer(".leaf = .{ .path = \"deps/leaf\", .tag = \"\" },");
+    try std.testing.expect(std.mem.find(u8, try tree.syncFails(), "invalid .tag") != null);
+}
+
+test "CI mode refuses a local branch with commits of its own before switching to it" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.upstream("mid", "");
+    const origin = try tree.path("origin/mid");
+    try tree.run(&.{ "git", "-C", origin, "branch", "dev" });
+    try tree.consumer(try tree.siblingWith("mid", ".branch = \"dev\","));
+    _ = try tree.sync();
+    // A commit of its own on dev, then back on a pushed main.
+    const mid = try tree.path("mid");
+    try tree.commit(mid, "mine");
+    try tree.run(&.{ "git", "-C", mid, "checkout", "--quiet", "-b", "main", "origin/main" });
+    try tree.commit(origin, "two");
+    try tree.run(&.{ "git", "-C", origin, "checkout", "--quiet", "dev" });
+    try tree.commit(origin, "three");
+    var run_ = try tree.syncIn(.ci);
+    try std.testing.expectError(error.DepsFailed, run_.enforceSiblings());
+    try std.testing.expect(std.mem.find(u8, run_.problem, "commits of its own on dev") != null);
+    try std.testing.expectEqualStrings("main", (try mod.Git.currentBranch(tree.allocator(), tree.io, mid)).?);
+}
+
+test "CI mode moves a clean detached sibling and fails on a tag its remote lacks" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.upstream("mid", "");
+    const origin = try tree.path("origin/mid");
+    try tree.commit(origin, "two");
+    try tree.run(&.{ "git", "-C", origin, "tag", "v2" });
+    try tree.consumer(try tree.siblingWith("mid", ".tag = \"v1\","));
+    _ = try tree.sync();
+    try tree.consumer(try tree.siblingWith("mid", ".tag = \"v2\","));
+    var run_ = try tree.syncIn(.ci);
+    try std.testing.expect(try run_.enforceSiblings());
+    try std.testing.expectEqualStrings(try tree.rev("origin/mid", "v2"), try tree.rev("mid", "HEAD"));
+
+    try tree.consumer(try tree.siblingWith("mid", ".tag = \"v9\","));
+    var missing = try tree.syncIn(.ci);
+    try std.testing.expectError(error.DepsFailed, missing.enforceSiblings());
+    try std.testing.expect(std.mem.find(u8, missing.problem, "is not on its remote") != null);
 }

@@ -118,9 +118,11 @@ additions to ZIGSTYLE:
   it tracks changed (`-D` options, build scripts, manifests, `b.dependOn*`
   paths). Declare anything else: `b.dependOnFileMetadata` and friends where
   a path captures it, else `b.graph.poisonCache()`. `Xcode.resolveFor`
-  tracks `SDKSettings.json`; `Android.resolve` and `Deps.sync` with
-  worktrees poison. Upstream is not tracked: `Deps` updates only when
-  `build()` runs for some other reason.
+  tracks `SDKSettings.json`; `Android.resolve`, `Deps.sync` with
+  worktrees, and CI mode poison. Upstream is not tracked: in develop mode
+  `Deps` updates only when `build()` runs for some other reason. The
+  environment is not tracked either: `CI` turns CI mode on only when
+  `build()` runs, so a warm develop cache wins until `-Dci` is passed.
 - **Work at build time goes in the host tool.** A Zig 0.17 step cannot run
   code of its own, and cache and install paths exist only when steps run.
   `src/tool.zig` is one program, `zigbuildx <command>`; each command is a
@@ -143,7 +145,8 @@ additions to ZIGSTYLE:
   runner's package table (a `.path` package's key is its path) for one
   outside `deps/` with no `build_zig`, so the clone path compiles away in
   the steady state. A lock, `<root>/.zig-cache/zigbuildx.lock`, is held from
-  before the first clone.
+  before the first clone, and again by `applyUpdate` while siblings and
+  worktrees are updated or moved, so two builds never move one checkout.
 - **`.archive` (`ZipArchive`):** a zip unpacked at a `.path` wherever a
   `.clone` would be cloned. It is downloaded (`curl`; `file://` in process)
   into `<path>.zigbuildx-unpack/`, extracted, stripped of a single top-level
@@ -154,6 +157,11 @@ additions to ZIGSTYLE:
   stamps the URL: a new URL replaces the directory, and a directory without
   the stamp is refused. It cannot be pinned, is never updated, and is not
   hash-checked.
+- **One entry point per `build()`:** `cloneMissing` and `sync` each declare
+  `-Dci` and `zigbuildx-pin`, which Zig panics on declaring twice. A second
+  call of the same one returns at once (`Deps.ranBefore`); mixing them
+  fails with a message (`failMixed`), since `cloneMissing` clones `deps/`
+  paths as plain checkouts, which `sync` then refuses for lacking a stamp.
 - **`Deps.sync`:** must come first in `build()`. `.sha` or `.tag` gives a
   detached worktree under `deps/`; `.branch` gives the branch
   `<consumer>/<branch>`. A worktree is created from its checkout (`.checkout`,
@@ -166,25 +174,61 @@ additions to ZIGSTYLE:
   is removed when clean, else kept and listed. The return type is `noreturn`
   while a `deps/` package is missing, so a transitive top-level `@import` can
   wait; a worktree dependency must have a `build.zig`.
-- **The update:** whenever `build()` runs, `Deps` fast-forwards siblings
-  and, under `sync`, `.branch` worktrees. Everything that rules one out is
-  checked first and locally (not a checkout, detached, on another branch
-  than its `.branch`, no upstream, dirty, or ahead of the tip as last
-  fetched), so a skipped checkout never reaches the network. The rest are
-  fetched at once (`Sync.fetchAll`: every `git fetch` child is started
-  before any is waited for; a build runner is single-threaded, so a
-  `std.Io.Group` would run them one by one). `.sha` and
-  `.tag` worktrees and archives are never fetched. A skip or a failed fetch
-  warns and never fails the build; anything moved exits 1.
-- **Sibling `.branch`:** a `../x` may follow a branch: cloned on it
-  (`git clone --branch`), and fast-forwarded to `origin/<branch>`. `.sha`
-  and `.tag` there are refused. Two manifests naming different branches for
-  one sibling: the first found (root first) wins, with a warning.
+- **The update (develop mode):** whenever `build()` runs, `Deps`
+  fast-forwards siblings and, under `sync`, `.branch` worktrees. Everything
+  that rules one out is checked first and locally (not a checkout, at a
+  `.tag`, detached, on another branch than its `.branch`, no upstream,
+  dirty, or ahead of the tip as last fetched), so a skipped checkout never
+  reaches the network. The rest are fetched at once (`Sync.fetchAll`: every
+  `git fetch` child is started before any is waited for; a build runner is
+  single-threaded, so a `std.Io.Group` would run them one by one). `.sha`
+  and `.tag` worktrees and archives are never fetched. A skip or a failed
+  fetch warns and never fails the build; anything moved exits 1.
+- **Sibling refs (`Sibling.ref`):** a `../x` may set `.branch` or `.tag`,
+  in the root's manifest or a sibling's; `.sha` there is refused (only a
+  worktree is frozen at a SHA). `pinOf` refuses an empty value or one
+  starting with `-`, which git could read as an option (`git checkout
+  <branch>` takes it bare). Either is cloned at it (`git clone
+  --branch`; a tag leaves HEAD detached). In develop mode a `.branch` is
+  fast-forwarded to `origin/<branch>` and a `.tag` is never fetched or
+  moved: a sibling off its tag (checked against the local tag) is left, with
+  a warning. Two manifests naming different refs for one sibling: the first
+  found (root first) wins, with a warning, in either mode.
+- **CI mode (`-Dci`, `Sync.enforceSiblings`):** a complement to develop mode
+  for reproducible builds from the manifests' refs, with no commit tracking.
+  `Deps.modeOf`, called by both `cloneMissing` and `sync`, declares `-Dci`,
+  which defaults to on when `CI` is set to anything but empty, `0` or
+  `false` (`-Dci=false` overrides it), and poisons the configure cache so
+  every configure checks the remotes. `applyUpdate` then runs
+  `enforceSiblings` in place of `updateSiblings`: every sibling (siblings of
+  siblings included) goes to its ref, `.branch` at `origin/<branch>` (on the
+  branch), `.tag` detached, no ref the remote's default branch
+  (`ls-remote --symref`). Work of its own fails the build, checked before
+  the network: dirty, or on a branch that has no upstream or is ahead of
+  it; a clean detached sibling is always moved. Switching to an existing
+  local `<branch>` is refused first when it is not an ancestor of
+  `origin/<branch>` (`Git.isAncestor`), so a failed move leaves the
+  sibling where it was. A sibling already at the target commit is left on
+  its branch or detached (`moveSibling`): the build reads files, not refs,
+  and a switch would cost a re-run. Fetches run at once, a
+  branch always, a tag only when the checkout lacks it; a failed fetch or a
+  ref not on the remote fails the build. Anything moved exits 1, as a clone
+  does. `deps/` `.branch` worktrees are updated as in develop mode, but one
+  that cannot be (work of its own, a failed fetch, its branch gone) fails
+  the build; archives behave as in develop mode. A
+  distinct exit code for "re-run" is impossible: 0.17's `zig build` turns
+  any configure failure into a fatal exit 1
+  (`lib/compiler/Maker.zig:1515`), and its own re-run loop covers only
+  hashed lazy packages, so CI runs `zig build -Dci || zig build -Dci`.
+  Clones land at `../x`, beside the project: `.path` is text, so a `deps/`
+  layout would need `deps/x` manifests (the `sync` worktree route), which
+  gives up live editing of `../x`.
 - **Empty checkouts (`Sync.repair`):** a sibling path that exists with
   neither `build.zig.zon` nor `build.zig` is filled in only when it holds
   nothing but `.git` and has no commits (an interrupted clone): `.branch`
   or the remote's HEAD (`ls-remote --symref`) is fetched and checked out,
-  tracking. Anything else without a manifest is refused, never touched.
+  tracking, or a `.tag` is fetched and checked out detached. Anything else
+  without a manifest is refused, never touched.
 - **`zigbuildx-pin` (`Deps.pin`, `make buildxpin` in `Makefile.in`):**
   declared by `cloneMissing` and `sync`. It reads this zigbuildx's `.url`
   (named by `ToolArtifact.dependencyName`) and runs `zig fetch` in the root,
@@ -251,7 +295,11 @@ additions to ZIGSTYLE:
   Before the push, `zig fetch .` here puts the same hash in the global cache
   for local builds. Consumers pin a tag with its commit (`?ref=v4.1.0#<commit>`),
   so a release that rewrites history breaks their URLs.
-- **Compatibility:** 5.0.0 removed `-Dupdate`, `Deps.guard`, `Deps.mark`
+- **Compatibility:** 5.1.0 needs no consumer change: it adds `-Dci` and
+  `.tag` on a sibling (refused before). Under `cloneMissing`, a root
+  `deps/x` with a `.tag` is now cloned at the tag and warned about when off
+  it, as a sibling's is; it used to be cloned on the default branch and
+  followed. 5.0.0 removed `-Dupdate`, `Deps.guard`, `Deps.mark`
   and `deps-mark`; the update runs on every configure. 4.1.0 needs no
   consumer change, though an iOS, tvOS, visionOS or watchOS target must call
   `xcode.configure(lib)`. 4.0.0 removed `Pkg` and `Apk`.
@@ -291,7 +339,7 @@ reaches `std.debug.print` does not compile for Apple's other platforms.
   (push and shell) on `std.Io.net`, plus RSA signing of the auth token with
   `~/.android/adbkey` (`std.crypto.ff`; std can only verify RSA). Open: a
   test device, a missing key, and whether it belongs in its own package.
-- **Rejected:** sibling pins (`.sha`/`.tag` on a `../x`) as checks
-  (`.branch` is followed, not checked); and a `--fork` per sibling, since
+- **Rejected:** a lock file of sibling commits for CI (CI mode builds the
+  declared refs instead); `.sha` on a `../x`; and a `--fork` per sibling, since
   Zig reads `--fork` only from the command line and matches only hashed
   packages.
