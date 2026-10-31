@@ -19,13 +19,11 @@ pub const Git = struct {
 
     /// Clones the repository at `url` into `dest`, at `ref` or the remote's default branch.
     ///
-    /// Parameters:
     /// - `io`: IO the `git` child is spawned on.
-    /// - `url`: the repository to clone.
-    /// - `dest`: the directory to clone into.
-    /// - `ref`: the branch, or the tag (HEAD then detached), to check out; null for the remote's HEAD.
-    ///
-    /// Return: nothing; `error.GitCloneFailed` when `git` fails, or spawn errors.
+    /// - `url`: The repository to clone.
+    /// - `dest`: The directory to clone into.
+    /// - `ref`: The branch, or the tag (HEAD then detached), to check out; null for the remote's HEAD.
+    /// - Returns: `error.GitCloneFailed` when `git` fails, or spawn errors.
     pub fn clone(io: std.Io, url: []const u8, dest: []const u8, ref: ?[]const u8) !void {
         // `--` ends the options, so a URL from a manifest cannot pass as one (`--upload-pack=...`).
         // A tag detaches HEAD, and `--quiet` does not silence git's advice about that.
@@ -50,12 +48,10 @@ pub const Git = struct {
 
     /// Fetches branches and tags from the default remote, accepting tags moved upstream.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the checkout to fetch into.
-    ///
-    /// Return: nothing; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The checkout to fetch into.
+    /// - Returns: `error.GitFailed` when `git` fails, or spawn errors.
     pub fn fetch(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !void {
         // `--force`: without it a tag moved upstream makes `--tags` exit 1 ("would clobber existing tag").
         // The checkout's tag then follows upstream; a worktree pinned to it keeps its stamped commit.
@@ -64,11 +60,9 @@ pub const Git = struct {
 
     /// Starts the fetch `fetch` runs without waiting for it, so several can overlap.
     ///
-    /// Parameters:
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the checkout to fetch into.
-    ///
-    /// Return: the running child, for `finishFetch`; spawn errors.
+    /// - `repo`: The checkout to fetch into.
+    /// - Returns: The running child, for `finishFetch`; spawn errors.
     pub fn startFetch(io: std.Io, repo: []const u8) !std.process.Child {
         // The arguments `fetch` passes; git's own errors reach stderr, as `clone`'s do.
         return std.process.spawn(io, .{ .argv = &.{ "git", "-C", repo, "fetch", "--tags", "--force", "--quiet" }, .stdin = .ignore, .stdout = .ignore });
@@ -76,11 +70,9 @@ pub const Git = struct {
 
     /// Waits for a child that `startFetch` began.
     ///
-    /// Parameters:
     /// - `io`: IO the child was spawned on.
-    /// - `child`: the running child.
-    ///
-    /// Return: `true` when the fetch succeeded.
+    /// - `child`: The running child.
+    /// - Returns: `true` when the fetch succeeded.
     pub fn finishFetch(io: std.Io, child: *std.process.Child) bool {
         const term = child.wait(io) catch return false;
         return switch (term) {
@@ -91,12 +83,10 @@ pub const Git = struct {
 
     /// Names the branch the `origin` remote's HEAD points at, asking the remote.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the returned name.
+    /// - `allocator`: Allocator for the returned name.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: a checkout with an `origin` remote.
-    ///
-    /// Return: the branch without `refs/heads/`, owned by the caller; `null` when the remote has no commits; `error.GitFailed` or spawn errors.
+    /// - `repo`: A checkout with an `origin` remote.
+    /// - Returns: The branch without `refs/heads/`, owned by the caller; `null` when the remote has no commits; `error.GitFailed` or spawn errors.
     pub fn remoteHead(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !?[]u8 {
         // An empty remote lists nothing and exits 0; otherwise the first line is `ref: refs/heads/<b>\tHEAD`.
         const out = try Self.run(allocator, io, repo, &.{ "ls-remote", "--symref", "origin", "HEAD" });
@@ -110,13 +100,11 @@ pub const Git = struct {
 
     /// Resolves `rev` to the full SHA of the commit it names.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the returned SHA.
+    /// - `allocator`: Allocator for the returned SHA.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the checkout or worktree to resolve in.
-    /// - `rev`: any revision git accepts: a SHA, `refs/tags/<tag>`, `refs/remotes/origin/<branch>`, `HEAD`.
-    ///
-    /// Return: the SHA, owned by the caller; `null` when `rev` names no commit; `error.GitFailed` or spawn errors.
+    /// - `repo`: The checkout or worktree to resolve in.
+    /// - `rev`: Any revision git accepts: a SHA, `refs/tags/<tag>`, `refs/remotes/origin/<branch>`, `HEAD`.
+    /// - Returns: The SHA, owned by the caller; `null` when `rev` names no commit; `error.GitFailed` or spawn errors.
     pub fn revParse(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, rev: []const u8) !?[]u8 {
         const commit = try allocator.print("{s}^{{commit}}", .{rev});
         defer allocator.free(commit);
@@ -125,38 +113,32 @@ pub const Git = struct {
 
     /// Names the branch HEAD is on.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the returned name.
+    /// - `allocator`: Allocator for the returned name.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the checkout or worktree to inspect.
-    ///
-    /// Return: the branch without `refs/heads/`, owned by the caller; `null` when detached; `error.GitFailed` or spawn errors.
+    /// - `repo`: The checkout or worktree to inspect.
+    /// - Returns: The branch without `refs/heads/`, owned by the caller; `null` when detached; `error.GitFailed` or spawn errors.
     pub fn currentBranch(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !?[]u8 {
         return Self.runOptional(allocator, io, repo, &.{ "symbolic-ref", "--quiet", "--short", "HEAD" });
     }
 
     /// Resolves the upstream of the branch HEAD is on (`@{u}`).
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the returned SHA.
+    /// - `allocator`: Allocator for the returned SHA.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the checkout to inspect.
-    ///
-    /// Return: the upstream's last-fetched SHA, owned by the caller; `null` with no upstream or when detached; `error.GitFailed` or spawn errors.
+    /// - `repo`: The checkout to inspect.
+    /// - Returns: The upstream's last-fetched SHA, owned by the caller; `null` with no upstream or when detached; `error.GitFailed` or spawn errors.
     pub fn upstream(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !?[]u8 {
         return Self.revParse(allocator, io, repo, "@{u}");
     }
 
     /// Adds a worktree at `path`, detached at `commit` or on `branch`.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the checkout that owns the worktree.
-    /// - `path`: where the worktree goes; must not exist.
+    /// - `repo`: The checkout that owns the worktree.
+    /// - `path`: Where the worktree goes; must not exist.
     /// - `on`: `.detached` at a commit, or `.branch`: a start creates it there, a null start checks out an existing one.
-    ///
-    /// Return: nothing; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - Returns: `error.GitFailed` when `git` fails, or spawn errors.
     pub fn worktreeAdd(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, path: []const u8, on: WorktreeHead) !void {
         switch (on) {
             .detached => |commit| try Self.runVoid(allocator, io, repo, &.{ "worktree", "add", "--quiet", "--detach", path, commit }),
@@ -170,52 +152,44 @@ pub const Git = struct {
 
     /// Clears the records of worktrees whose directories are gone.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the checkout that owns the worktrees.
-    ///
-    /// Return: nothing; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The checkout that owns the worktrees.
+    /// - Returns: `error.GitFailed` when `git` fails, or spawn errors.
     pub fn worktreePrune(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !void {
         try Self.runVoid(allocator, io, repo, &.{ "worktree", "prune" });
     }
 
     /// Removes the worktree at `path`; git refuses when it has uncommitted changes.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the checkout that owns the worktree.
-    /// - `path`: the worktree to remove.
-    ///
-    /// Return: nothing; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The checkout that owns the worktree.
+    /// - `path`: The worktree to remove.
+    /// - Returns: `error.GitFailed` when `git` fails, or spawn errors.
     pub fn worktreeRemove(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, path: []const u8) !void {
         try Self.runVoid(allocator, io, repo, &.{ "worktree", "remove", path });
     }
 
     /// Detaches HEAD at `commit`.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the worktree to move.
-    /// - `commit`: the commit to check out.
-    ///
-    /// Return: nothing; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The worktree to move.
+    /// - `commit`: The commit to check out.
+    /// - Returns: `error.GitFailed` when `git` fails, or spawn errors.
     pub fn checkoutDetached(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, commit: []const u8) !void {
         try Self.runVoid(allocator, io, repo, &.{ "checkout", "--quiet", "--detach", commit });
     }
 
     /// Checks out branch `name`, creating it at `start` when `start` is not null.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the worktree to move.
-    /// - `name`: the branch.
-    /// - `start`: the commit a new branch starts at; null to check out an existing one.
-    ///
-    /// Return: nothing; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The worktree to move.
+    /// - `name`: The branch.
+    /// - `start`: The commit a new branch starts at; null to check out an existing one.
+    /// - Returns: `error.GitFailed` when `git` fails, or spawn errors.
     pub fn checkoutBranch(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, name: []const u8, start: ?[]const u8) !void {
         if (start) |commit| {
             try Self.runVoid(allocator, io, repo, &.{ "checkout", "--quiet", "-b", name, commit });
@@ -226,13 +200,11 @@ pub const Git = struct {
 
     /// Creates branch `name` at `origin/<name>`, tracking it, and checks it out.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the checkout; `origin/<name>` must have been fetched.
-    /// - `name`: the branch.
-    ///
-    /// Return: nothing; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The checkout; `origin/<name>` must have been fetched.
+    /// - `name`: The branch.
+    /// - Returns: `error.GitFailed` when `git` fails, or spawn errors.
     pub fn checkoutTracking(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, name: []const u8) !void {
         const start = try allocator.print("refs/remotes/origin/{s}", .{name});
         defer allocator.free(start);
@@ -241,25 +213,21 @@ pub const Git = struct {
 
     /// Fast-forwards the checked-out branch to `commit`; git refuses anything but a fast-forward.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the worktree to move.
-    /// - `commit`: the commit to move to.
-    ///
-    /// Return: nothing; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The worktree to move.
+    /// - `commit`: The commit to move to.
+    /// - Returns: `error.GitFailed` when `git` fails, or spawn errors.
     pub fn fastForward(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, commit: []const u8) !void {
         try Self.runVoid(allocator, io, repo, &.{ "merge", "--quiet", "--ff-only", commit });
     }
 
     /// Reports whether the worktree has no uncommitted changes, untracked files included.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the worktree to inspect.
-    ///
-    /// Return: `true` when clean; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The worktree to inspect.
+    /// - Returns: `true` when clean; `error.GitFailed` when `git` fails, or spawn errors.
     pub fn isClean(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !bool {
         const out = try Self.run(allocator, io, repo, &.{ "status", "--porcelain" });
         defer allocator.free(out);
@@ -268,13 +236,11 @@ pub const Git = struct {
 
     /// Reports whether HEAD has commits that `base` does not.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the worktree to inspect.
-    /// - `base`: the commit HEAD is compared with.
-    ///
-    /// Return: `true` when HEAD is ahead of `base`; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The worktree to inspect.
+    /// - `base`: The commit HEAD is compared with.
+    /// - Returns: `true` when HEAD is ahead of `base`; `error.GitFailed` when `git` fails, or spawn errors.
     pub fn isAhead(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, base: []const u8) !bool {
         const range = try allocator.print("{s}..HEAD", .{base});
         defer allocator.free(range);
@@ -285,14 +251,12 @@ pub const Git = struct {
 
     /// Reports whether `ancestor` is reachable from `descendant`, so moving `ancestor`'s branch there loses nothing.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the checkout to inspect.
-    /// - `ancestor`: a revision, e.g. `refs/heads/<branch>`.
-    /// - `descendant`: a revision, e.g. a fetched commit.
-    ///
-    /// Return: `true` when it is an ancestor or the same commit; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The checkout to inspect.
+    /// - `ancestor`: A revision, e.g. `refs/heads/<branch>`.
+    /// - `descendant`: A revision, e.g. a fetched commit.
+    /// - Returns: `true` when it is an ancestor or the same commit; `error.GitFailed` when `git` fails, or spawn errors.
     pub fn isAncestor(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, ancestor: []const u8, descendant: []const u8) !bool {
         const out = try Self.runOptional(allocator, io, repo, &.{ "merge-base", "--is-ancestor", ancestor, descendant }) orelse return false;
         allocator.free(out);
@@ -301,13 +265,11 @@ pub const Git = struct {
 
     /// Reports whether local branch `name` exists.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the checkout or worktree to inspect.
-    /// - `name`: the branch, without `refs/heads/`.
-    ///
-    /// Return: `true` when it exists; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The checkout or worktree to inspect.
+    /// - `name`: The branch, without `refs/heads/`.
+    /// - Returns: `true` when it exists; `error.GitFailed` when `git` fails, or spawn errors.
     pub fn branchExists(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, name: []const u8) !bool {
         const ref = try allocator.print("refs/heads/{s}", .{name});
         defer allocator.free(ref);
@@ -318,26 +280,22 @@ pub const Git = struct {
 
     /// Deletes local branch `name`; git refuses when it has unmerged commits.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the checkout that owns the branch.
-    /// - `name`: the branch.
-    ///
-    /// Return: nothing; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The checkout that owns the branch.
+    /// - `name`: The branch.
+    /// - Returns: `error.GitFailed` when `git` fails, or spawn errors.
     pub fn branchDelete(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, name: []const u8) !void {
         try Self.runVoid(allocator, io, repo, &.{ "branch", "--quiet", "-d", name });
     }
 
     /// Lists the tags of the remote repository at `url`, without fetching it.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the returned listing.
+    /// - `allocator`: Allocator for the returned listing.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: any directory git may run in; nothing in it is read.
-    /// - `url`: the remote repository.
-    ///
-    /// Return: `<sha>\trefs/tags/<tag>` lines, plus `<commit>\trefs/tags/<tag>^{}` for an annotated tag, owned by the caller; `error.GitFailed` or spawn errors.
+    /// - `repo`: Any directory git may run in; nothing in it is read.
+    /// - `url`: The remote repository.
+    /// - Returns: `<sha>\trefs/tags/<tag>` lines, plus `<commit>\trefs/tags/<tag>^{}` for an annotated tag, owned by the caller; `error.GitFailed` or spawn errors.
     pub fn remoteTags(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, url: []const u8) ![]u8 {
         // `--` ends the options, so a URL from a manifest cannot pass as one. No `--refs`:
         // an annotated tag's own line names the tag object, and only its `^{}` line the commit.
@@ -346,13 +304,11 @@ pub const Git = struct {
 
     /// Reports whether git ignores `path`, so it can never be committed by accident.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: a directory inside the repository.
-    /// - `path`: the file, relative to `repo`.
-    ///
-    /// Return: `true` when ignored; `error.GitFailed` when `repo` is outside a repository, or spawn errors.
+    /// - `repo`: A directory inside the repository.
+    /// - `path`: The file, relative to `repo`.
+    /// - Returns: `true` when ignored; `error.GitFailed` when `repo` is outside a repository, or spawn errors.
     pub fn isIgnored(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, path: []const u8) !bool {
         const out = try Self.runOptional(allocator, io, repo, &.{ "check-ignore", "--quiet", path }) orelse return false;
         allocator.free(out);
@@ -361,53 +317,45 @@ pub const Git = struct {
 
     /// Runs `git -C repo args…` and discards its output.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the child's output, freed before return.
+    /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the directory git runs in.
-    /// - `args`: the arguments after `git -C repo`.
-    ///
-    /// Return: nothing; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The directory git runs in.
+    /// - `args`: The arguments after `git -C repo`.
+    /// - Returns: `error.GitFailed` when `git` fails, or spawn errors.
     fn runVoid(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, args: []const []const u8) !void {
         allocator.free(try Self.run(allocator, io, repo, args));
     }
 
     /// Runs `git -C repo args…` and returns its trimmed stdout; any non-zero exit is a failure.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the returned output.
+    /// - `allocator`: Allocator for the returned output.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the directory git runs in.
-    /// - `args`: the arguments after `git -C repo`.
-    ///
-    /// Return: trimmed stdout, owned by the caller; `error.GitFailed` when `git` fails, or spawn errors.
+    /// - `repo`: The directory git runs in.
+    /// - `args`: The arguments after `git -C repo`.
+    /// - Returns: Trimmed stdout, owned by the caller; `error.GitFailed` when `git` fails, or spawn errors.
     fn run(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, args: []const []const u8) ![]u8 {
         return try Self.runExpecting(allocator, io, repo, args, false) orelse unreachable;
     }
 
     /// Runs `git -C repo args…`, treating exit 1 as "not found".
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the returned output.
+    /// - `allocator`: Allocator for the returned output.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the directory git runs in.
-    /// - `args`: the arguments after `git -C repo`.
-    ///
-    /// Return: trimmed stdout, owned by the caller; `null` on exit 1; `error.GitFailed` or spawn errors.
+    /// - `repo`: The directory git runs in.
+    /// - `args`: The arguments after `git -C repo`.
+    /// - Returns: Trimmed stdout, owned by the caller; `null` on exit 1; `error.GitFailed` or spawn errors.
     fn runOptional(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, args: []const []const u8) !?[]u8 {
         return Self.runExpecting(allocator, io, repo, args, true);
     }
 
     /// Runs `git -C repo args…` and collects its output.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the returned output.
+    /// - `allocator`: Allocator for the returned output.
     /// - `io`: IO the `git` child is spawned on.
-    /// - `repo`: the directory git runs in.
-    /// - `args`: the arguments after `git -C repo`.
-    /// - `missing_ok`: whether exit 1 means "not found" rather than failure.
-    ///
-    /// Return: trimmed stdout, owned by the caller; `null` on exit 1 when `missing_ok`; `error.GitFailed` or spawn errors.
+    /// - `repo`: The directory git runs in.
+    /// - `args`: The arguments after `git -C repo`.
+    /// - `missing_ok`: Whether exit 1 means "not found" rather than failure.
+    /// - Returns: Trimmed stdout, owned by the caller; `null` on exit 1 when `missing_ok`; `error.GitFailed` or spawn errors.
     fn runExpecting(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, args: []const []const u8, missing_ok: bool) !?[]u8 {
         const argv = try allocator.alloc([]const u8, args.len + 3);
         defer allocator.free(argv);
@@ -448,11 +396,9 @@ const TestRepo = struct {
 
     /// Creates the scratch directory and the origin repository in it.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for paths; freed by `deinit`.
+    /// - `allocator`: Allocator for paths; freed by `deinit`.
     /// - `io`: IO for the filesystem and `git`.
-    ///
-    /// Return: the fixture; spawn and filesystem errors.
+    /// - Returns: The fixture; spawn and filesystem errors.
     fn init(allocator: std.mem.Allocator, io: std.Io) !Self {
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
@@ -469,8 +415,7 @@ const TestRepo = struct {
 
     /// Removes the scratch directory.
     ///
-    /// Parameters:
-    /// - `self`: the fixture.
+    /// - `self`: The fixture.
     fn deinit(self: *Self) void {
         self.allocator.free(self.root);
         self.tmp.cleanup();
@@ -478,23 +423,19 @@ const TestRepo = struct {
 
     /// Joins `sub` onto the scratch directory.
     ///
-    /// Parameters:
-    /// - `self`: the fixture.
-    /// - `sub`: a path inside it.
-    ///
-    /// Return: the absolute path, owned by the caller; allocation errors.
+    /// - `self`: The fixture.
+    /// - `sub`: A path inside it.
+    /// - Returns: The absolute path, owned by the caller; allocation errors.
     fn path(self: *const Self, sub: []const u8) ![]u8 {
         return std.Io.Dir.path.join(self.allocator, &.{ self.root, sub });
     }
 
     /// Writes file `name` in repository `repo` and commits it.
     ///
-    /// Parameters:
-    /// - `self`: the fixture.
-    /// - `repo`: the repository, relative to the scratch directory.
-    /// - `name`: the file to write and the commit message.
-    ///
-    /// Return: nothing; spawn and filesystem errors.
+    /// - `self`: The fixture.
+    /// - `repo`: The repository, relative to the scratch directory.
+    /// - `name`: The file to write and the commit message.
+    /// - Returns: Spawn and filesystem errors.
     fn commit(self: *const Self, repo: []const u8, name: []const u8) !void {
         const dir = try self.path(repo);
         defer self.allocator.free(dir);
@@ -507,11 +448,9 @@ const TestRepo = struct {
 
     /// Runs a command and expects it to succeed.
     ///
-    /// Parameters:
-    /// - `self`: the fixture.
-    /// - `argv`: the command.
-    ///
-    /// Return: nothing; `error.TestUnexpectedResult` on failure, or spawn errors.
+    /// - `self`: The fixture.
+    /// - `argv`: The command.
+    /// - Returns: `error.TestUnexpectedResult` on failure, or spawn errors.
     fn git(self: *const Self, argv: []const []const u8) !void {
         const result = try std.process.run(self.allocator, self.io, .{ .argv = argv });
         defer self.allocator.free(result.stdout);

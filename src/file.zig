@@ -10,11 +10,9 @@ pub const File = struct {
 
     /// Reports whether `path` exists.
     ///
-    /// Parameters:
     /// - `io`: IO for the filesystem.
-    /// - `path`: the file or directory.
-    ///
-    /// Return: `true` when it exists; IO errors other than "not found".
+    /// - `path`: The file or directory.
+    /// - Returns: `true` when it exists; IO errors other than "not found".
     pub fn exists(io: std.Io, path: []const u8) !bool {
         std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
             error.FileNotFound => return false,
@@ -25,13 +23,11 @@ pub const File = struct {
 
     /// Reads the file at `path`, or reports that there is none.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the contents.
+    /// - `allocator`: Allocator for the contents.
     /// - `io`: IO for the filesystem.
-    /// - `path`: the file.
-    /// - `limit`: the most it may hold.
-    ///
-    /// Return: the contents, owned by the caller, or `null` when missing; `error.StreamTooLong` past `limit`.
+    /// - `path`: The file.
+    /// - `limit`: The most it may hold.
+    /// - Returns: The contents, owned by the caller, or `null` when missing; `error.StreamTooLong` past `limit`.
     pub fn readOptional(allocator: std.mem.Allocator, io: std.Io, path: []const u8, limit: std.Io.Limit) !?[]u8 {
         return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, limit) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -41,13 +37,11 @@ pub const File = struct {
 
     /// Reads the file at `path` with a terminating 0, or reports that there is none.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the contents.
+    /// - `allocator`: Allocator for the contents.
     /// - `io`: IO for the filesystem.
-    /// - `path`: the file.
-    /// - `limit`: the most it may hold.
-    ///
-    /// Return: the 0-terminated contents, owned by the caller, or `null` when missing; `error.StreamTooLong` past `limit`.
+    /// - `path`: The file.
+    /// - `limit`: The most it may hold.
+    /// - Returns: The 0-terminated contents, owned by the caller, or `null` when missing; `error.StreamTooLong` past `limit`.
     pub fn readOptionalZ(allocator: std.mem.Allocator, io: std.Io, path: []const u8, limit: std.Io.Limit) !?[:0]u8 {
         return std.Io.Dir.cwd().readFileAllocOptions(io, path, allocator, limit, .of(u8), 0) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -57,11 +51,9 @@ pub const File = struct {
 
     /// Creates the directory `path` goes in, and any missing above it.
     ///
-    /// Parameters:
     /// - `io`: IO for the filesystem.
-    /// - `path`: a file or directory; a bare name has no parent to create.
-    ///
-    /// Return: nothing; IO errors.
+    /// - `path`: A file or directory; a bare name has no parent to create.
+    /// - Returns: IO errors.
     pub fn createParentDir(io: std.Io, path: []const u8) !void {
         try std.Io.Dir.cwd().createDirPath(io, std.Io.Dir.path.dirname(path) orelse return);
     }

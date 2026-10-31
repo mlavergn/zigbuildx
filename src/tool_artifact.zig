@@ -19,17 +19,14 @@ pub const ToolArtifact = struct {
 
     /// Returns the host tool of the zigbuildx package this code belongs to, whatever the consumer named it.
     ///
-    /// Parameters:
-    /// - `b`: the build graph of a package that depends on zigbuildx.
-    ///
-    /// Return: the executable; panics when `b`'s package does not depend on this zigbuildx.
+    /// - `b`: The build graph of a package that depends on zigbuildx.
+    /// - Returns: The executable; panics when `b`'s package does not depend on this zigbuildx.
     pub fn add(b: *std.Build) *std.Build.Step.Compile {
         const root = @import("root");
         if (comptime !@hasDecl(root, "dependencies")) @panic("ToolArtifact.add runs only in a build runner");
-        const packages = root.dependencies.packages;
         // By identity, not name: two packages in one build may each depend on a different zigbuildx.
-        inline for (@typeInfo(packages).@"struct".decl_names) |decl_name| {
-            const package = @field(packages, decl_name);
+        inline for (@typeInfo(root.dependencies.packages).@"struct".decl_names) |decl_name| {
+            const package = @field(root.dependencies.packages, decl_name);
             if (comptime Self.isSelf(package)) return b.dependencyFromBuildZig(package.build_zig, .{}).artifact(Self.name);
         }
         @panic("zigbuildx is not among the build's packages");
@@ -37,7 +34,7 @@ pub const ToolArtifact = struct {
 
     /// Names this zigbuildx among the root package's own dependencies.
     ///
-    /// Return: the field `build.zig.zon` gives it, or null when the root does not list it itself.
+    /// - Returns: The field `build.zig.zon` gives it, or null when the root does not list it itself.
     pub fn dependencyName() ?[]const u8 {
         const root = @import("root");
         if (comptime !@hasDecl(root, "dependencies")) return null;
@@ -49,10 +46,8 @@ pub const ToolArtifact = struct {
 
     /// Reports whether `package`, an entry of the build runner's package table, is this zigbuildx.
     ///
-    /// Parameters:
-    /// - `package`: the entry.
-    ///
-    /// Return: `true` when its `build.zig` re-exports this module's `Deps`.
+    /// - `package`: The entry.
+    /// - Returns: `true` when its `build.zig` re-exports this module's `Deps`.
     fn isSelf(comptime package: type) bool {
         if (!@hasDecl(package, "build_zig")) return false;
         const build_zig = package.build_zig;

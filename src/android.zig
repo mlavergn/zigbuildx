@@ -1,80 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zigbuildx_android);
-
-/// An Android ABI: what an APK names the directory holding its native libraries.
-pub const AndroidAbi = enum {
-    const Self = @This();
-
-    arm64V8a,
-    armeabiV7a,
-    x86_64,
-    x86,
-
-    /// Returns the ABI's directory under `lib/` in an APK.
-    ///
-    /// Parameters:
-    /// - `self`: the ABI.
-    ///
-    /// Return: the name, e.g. `arm64-v8a`.
-    pub fn dirName(self: Self) []const u8 {
-        return switch (self) {
-            .arm64V8a => "arm64-v8a",
-            .armeabiV7a => "armeabi-v7a",
-            .x86_64 => "x86_64",
-            .x86 => "x86",
-        };
-    }
-
-    /// Returns the NDK sysroot's directory for the ABI, under `usr/include` and `usr/lib`.
-    ///
-    /// Parameters:
-    /// - `self`: the ABI.
-    ///
-    /// Return: the triple, e.g. `aarch64-linux-android`.
-    pub fn triple(self: Self) []const u8 {
-        return switch (self) {
-            .arm64V8a => "aarch64-linux-android",
-            .armeabiV7a => "arm-linux-androideabi",
-            .x86_64 => "x86_64-linux-android",
-            .x86 => "i686-linux-android",
-        };
-    }
-
-    /// Returns the Zig target query for the ABI at Android API level `api`.
-    ///
-    /// Parameters:
-    /// - `self`: the ABI.
-    /// - `api`: the minimum Android API level.
-    ///
-    /// Return: the query.
-    pub fn query(self: Self, api: u32) std.Target.Query {
-        // The 32-bit ABIs name a CPU, since Android's baselines sit above Zig's:
-        // armeabi-v7a devices are ARMv7-A with NEON (Cortex-A7), and x86 devices guarantee SSSE3.
-        return switch (self) {
-            .arm64V8a => .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .android, .android_api_level = api },
-            .armeabiV7a => .{ .cpu_arch = .arm, .cpu_model = .{ .explicit = &std.Target.arm.cpu.cortex_a7 }, .os_tag = .linux, .abi = .androideabi, .android_api_level = api },
-            .x86_64 => .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .android, .android_api_level = api },
-            .x86 => .{ .cpu_arch = .x86, .cpu_model = .{ .explicit = &std.Target.x86.cpu.i686 }, .cpu_features_add = std.Target.x86.featureSet(&.{.ssse3}), .os_tag = .linux, .abi = .android, .android_api_level = api },
-        };
-    }
-
-    /// Returns the ABI a resolved target builds for.
-    ///
-    /// Parameters:
-    /// - `target`: the target.
-    ///
-    /// Return: the ABI, or null when `target` is not Android.
-    pub fn fromTarget(target: std.Target) ?Self {
-        if (!target.abi.isAndroid()) return null;
-        return switch (target.cpu.arch) {
-            .aarch64 => .arm64V8a,
-            .arm, .thumb => .armeabiV7a,
-            .x86_64 => .x86_64,
-            .x86 => .x86,
-            else => null,
-        };
-    }
-};
+const mod = @import("module.zig");
 
 /// Builds Android native libraries, with no Java or Kotlin.
 ///
@@ -113,10 +39,8 @@ pub const Android = struct {
 
     /// Creates an unresolved handle for build graph `b`.
     ///
-    /// Parameters:
-    /// - `b`: the build graph; must outlive the handle.
-    ///
-    /// Return: the handle.
+    /// - `b`: The build graph; must outlive the handle.
+    /// - Returns: The handle.
     pub fn init(b: *std.Build) !Self {
         var self = Self.initWith(b.allocator, b.graph.io);
         self.b = b;
@@ -125,19 +49,16 @@ pub const Android = struct {
 
     /// Creates an unresolved handle with no build graph, for the unit tests.
     ///
-    /// Parameters:
-    /// - `allocator`: backs the resolved paths; must outlive the handle.
+    /// - `allocator`: Backs the resolved paths; must outlive the handle.
     /// - `io`: IO for inspecting the SDK.
-    ///
-    /// Return: the handle, usable with `resolveFrom` but not `resolve` or `configure`.
+    /// - Returns: The handle, usable with `resolveFrom` but not `resolve` or `configure`.
     fn initWith(allocator: std.mem.Allocator, io: std.Io) Self {
         return Self{ .arena = std.heap.ArenaAllocator.init(allocator), .io = io };
     }
 
     /// Frees the resolved paths.
     ///
-    /// Parameters:
-    /// - `self`: the handle.
+    /// - `self`: The handle.
     pub fn deinit(self: *Self) void {
         self.arena.deinit();
     }
@@ -145,10 +66,8 @@ pub const Android = struct {
     /// Locates the SDK, the NDK and the NDK sysroot for this host.
     /// Poisons the configure cache: every build that resolves Android configures again.
     ///
-    /// Parameters:
-    /// - `self`: the handle to populate; its build graph's environment and host are read.
-    ///
-    /// Return: nothing; `error.AndroidSdkNotFound` naming what is missing.
+    /// - `self`: The handle to populate; its build graph's environment and host are read.
+    /// - Returns: `error.AndroidSdkNotFound` naming what is missing.
     pub fn resolve(self: *Self) !void {
         // Zig 0.17 reuses a configured graph until a tracked input changes, and neither the
         // environment nor a newer NDK appearing is tracked.
@@ -162,23 +81,19 @@ pub const Android = struct {
 
     /// Returns the target for `abi` at Android API level `api`.
     ///
-    /// Parameters:
-    /// - `b`: the build graph.
-    /// - `abi`: the ABI.
-    /// - `api`: the minimum API level, which the NDK's libraries are chosen by.
-    ///
-    /// Return: the resolved target.
-    pub fn resolveTarget(b: *std.Build, abi: AndroidAbi, api: u32) std.Build.ResolvedTarget {
+    /// - `b`: The build graph.
+    /// - `abi`: The ABI.
+    /// - `api`: The minimum API level, which the NDK's libraries are chosen by.
+    /// - Returns: The resolved target.
+    pub fn resolveTarget(b: *std.Build, abi: mod.AndroidAbi, api: u32) std.Build.ResolvedTarget {
         return b.resolveTargetQuery(abi.query(api));
     }
 
     /// Makes `lib` link against the NDK: libc, the libc file, and 16 KB pages.
     ///
-    /// Parameters:
-    /// - `self`: a resolved handle.
-    /// - `lib`: a library whose target came from `resolveTarget`.
-    ///
-    /// Return: nothing; `error.NotAndroid` when `lib`'s target is not Android.
+    /// - `self`: A resolved handle.
+    /// - `lib`: A library whose target came from `resolveTarget`.
+    /// - Returns: `error.NotAndroid` when `lib`'s target is not Android.
     pub fn configure(self: *Self, lib: *std.Build.Step.Compile) !void {
         std.debug.assert(self.loaded);
         const resolved = lib.root_module.resolved_target orelse {
@@ -186,7 +101,7 @@ pub const Android = struct {
             return error.NotAndroid;
         };
         const target = resolved.result;
-        const abi = AndroidAbi.fromTarget(target) orelse {
+        const abi = mod.AndroidAbi.fromTarget(target) orelse {
             log.err("{s} does not target Android", .{lib.name});
             return error.NotAndroid;
         };
@@ -198,12 +113,10 @@ pub const Android = struct {
 
     /// Populates the handle from `environ` for a `host` build.
     ///
-    /// Parameters:
-    /// - `self`: the handle.
-    /// - `environ`: the build's environment.
-    /// - `host`: the build host's OS, which picks the NDK prebuilt.
-    ///
-    /// Return: nothing; `error.AndroidSdkNotFound`, `error.AndroidNdkNotFound` or `error.UnsupportedHost`, naming the path in `missing`.
+    /// - `self`: The handle.
+    /// - `environ`: The build's environment.
+    /// - `host`: The build host's OS, which picks the NDK prebuilt.
+    /// - Returns: `error.AndroidSdkNotFound`, `error.AndroidNdkNotFound` or `error.UnsupportedHost`, naming the path in `missing`.
     fn resolveFrom(self: *Self, environ: *const std.process.Environ.Map, host: std.Target.Os.Tag) !void {
         const allocator = self.arena.allocator();
         const cwd = std.Io.Dir.cwd();
@@ -234,11 +147,9 @@ pub const Android = struct {
 
     /// Explains a `resolveFrom` failure, naming what was looked for and how to point at it.
     ///
-    /// Parameters:
-    /// - `self`: the handle `resolveFrom` failed on; its `missing` names the path.
-    /// - `err`: the error `resolveFrom` returned.
-    ///
-    /// Return: the message, owned by the handle; allocation errors.
+    /// - `self`: The handle `resolveFrom` failed on; its `missing` names the path.
+    /// - `err`: The error `resolveFrom` returned.
+    /// - Returns: The message, owned by the handle; allocation errors.
     fn describeFailure(self: *Self, err: anyerror) ![]const u8 {
         const allocator = self.arena.allocator();
         return switch (err) {
@@ -255,13 +166,11 @@ pub const Android = struct {
 
     /// Returns the libc file that points Zig at the NDK sysroot for `abi` at `api`.
     ///
-    /// Parameters:
-    /// - `self`: a resolved handle.
-    /// - `abi`: the ABI.
-    /// - `api`: the API level, which selects the sysroot's `usr/lib/<triple>/<api>`.
-    ///
-    /// Return: the file's text, owned by the handle; allocation errors.
-    fn libCText(self: *Self, abi: AndroidAbi, api: u32) ![]const u8 {
+    /// - `self`: A resolved handle.
+    /// - `abi`: The ABI.
+    /// - `api`: The API level, which selects the sysroot's `usr/lib/<triple>/<api>`.
+    /// - Returns: The file's text, owned by the handle; allocation errors.
+    fn libCText(self: *Self, abi: mod.AndroidAbi, api: u32) ![]const u8 {
         const allocator = self.arena.allocator();
         const include = try std.Io.Dir.path.join(allocator, &.{ self.sysroot, "usr", "include" });
         const sys_include = try std.Io.Dir.path.join(allocator, &.{ include, abi.triple() });
@@ -283,11 +192,9 @@ pub const Android = struct {
     /// Returns the newest entry of directory `path`, comparing the numbers in each name.
     /// Names with no number (preview platforms) are skipped.
     ///
-    /// Parameters:
-    /// - `self`: the handle.
-    /// - `path`: the directory.
-    ///
-    /// Return: the entry's name, or null when the directory is absent or holds none; IO errors.
+    /// - `self`: The handle.
+    /// - `path`: The directory.
+    /// - Returns: The entry's name, or null when the directory is absent or holds none; IO errors.
     fn newest(self: *Self, path: []const u8) !?[]const u8 {
         var dir = std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true }) catch return null;
         defer dir.close(self.io);
@@ -306,10 +213,8 @@ pub const Android = struct {
 
     /// Returns the first four numbers in `name`, zero-filled.
     ///
-    /// Parameters:
-    /// - `name`: a versioned name, e.g. `35.0.1` or `android-35`.
-    ///
-    /// Return: the numbers, or null when `name` holds none.
+    /// - `name`: A versioned name, e.g. `35.0.1` or `android-35`.
+    /// - Returns: The numbers, or null when `name` holds none.
     fn versionOf(name: []const u8) ?[4]u32 {
         var version: [4]u32 = .{ 0, 0, 0, 0 };
         var count: usize = 0;
@@ -324,10 +229,8 @@ pub const Android = struct {
 
     /// Returns the NDK prebuilt directory name for a host.
     ///
-    /// Parameters:
-    /// - `host`: the host OS.
-    ///
-    /// Return: the name, or null for a host the NDK does not support.
+    /// - `host`: The host OS.
+    /// - Returns: The name, or null for a host the NDK does not support.
     fn hostTag(host: std.Target.Os.Tag) ?[]const u8 {
         return switch (host) {
             // Google ships `darwin-x86_64` as a universal binary, so Apple Silicon uses it too.
@@ -340,12 +243,10 @@ pub const Android = struct {
 
     /// Returns Android Studio's default SDK location for `host`.
     ///
-    /// Parameters:
-    /// - `allocator`: owns the path.
-    /// - `environ`: the build's environment.
-    /// - `host`: the host OS.
-    ///
-    /// Return: the path; `error.AndroidSdkNotFound` when the home directory is unknown.
+    /// - `allocator`: Owns the path.
+    /// - `environ`: The build's environment.
+    /// - `host`: The host OS.
+    /// - Returns: The path; `error.AndroidSdkNotFound` when the home directory is unknown.
     fn defaultSdk(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, host: std.Target.Os.Tag) ![]const u8 {
         if (host == .windows) {
             const local = environ.get("LOCALAPPDATA") orelse return error.AndroidSdkNotFound;
@@ -360,17 +261,6 @@ pub const Android = struct {
 // -----------------------------------------------------------------------------
 // Unit Tests
 
-test "every ABI round-trips through its target" {
-    const io = std.testing.io;
-    for (std.enums.values(AndroidAbi)) |abi| {
-        const target = try std.zig.system.resolveTargetQuery(io, abi.query(30));
-        try std.testing.expectEqual(abi, AndroidAbi.fromTarget(target).?);
-        try std.testing.expectEqual(@as(u32, 30), target.os.version_range.linux.android);
-    }
-    const desktop = try std.zig.system.resolveTargetQuery(io, .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu });
-    try std.testing.expectEqual(@as(?AndroidAbi, null), AndroidAbi.fromTarget(desktop));
-}
-
 test "versionOf reads the numbers in a name" {
     try std.testing.expectEqual([4]u32{ 35, 0, 1, 0 }, Android.versionOf("35.0.1").?);
     try std.testing.expectEqual([4]u32{ 35, 0, 0, 0 }, Android.versionOf("android-35").?);
@@ -380,11 +270,9 @@ test "versionOf reads the numbers in a name" {
 
 /// Builds a fake SDK under `root`: two NDKs, the newer with a sysroot for every host.
 ///
-/// Parameters:
 /// - `io`: IO for the filesystem.
-/// - `root`: the directory to build it in.
-///
-/// Return: nothing; IO errors.
+/// - `root`: The directory to build it in.
+/// - Returns: IO errors.
 fn makeFakeSdk(io: std.Io, root: std.Io.Dir) !void {
     const dirs = [_][]const u8{
         "sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/darwin-x86_64/sysroot",
@@ -422,7 +310,7 @@ test "resolve picks the newest NDK, and the sysroot for every host" {
         try tmp.dir.writeFile(io, .{ .sub_path = "libc.txt", .data = text });
         const libc_path = try std.Io.Dir.path.join(allocator, &.{ root, "libc.txt" });
         defer allocator.free(libc_path);
-        const target = try std.zig.system.resolveTargetQuery(io, AndroidAbi.arm64V8a.query(30));
+        const target = try std.zig.system.resolveTargetQuery(io, mod.AndroidAbi.arm64V8a.query(30));
         var libc = try std.zig.LibCInstallation.parse(allocator, io, libc_path, &target);
         libc.deinit(allocator);
         try std.testing.expect(std.mem.find(u8, text, "aarch64-linux-android") != null);

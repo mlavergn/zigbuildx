@@ -24,11 +24,9 @@ pub const Docs = struct {
     /// Returns autodoc site `docs` with private declarations listed alongside public ones.
     /// Fails the build when Zig's front end no longer has the code it patches.
     ///
-    /// Parameters:
-    /// - `b`: the build graph.
-    /// - `docs`: an emitted site, from `getEmittedDocs()`.
-    ///
-    /// Return: the patched site's directory, for `b.addInstallDirectory`.
+    /// - `b`: The build graph.
+    /// - `docs`: An emitted site, from `getEmittedDocs()`.
+    /// - Returns: The patched site's directory, for `b.addInstallDirectory`.
     pub fn includePrivate(b: *std.Build, docs: std.Build.LazyPath) std.Build.LazyPath {
         // Zig's autodoc renders public declarations only; the host tool copies the site, patching `main.js`.
         const run = b.addRunArtifact(mod.ToolArtifact.add(b));
@@ -40,11 +38,9 @@ pub const Docs = struct {
 
     /// Returns `js` with each replacement applied; each pattern must occur exactly once.
     ///
-    /// Parameters:
-    /// - `allocator`: owns the result.
-    /// - `js`: the contents of `main.js`.
-    ///
-    /// Return: the patched script; `error.AutodocChanged` when a pattern is missing or repeated.
+    /// - `allocator`: Owns the result.
+    /// - `js`: The contents of `main.js`.
+    /// - Returns: The patched script; `error.AutodocChanged` when a pattern is missing or repeated.
     pub fn patch(allocator: std.mem.Allocator, js: []const u8) ![]u8 {
         var current = try allocator.dupe(u8, js);
         errdefer allocator.free(current);
@@ -65,11 +61,9 @@ pub const Docs = struct {
 
     /// `zigbuildx docs-patch <in-dir> <out-dir>`: copies the autodoc site at `in-dir`, patching `main.js`.
     ///
-    /// Parameters:
-    /// - `process_init`: the process's allocator and IO.
-    /// - `args`: the command line after the program's path; `args[0]` is the command.
-    ///
-    /// Return: nothing; `error.InvalidArguments`, `error.AutodocChanged` when `main.js` is unpatchable, or IO errors.
+    /// - `process_init`: The process's allocator and IO.
+    /// - `args`: The command line after the program's path; `args[0]` is the command.
+    /// - Returns: `error.InvalidArguments`, `error.AutodocChanged` when `main.js` is unpatchable, or IO errors.
     pub fn command(process_init: std.process.Init, args: []const [:0]const u8) !void {
         const allocator = process_init.gpa;
         const io = process_init.io;

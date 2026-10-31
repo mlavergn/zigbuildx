@@ -2,6 +2,15 @@ const std = @import("std");
 const log = std.log.scoped(.zigbuildx_tool);
 const mod = @import("module.zig");
 
+/// A `Tool` command's name and the function that runs it.
+const Command = struct {
+    const Self = @This();
+    /// The name a step passes first.
+    name: []const u8,
+    /// The command's method on the struct it serves.
+    run: *const fn (process_init: std.process.Init, args: []const [:0]const u8) anyerror!void,
+};
+
 /// zigbuildx's host program: one command per job a build step hands it.
 ///
 /// Built for the build host through `ToolArtifact.add` and run by `Run` steps, so
@@ -9,15 +18,6 @@ const mod = @import("module.zig");
 /// command lives with the extension it serves; this only dispatches.
 pub const Tool = struct {
     const Self = @This();
-
-    /// A command's name and the function that runs it.
-    const Command = struct {
-        const Self = @This();
-        /// The name a step passes first.
-        name: []const u8,
-        /// The command's method on the struct it serves.
-        run: *const fn (process_init: std.process.Init, args: []const [:0]const u8) anyerror!void,
-    };
 
     /// Every command, by the name a step passes first.
     const commands = [_]Command{
@@ -35,11 +35,9 @@ pub const Tool = struct {
 
     /// Runs the command `args[0]` names.
     ///
-    /// Parameters:
-    /// - `process_init`: the process's allocator and IO.
-    /// - `args`: the command line after the program's path.
-    ///
-    /// Return: nothing; `error.InvalidArguments` for an unknown or missing command, or the command's errors.
+    /// - `process_init`: The process's allocator and IO.
+    /// - `args`: The command line after the program's path.
+    /// - Returns: `error.InvalidArguments` for an unknown or missing command, or the command's errors.
     pub fn dispatch(process_init: std.process.Init, args: []const [:0]const u8) !void {
         if (args.len > 0) {
             for (Self.commands) |entry| {
@@ -53,10 +51,8 @@ pub const Tool = struct {
 
 /// Runs zigbuildx's host program.
 ///
-/// Parameters:
-/// - `init`: the process's allocator, IO and arguments.
-///
-/// Return: nothing; exits 1 on an error the command already reported, else returns the error.
+/// - `init`: The process's allocator, IO and arguments.
+/// - Returns: The command's error; exits 1 instead on one it already reported.
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     // An empty argv has not even the program's path; there is no command to find.

@@ -50,12 +50,10 @@ pub const ZipArchive = struct {
 
     /// Reads the URL the directory at `dir` was unpacked from.
     ///
-    /// Parameters:
-    /// - `allocator`: an arena for the result.
+    /// - `allocator`: An arena for the result.
     /// - `io`: IO for the filesystem.
-    /// - `dir`: the dependency's absolute path.
-    ///
-    /// Return: the URL, or `null` when `dir` has no stamp; IO errors.
+    /// - `dir`: The dependency's absolute path.
+    /// - Returns: The URL, or `null` when `dir` has no stamp; IO errors.
     pub fn source(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !?[]const u8 {
         const path = try std.Io.Dir.path.join(allocator, &.{ dir, stamp_name });
         const text = try mod.File.readOptional(allocator, io, path, .limited(Self.max_stamp_bytes)) orelse return null;
@@ -64,13 +62,11 @@ pub const ZipArchive = struct {
 
     /// Downloads the zip at `url` and unpacks it at `dest`, replacing an earlier unpack; `dest` is untouched on failure.
     ///
-    /// Parameters:
-    /// - `allocator`: an arena for everything it allocates.
+    /// - `allocator`: An arena for everything it allocates.
     /// - `io`: IO for the filesystem and `curl`.
-    /// - `url`: an `https://`, `http://` or `file://` URL of a zip.
-    /// - `dest`: the dependency's absolute path; the caller decides it may be replaced.
-    ///
-    /// Return: nothing; `error.ArchiveDownloadFailed`, `error.ArchiveEmpty`, or IO and zip errors, none of them logged.
+    /// - `url`: An `https://`, `http://` or `file://` URL of a zip.
+    /// - `dest`: The dependency's absolute path; the caller decides it may be replaced.
+    /// - Returns: `error.ArchiveDownloadFailed`, `error.ArchiveEmpty`, or IO and zip errors, none of them logged.
     pub fn unpack(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest: []const u8) !void {
         const cwd = std.Io.Dir.cwd();
         // Downloaded and unpacked beside `dest`, then renamed into place, so a failed download leaves `dest`.
@@ -104,13 +100,11 @@ pub const ZipArchive = struct {
 
     /// Downloads `url` to the file at `path`.
     ///
-    /// Parameters:
-    /// - `allocator`: an arena for a local archive's contents.
+    /// - `allocator`: An arena for a local archive's contents.
     /// - `io`: IO for the filesystem and `curl`.
-    /// - `url`: an `https://`, `http://` or `file://` URL.
-    /// - `path`: the file to write.
-    ///
-    /// Return: nothing; `error.ArchiveDownloadFailed` when `curl` fails, or IO errors.
+    /// - `url`: An `https://`, `http://` or `file://` URL.
+    /// - `path`: The file to write.
+    /// - Returns: `error.ArchiveDownloadFailed` when `curl` fails, or IO errors.
     fn download(allocator: std.mem.Allocator, io: std.Io, url: []const u8, path: []const u8) !void {
         const cwd = std.Io.Dir.cwd();
         if (std.mem.startsWith(u8, url, Self.file_scheme)) {
@@ -132,13 +126,11 @@ pub const ZipArchive = struct {
 
     /// Unpacks the zip at `zip_path` into `dir`.
     ///
-    /// Parameters:
-    /// - `allocator`: an arena for the result.
+    /// - `allocator`: An arena for the result.
     /// - `io`: IO for the filesystem.
-    /// - `zip_path`: the zip.
-    /// - `dir`: an empty directory to unpack into.
-    ///
-    /// Return: the zip's single top-level folder inside `dir`, else `dir`; `error.ArchiveEmpty`, or IO and zip errors.
+    /// - `zip_path`: The zip.
+    /// - `dir`: An empty directory to unpack into.
+    /// - Returns: The zip's single top-level folder inside `dir`, else `dir`; `error.ArchiveEmpty`, or IO and zip errors.
     fn extract(allocator: std.mem.Allocator, io: std.Io, zip_path: []const u8, dir: []const u8) ![]const u8 {
         const cwd = std.Io.Dir.cwd();
         var file = try cwd.openFile(io, zip_path, .{});
@@ -160,13 +152,11 @@ pub const ZipArchive = struct {
 
 /// Writes a zip of `entries` into `tmp` as `name`.
 ///
-/// Parameters:
-/// - `allocator`: an arena for the result.
-/// - `tmp`: the scratch directory.
-/// - `name`: the zip's file name.
+/// - `allocator`: An arena for the result.
+/// - `tmp`: The scratch directory.
+/// - `name`: The zip's file name.
 /// - `entries`: (name, contents) pairs, with `/`-separated names.
-///
-/// Return: the zip's `file://` URL; IO and zip errors.
+/// - Returns: The zip's `file://` URL; IO and zip errors.
 fn writeTestZip(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8, entries: []const [2][]const u8) ![]const u8 {
     var zip = mod.ZipBuilder.init(allocator);
     defer zip.deinit();

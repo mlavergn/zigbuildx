@@ -49,10 +49,8 @@ pub const Xcode = struct {
 
     /// Creates an unresolved handle for build graph `b`.
     ///
-    /// Parameters:
-    /// - `b`: the build graph; must outlive the handle.
-    ///
-    /// Return: the handle.
+    /// - `b`: The build graph; must outlive the handle.
+    /// - Returns: The handle.
     pub fn init(b: *std.Build) !Self {
         var self = Self.initWith(b.allocator, b.graph.io);
         self.b = b;
@@ -61,11 +59,9 @@ pub const Xcode = struct {
 
     /// Creates a handle for `target`, resolved for an Apple target on a Mac.
     ///
-    /// Parameters:
-    /// - `b`: the build graph; must outlive the handle.
-    /// - `target`: the target the modules are built for.
-    ///
-    /// Return: the handle; `error.FailedToResolveSDK` when a Mac has no SDK for the platform.
+    /// - `b`: The build graph; must outlive the handle.
+    /// - `target`: The target the modules are built for.
+    /// - Returns: The handle; `error.FailedToResolveSDK` when a Mac has no SDK for the platform.
     pub fn initFor(b: *std.Build, target: std.Build.ResolvedTarget) !Self {
         var self = try Self.init(b);
         self.apple = target.result.os.tag.isDarwin();
@@ -75,19 +71,16 @@ pub const Xcode = struct {
 
     /// Creates an unresolved handle with no build graph, for the unit tests.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the SDK paths; must outlive the handle.
+    /// - `allocator`: Allocator for the SDK paths; must outlive the handle.
     /// - `io`: IO for `xcrun`.
-    ///
-    /// Return: the handle, usable with `resolveSdk` only.
+    /// - Returns: The handle, usable with `resolveSdk` only.
     fn initWith(allocator: std.mem.Allocator, io: std.Io) Self {
         return Self{ .allocator = allocator, .io = io };
     }
 
     /// Frees the SDK paths when they were resolved; a handle from `init` need not call it.
     ///
-    /// Parameters:
-    /// - `self`: the handle.
+    /// - `self`: The handle.
     pub fn deinit(self: *Self) void {
         if (!self.loaded) return;
         self.allocator.free(self.libraries);
@@ -98,10 +91,8 @@ pub const Xcode = struct {
 
     /// Resolves the Apple Silicon macOS SDK into the handle; does nothing once resolved.
     ///
-    /// Parameters:
-    /// - `self`: the handle.
-    ///
-    /// Return: nothing; `error.FailedToResolveSDK` when there is no SDK.
+    /// - `self`: The handle.
+    /// - Returns: `error.FailedToResolveSDK` when there is no SDK.
     pub fn resolve(self: *Self) !void {
         if (self.loaded) return;
         try self.resolveFor(try std.zig.system.resolveTargetQuery(self.io, .{ .cpu_arch = .aarch64, .os_tag = .macos }));
@@ -109,11 +100,9 @@ pub const Xcode = struct {
 
     /// Resolves the SDK of `target`'s platform into the handle; does nothing once resolved.
     ///
-    /// Parameters:
-    /// - `self`: the handle.
-    /// - `target`: an Apple target; its OS and ABI pick the SDK.
-    ///
-    /// Return: nothing; `error.FailedToResolveSDK` when there is no SDK.
+    /// - `self`: The handle.
+    /// - `target`: An Apple target; its OS and ABI pick the SDK.
+    /// - Returns: `error.FailedToResolveSDK` when there is no SDK.
     pub fn resolveFor(self: *Self, target: std.Target) !void {
         if (self.loaded) return;
         try self.resolveSdk(target);
@@ -124,11 +113,9 @@ pub const Xcode = struct {
 
     /// Declares `-Dtarget` like `b.standardTargetOptions`, plus `-Dmacos-min`, the macOS deployment floor.
     ///
-    /// Parameters:
-    /// - `b`: the build graph.
-    /// - `default_min`: the floor without `-Dmacos-min`, as `major[.minor[.patch]]`.
-    ///
-    /// Return: the target; `error.InvalidVersion` when the floor does not parse.
+    /// - `b`: The build graph.
+    /// - `default_min`: The floor without `-Dmacos-min`, as `major[.minor[.patch]]`.
+    /// - Returns: The target; `error.InvalidVersion` when the floor does not parse.
     pub fn standardTargetOptions(b: *std.Build, default_min: []const u8) !std.Build.ResolvedTarget {
         const text = b.option([]const u8, "macos-min", "Minimum macOS version for macOS artifacts (major[.minor[.patch]])") orelse default_min;
         const min = Self.parseVersion(text) catch |err| {
@@ -142,9 +129,8 @@ pub const Xcode = struct {
 
     /// Adds the SDK's frameworks directory to `module`'s framework search path.
     ///
-    /// Parameters:
-    /// - `self`: a resolved handle.
-    /// - `module`: the module that links system frameworks.
+    /// - `self`: A resolved handle.
+    /// - `module`: The module that links system frameworks.
     pub fn addFrameworkPath(self: *const Self, module: *std.Build.Module) void {
         std.debug.assert(self.loaded);
         module.addFrameworkPath(module.owner.graph.cwdRelativePath(self.frameworks));
@@ -152,9 +138,8 @@ pub const Xcode = struct {
 
     /// Adds the SDK's frameworks directory and `usr/lib` to `module`'s search paths.
     ///
-    /// Parameters:
-    /// - `self`: a resolved handle.
-    /// - `module`: the module that links system frameworks.
+    /// - `self`: A resolved handle.
+    /// - `module`: The module that links system frameworks.
     pub fn addSdkPaths(self: *const Self, module: *std.Build.Module) void {
         self.addFrameworkPath(module);
         // A framework's stub names its dependencies by `/usr/lib` install name (CoreFoundation's
@@ -164,10 +149,9 @@ pub const Xcode = struct {
 
     /// Links `module` against SDK framework `name`; use it in place of `module.linkFramework`.
     ///
-    /// Parameters:
-    /// - `self`: the handle; does nothing when made for a non-Apple target.
-    /// - `module`: the module that links the framework.
-    /// - `name`: the framework, as `"CoreFoundation"`.
+    /// - `self`: The handle; does nothing when made for a non-Apple target.
+    /// - `module`: The module that links the framework.
+    /// - `name`: The framework, as `"CoreFoundation"`.
     pub fn linkFramework(self: *const Self, module: *std.Build.Module, name: []const u8) void {
         if (!self.apple) return;
         if (self.loaded) self.addSdkPaths(module);
@@ -176,11 +160,9 @@ pub const Xcode = struct {
 
     /// Makes `lib` build against the resolved SDK; required for iOS, tvOS, visionOS and watchOS.
     ///
-    /// Parameters:
-    /// - `self`: the handle `initFor` made for `lib`'s target; does nothing when unresolved or non-Apple.
-    /// - `lib`: a library or executable built for that target.
-    ///
-    /// Return: nothing; `error.TargetMismatch` when `lib` targets another platform.
+    /// - `self`: The handle `initFor` made for `lib`'s target; does nothing when unresolved or non-Apple.
+    /// - `lib`: A library or executable built for that target.
+    /// - Returns: `error.TargetMismatch` when `lib` targets another platform.
     pub fn configure(self: *const Self, lib: *std.Build.Step.Compile) !void {
         if (!self.apple or !self.loaded) return;
         const target = lib.root_module.resolved_target orelse {
@@ -205,11 +187,9 @@ pub const Xcode = struct {
     /// Assembles an `.xcframework` from libraries built for Apple targets, joining each platform's architectures.
     /// Configure each library with an `initFor` handle for its own target first.
     ///
-    /// Parameters:
-    /// - `b`: the build graph.
-    /// - `options`: the name, libraries and headers.
-    ///
-    /// Return: the `<name>.xcframework` directory, or null off macOS; `error.InvalidXcframework` for a library that is not for an Apple platform, or two for one platform and architecture.
+    /// - `b`: The build graph.
+    /// - `options`: The name, libraries and headers.
+    /// - Returns: The `<name>.xcframework` directory, or null off macOS; `error.InvalidXcframework` for a library that is not for an Apple platform, or two for one platform and architecture.
     pub fn addXcframework(b: *std.Build, options: Xcframework) !?std.Build.LazyPath {
         if (b.graph.host.result.os.tag != .macos) return null;
         if (options.libraries.len == 0) {
@@ -257,11 +237,9 @@ pub const Xcode = struct {
 
     /// Asks `xcrun` for `target`'s SDK and fills in the handle; does nothing once resolved.
     ///
-    /// Parameters:
-    /// - `self`: the handle.
-    /// - `target`: an Apple target; its OS and ABI pick the SDK.
-    ///
-    /// Return: nothing; `error.FailedToResolveSDK` when there is no SDK.
+    /// - `self`: The handle.
+    /// - `target`: An Apple target; its OS and ABI pick the SDK.
+    /// - Returns: `error.FailedToResolveSDK` when there is no SDK.
     fn resolveSdk(self: *Self, target: std.Target) !void {
         if (self.loaded) return;
         self.target = target;
@@ -281,34 +259,28 @@ pub const Xcode = struct {
 
     /// Reports whether `initFor` resolves an SDK for a `target` build on `host`.
     ///
-    /// Parameters:
-    /// - `target`: the build target's OS.
-    /// - `host`: the build host's OS.
-    ///
-    /// Return: `true` for an Apple target on a macOS host.
+    /// - `target`: The build target's OS.
+    /// - `host`: The build host's OS.
+    /// - Returns: `true` for an Apple target on a macOS host.
     fn resolvesFor(target: std.Target.Os.Tag, host: std.Target.Os.Tag) bool {
         return target.isDarwin() and host == .macos;
     }
 
     /// Names the platform an `.xcframework` files a target's library under.
     ///
-    /// Parameters:
-    /// - `allocator`: allocator for the name.
-    /// - `target`: an Apple target.
-    ///
-    /// Return: the OS, with `-simulator` for the simulator ABI (`ios-simulator`), owned by the caller.
+    /// - `allocator`: Allocator for the name.
+    /// - `target`: An Apple target.
+    /// - Returns: The OS, with `-simulator` for the simulator ABI (`ios-simulator`), owned by the caller.
     fn platformName(allocator: std.mem.Allocator, target: std.Target) ![]u8 {
         return allocator.print("{t}{s}", .{ target.os.tag, if (target.abi == .simulator) "-simulator" else "" });
     }
 
     /// Returns one library for a platform: the only one, or every architecture's joined by `lipo`.
     ///
-    /// Parameters:
-    /// - `b`: the build graph.
-    /// - `platform`: the platform's name, for the step's.
-    /// - `libs`: the platform's libraries, one per architecture.
-    ///
-    /// Return: the library.
+    /// - `b`: The build graph.
+    /// - `platform`: The platform's name, for the step's.
+    /// - `libs`: The platform's libraries, one per architecture.
+    /// - Returns: The library.
     fn joinArchitectures(b: *std.Build, platform: []const u8, libs: []const *std.Build.Step.Compile) std.Build.LazyPath {
         if (libs.len == 1) return libs[0].getEmittedBin();
         const lipo = b.addSystemCommand(&.{ "lipo", "-create" });
@@ -320,10 +292,8 @@ pub const Xcode = struct {
 
     /// Returns the libc file describing the resolved SDK's C library.
     ///
-    /// Parameters:
-    /// - `self`: a handle with `sdk` and `libraries` set.
-    ///
-    /// Return: the file's text, owned by `self.allocator`.
+    /// - `self`: A handle with `sdk` and `libraries` set.
+    /// - Returns: The file's text, owned by `self.allocator`.
     fn libCText(self: *const Self) ![]u8 {
         const include = try std.Io.Dir.path.join(self.allocator, &.{ self.sdk, "usr", "include" });
         defer self.allocator.free(include);
@@ -342,10 +312,8 @@ pub const Xcode = struct {
 
     /// Parses a `major[.minor[.patch]]` version, absent components being 0.
     ///
-    /// Parameters:
-    /// - `text`: the version.
-    ///
-    /// Return: the version; `error.InvalidVersion` when a component is not a number.
+    /// - `text`: The version.
+    /// - Returns: The version; `error.InvalidVersion` when a component is not a number.
     fn parseVersion(text: []const u8) !std.SemanticVersion {
         // `std.SemanticVersion.parse` requires all three components; a floor is written `26.0`.
         var parts = std.mem.splitScalar(u8, text, '.');

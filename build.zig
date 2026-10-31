@@ -1,8 +1,6 @@
 const std = @import("std");
-
-const builtin = @import("builtin");
-
 const mod = @import("src/module.zig");
+const builtin = @import("builtin");
 
 // zigbuildx targets one Zig release: std.Build moves between releases, and
 // several extensions work around defects in this one. A clear error here beats
@@ -29,8 +27,7 @@ pub const Docs = mod.Docs;
 
 /// Declares zigbuildx's host tool and its own test step; a consumer never calls it.
 ///
-/// Parameters:
-/// - `b`: the build graph.
+/// - `b`: The build graph.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});

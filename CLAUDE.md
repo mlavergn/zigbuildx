@@ -32,8 +32,8 @@ imported from other projects' `build.zig` instead of copied into each one.
 - `make cross`: compiles the suite and the host tool for x86_64 and aarch64
   Windows and Linux, without running them.
 - `format`, `lint` and `validate` come from `../styleguide/Makefile.in`, so
-  they need that sibling checkout. `make lint` runs `zlintpre`, then `zlint
-  -c ../styleguide --deny-warnings`, over `build.zig` and `ZIG_DIRS`
+  they need that sibling checkout. `make lint` runs `zlint -c ../styleguide
+  --deny-warnings` over `build.zig` and `ZIG_DIRS`
   (default `src cli web`; only `src/` exists). Add new source roots to
   `ZIG_DIRS`.
 - `make tag`: tags `v<.version>` and pushes it; `zigbuildx-pin` finds
@@ -64,11 +64,21 @@ zig fetch --save=zigbuildx ../zigbuildx   # from the scratch package
 build.zig              the public surface: re-exports Deps, Git, Xcode, Swift,
                        Android, AndroidAbi and Docs; installs the host tool
 src/module.zig         the barrel the tests compile
-src/deps.zig           Deps (clone, sync, update, pin) and its private Sync
+src/deps.zig           Deps: the entry points (clone, sync, update, pin)
+src/sync.zig           Sync: one run over the manifests, siblings and worktrees
+src/manifest.zig       Manifest: the parts of a `build.zig.zon` Deps reads
+src/entry.zig          Entry: one manifest dependency
+src/pin.zig            Pin: a worktree's SHA, tag or branch
+src/pin_kind.zig       PinKind: which of the three a pin is
+src/stamp.zig          Stamp: a worktree's `deps/.zigbuildx/*.rev` record
+src/mode.zig           Mode: develop or CI
+src/updated.zig        Updated: what an update moved or skipped
+src/release_pin.zig    ReleasePin: `git+` URLs and release tags for `zigbuildx-pin`
 src/git.zig            Git: one thin wrapper per git command
 src/xcode.zig          Xcode: Apple SDKs, the macOS floor, frameworks, xcframeworks
 src/swift.zig          Swift: swiftc dylibs
-src/android.zig        Android, AndroidAbi: the NDK
+src/android.zig        Android: the NDK
+src/android_abi.zig    AndroidAbi: an ABI and its Zig target
 src/docs.zig           Docs: autodoc with private declarations
 src/zip_archive.zig    ZipArchive: `.archive` download and unpack
 src/file.zig           File: file-system primitives the others share
@@ -78,9 +88,11 @@ src/zip_builder.zig    ZipBuilder: in-memory zips for the tests
 ```
 
 Consumers import this package's `build.zig` by dependency name, so only what
-it re-exports is reachable; `File`, `ZipArchive`, `ToolArtifact`, `Tool` and
-`ZipBuilder` are internal. A new sub-folder with several `.zig` files gets
-its own `module.zig` barrel.
+it re-exports is reachable; everything else in `module.zig` is internal.
+One struct per file (B.2.a): a type stays beside the primary struct only
+when that struct is its sole user (`Release`, `Command`, `Xcframework`),
+and anything two structs share gets a file of its own. A new sub-folder
+with several `.zig` files gets its own `module.zig` barrel.
 
 ## Architecture conventions
 
@@ -91,20 +103,26 @@ additions to ZIGSTYLE:
 
 - **No `@src()` entry tracing** (D.3.a): a consumer's build runner is Debug,
   where `log.debug` prints on every build.
-- **A scoped logger only in files that log**: `zlint` flags an unused one.
+- **A scoped logger only in files that log, and `std` only in files that
+  use it**: `zlint` flags an unused import.
 - **Fixed limits are named constants** (A.1.b): there is no `Config` inside
   another project's `build()`, so read caps (`Manifest.max_bytes`) and
   `curl`'s `ZipArchive.connect_timeout_seconds` are constants on their
   struct, never bare numbers. A value a consumer must choose is a `-D`
   option.
-- **Doc comments** on every function say what it does, never how: a
+- **Doc comments** (E.1) on every function say what it does, never how: a
   one-line summary (plus at most one line a caller must know, such as "Call
-  it first in `build()`"), a one-line `Parameters:` bullet per parameter in
-  signature order, and a one-line `Return:` (omitted for plain `void`). Why a
-  line does something non-obvious, such as a Zig 0.17 workaround, is a `//`
-  comment on that line.
+  it first in `build()`"), a blank `///`, then a one-line `` - `name`: ``
+  bullet per parameter in signature order and a one-line `- Returns:`,
+  both capitalized, with no blank line between them. `- Returns:` is
+  omitted only for plain `void` and `noreturn`; an error union states its
+  errors there (`- Returns: IO errors.`). Why a line does something
+  non-obvious, such as a Zig 0.17 workaround, is a `//` comment on that line.
 - **`// SAFETY:`** above every `undefined` field, saying what populates it.
-- **One-line parameter lists**: `zlintpre` rejects multi-line ones.
+- **No `deinit` on a struct that owns nothing** (D.2.a): `Sync` allocates
+  from its caller's arena (the build's), so a `deinit` would be `_ = self;`
+  and a `defer` at every call site.
+- **One-line parameter lists**, even past the usual width.
 - **Use `Run`'s `…Arg2` forms throughout.** Every path-argument method
   without `2` is deprecated in 0.17 except `addFileArg`, a plain wrapper of
   `addFileArg2`; `addFileArg2` is used too, so there is one form.
@@ -295,7 +313,9 @@ additions to ZIGSTYLE:
   Before the push, `zig fetch .` here puts the same hash in the global cache
   for local builds. Consumers pin a tag with its commit (`?ref=v4.1.0#<commit>`),
   so a release that rewrites history breaks their URLs.
-- **Compatibility:** 5.1.0 needs no consumer change: it adds `-Dci` and
+- **Compatibility:** 5.1.1 needs no consumer change: it splits `deps.zig`
+  one struct per file, so `Sync`'s messages now log as `zigbuildx_sync`
+  rather than `zigbuildx_deps`. 5.1.0 needs no consumer change: it adds `-Dci` and
   `.tag` on a sibling (refused before). Under `cloneMissing`, a root
   `deps/x` with a `.tag` is now cloned at the tag and warned about when off
   it, as a sibling's is; it used to be cloned on the default branch and

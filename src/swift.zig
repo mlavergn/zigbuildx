@@ -29,11 +29,9 @@ pub const Swift = struct {
 
     /// Compiles `options.sources` into `lib<name>.dylib` and registers it as `lib<name>`.
     ///
-    /// Parameters:
-    /// - `b`: the build graph.
-    /// - `options`: what to compile.
-    ///
-    /// Return: the dylib, or null when the target is not macOS or the host cannot run `swiftc`.
+    /// - `b`: The build graph.
+    /// - `options`: What to compile.
+    /// - Returns: The dylib, or null when the target is not macOS or the host cannot run `swiftc`.
     pub fn addDylib(b: *std.Build, options: SwiftDylib) ?std.Build.LazyPath {
         const target = options.target.result;
         if (target.os.tag != .macos or b.graph.host.result.os.tag != .macos) return null;
@@ -74,10 +72,9 @@ pub const Swift = struct {
 
     /// Links `module` against a dylib from `addDylib`, from the build cache and once installed.
     ///
-    /// Parameters:
-    /// - `module`: the module to link; mutated in place.
-    /// - `name`: the library's name, as given to `addDylib`.
-    /// - `dylib`: the dylib, or null to do nothing — `addDylib`'s answer off macOS.
+    /// - `module`: The module to link; mutated in place.
+    /// - `name`: The library's name, as given to `addDylib`.
+    /// - `dylib`: The dylib, or null to do nothing — `addDylib`'s answer off macOS.
     pub fn link(module: *std.Build.Module, name: []const u8, dylib: ?std.Build.LazyPath) void {
         const path = dylib orelse return;
         module.addLibraryPath(path.dirname());
@@ -92,23 +89,19 @@ pub const Swift = struct {
 
     /// Creates a step installing the dylib under `lib/`, where `link`'s installed rpath looks.
     ///
-    /// Parameters:
-    /// - `b`: the build graph.
-    /// - `name`: the library's name, as given to `addDylib`.
-    /// - `dylib`: the dylib.
-    ///
-    /// Return: the install step, not yet attached to any step.
+    /// - `b`: The build graph.
+    /// - `name`: The library's name, as given to `addDylib`.
+    /// - `dylib`: The dylib.
+    /// - Returns: The install step, not yet attached to any step.
     pub fn addInstall(b: *std.Build, name: []const u8, dylib: std.Build.LazyPath) *std.Build.Step {
         return &b.addInstallLibFile(dylib, b.fmt("lib{s}.dylib", .{name})).step;
     }
 
     /// Returns the dylib a dependency built with `addDylib`.
     ///
-    /// Parameters:
-    /// - `dep`: the dependency.
-    /// - `name`: the library's name, as the dependency gave it to `addDylib`.
-    ///
-    /// Return: the dylib, or null when the dependency built none — off macOS.
+    /// - `dep`: The dependency.
+    /// - `name`: The library's name, as the dependency gave it to `addDylib`.
+    /// - Returns: The dylib, or null when the dependency built none — off macOS.
     pub fn fromDependency(dep: *std.Build.Dependency, name: []const u8) ?std.Build.LazyPath {
         // Not `dep.namedLazyPath`, which panics on a name it cannot find, and off
         // macOS nothing is ever registered.
@@ -120,11 +113,9 @@ pub const Swift = struct {
 
     /// Returns `swiftc`'s `-target` for `target`: `<arch>-apple-macos<major>.<minor>`.
     ///
-    /// Parameters:
-    /// - `allocator`: owns the returned string.
-    /// - `target`: a macOS target.
-    ///
-    /// Return: the triple, owned by the caller; allocation errors.
+    /// - `allocator`: Owns the returned string.
+    /// - `target`: A macOS target.
+    /// - Returns: The triple, owned by the caller; allocation errors.
     fn triple(allocator: std.mem.Allocator, target: std.Target) ![]u8 {
         const arch = switch (target.cpu.arch) {
             .aarch64 => "arm64",

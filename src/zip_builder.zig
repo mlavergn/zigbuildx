@@ -28,18 +28,15 @@ pub const ZipBuilder = struct {
 
     /// Creates an empty archive.
     ///
-    /// Parameters:
-    /// - `allocator`: backs the archive.
-    ///
-    /// Return: the archive.
+    /// - `allocator`: Backs the archive.
+    /// - Returns: The archive.
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{ .allocator = allocator, .body = .init(allocator), .central = .init(allocator) };
     }
 
     /// Frees the archive.
     ///
-    /// Parameters:
-    /// - `self`: the archive.
+    /// - `self`: The archive.
     pub fn deinit(self: *Self) void {
         self.central.deinit();
         self.body.deinit();
@@ -47,12 +44,10 @@ pub const ZipBuilder = struct {
 
     /// Appends `data` as entry `name`, stored uncompressed.
     ///
-    /// Parameters:
-    /// - `self`: the archive.
-    /// - `name`: the entry's path, with `/` separators.
-    /// - `data`: the file's contents.
-    ///
-    /// Return: nothing; `error.NameTooLong`, `error.EntryTooLarge` or `error.ArchiveTooLarge` past a zip's limits.
+    /// - `self`: The archive.
+    /// - `name`: The entry's path, with `/` separators.
+    /// - `data`: The file's contents.
+    /// - Returns: `error.NameTooLong`, `error.EntryTooLarge` or `error.ArchiveTooLarge` past a zip's limits.
     pub fn addStored(self: *Self, name: []const u8, data: []const u8) !void {
         if (name.len > std.math.maxInt(u16)) return error.NameTooLong;
         if (data.len >= 0xFFFFFFFF) return error.EntryTooLarge;
@@ -88,10 +83,8 @@ pub const ZipBuilder = struct {
 
     /// Completes the archive; nothing may be added afterwards.
     ///
-    /// Parameters:
-    /// - `self`: the archive.
-    ///
-    /// Return: the zip's bytes, owned by the archive; `error.TooManyEntries` or `error.ArchiveTooLarge` past a zip's limits.
+    /// - `self`: The archive.
+    /// - Returns: The zip's bytes, owned by the archive; `error.TooManyEntries` or `error.ArchiveTooLarge` past a zip's limits.
     pub fn finish(self: *Self) ![]const u8 {
         if (self.count > 0xFFFF) return error.TooManyEntries;
         const central_offset = self.body.written().len;
