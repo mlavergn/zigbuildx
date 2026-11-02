@@ -25,4 +25,13 @@ pub const Pin = struct {
     pub fn follows(self: *const Self) bool {
         return self.kind == .branch;
     }
+
+    /// Reports whether `value` may name a SHA, tag or branch.
+    ///
+    /// - `value`: A `.sha`, `.tag` or `.branch` from a manifest.
+    /// - Returns: `false` for an empty value or one git could read as an option.
+    pub fn isValidValue(value: []const u8) bool {
+        // A value git could read as an option (`-f`, `--orphan`) is no ref name git accepts either.
+        return value.len > 0 and value[0] != '-';
+    }
 };

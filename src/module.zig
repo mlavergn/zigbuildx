@@ -28,6 +28,12 @@ pub const PinKind = @import("pin_kind.zig").PinKind;
 pub const Stamp = @import("stamp.zig").Stamp;
 /// Reads the `git+` URLs and tag listings `Deps.pin` works from.
 pub const ReleasePin = @import("release_pin.zig").ReleasePin;
+/// Stages siblings into Zig's package store for a distribution build.
+pub const Stage = @import("stage.zig").Stage;
+/// Where an absent `.path` dependency comes from.
+pub const Source = @import("source.zig").Source;
+/// Edits a `build.zig.zon` in place, as text.
+pub const ZonEdit = @import("zon_edit.zig").ZonEdit;
 /// Runs `git` for the build.
 pub const Git = @import("git.zig").Git;
 /// Where a new worktree's HEAD goes.
@@ -52,6 +58,8 @@ pub const ToolArtifact = @import("tool_artifact.zig").ToolArtifact;
 pub const Tool = @import("tool.zig").Tool;
 /// Builds in-memory zips for the tests.
 pub const ZipBuilder = @import("zip_builder.zig").ZipBuilder;
+/// A scratch tree of git repositories and a consumer, for the tests.
+pub const TestTree = @import("test_tree.zig").TestTree;
 
 test {
     std.testing.refAllDecls(@This());

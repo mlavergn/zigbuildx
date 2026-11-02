@@ -66,7 +66,7 @@ pub const ZipArchive = struct {
     /// - `io`: IO for the filesystem and `curl`.
     /// - `url`: An `https://`, `http://` or `file://` URL of a zip.
     /// - `dest`: The dependency's absolute path; the caller decides it may be replaced.
-    /// - Returns: `error.ArchiveDownloadFailed`, `error.ArchiveEmpty`, or IO and zip errors, none of them logged.
+    /// - Returns: `error.ArchiveDownloadFailed`, `error.ArchiveEmpty`, `error.ArchiveBadFilename`, or IO and zip errors, none of them logged.
     pub fn unpack(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest: []const u8) !void {
         const cwd = std.Io.Dir.cwd();
         // Downloaded and unpacked beside `dest`, then renamed into place, so a failed download leaves `dest`.
@@ -130,13 +130,22 @@ pub const ZipArchive = struct {
     /// - `io`: IO for the filesystem.
     /// - `zip_path`: The zip.
     /// - `dir`: An empty directory to unpack into.
-    /// - Returns: The zip's single top-level folder inside `dir`, else `dir`; `error.ArchiveEmpty`, or IO and zip errors.
+    /// - Returns: The zip's single top-level folder inside `dir`, else `dir`; `error.ArchiveEmpty`, `error.ArchiveBadFilename` for a name with a drive or a stream (`:`), or IO and zip errors.
     fn extract(allocator: std.mem.Allocator, io: std.Io, zip_path: []const u8, dir: []const u8) ![]const u8 {
         const cwd = std.Io.Dir.cwd();
         var file = try cwd.openFile(io, zip_path, .{});
         defer file.close(io);
         var buffer: [16 * 1024]u8 = undefined;
         var reader = file.reader(io, &buffer);
+        // `std.zip` refuses `..` and a leading `/`, but not `C:\…` (once backslashes are slashes),
+        // which Windows writes wherever it points, nor an NTFS stream (`a:b`). Checked before anything
+        // is written, on every host: a name with a `:` does not unpack on Windows anyway.
+        var entries = try std.zip.Iterator.init(&reader);
+        var name_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        while (try entries.next()) |entry| {
+            const name = try entry.getFilename(&reader, &name_buffer, .{ .allow_backslashes = true });
+            if (std.mem.findScalar(u8, name, ':') != null) return error.ArchiveBadFilename;
+        }
         var out = try cwd.openDir(io, dir, .{});
         defer out.close(io);
         var diagnostics: std.zip.Diagnostics = .{ .allocator = allocator };
@@ -208,4 +217,20 @@ test "unpack replaces an earlier unpack, keeps an archive's own build.zig, and l
     const missing = try allocator.print("{s}{s}", .{ ZipArchive.file_scheme, try std.Io.Dir.path.join(allocator, &.{ dest, "..", "missing.zip" }) });
     try std.testing.expectError(error.FileNotFound, ZipArchive.unpack(allocator, io, missing, dest));
     try tmp.dir.access(io, "dep/new.c", .{});
+}
+
+test "unpack refuses an entry naming a drive or a stream, and writes nothing" {
+    std.testing.log_level = .err;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const dest = try std.Io.Dir.path.join(allocator, &.{ try tmp.dir.realPathFileAlloc(io, ".", allocator), "dep" });
+    for ([_][]const u8{ "C:\\Users\\Public\\x.c", "C:/x.c", "release-1/a.c:stream" }) |name| {
+        const url = try writeTestZip(allocator, &tmp, "bad.zip", &.{ .{ "release-1/ok.c", "ok" }, .{ name, "x" } });
+        try std.testing.expectError(error.ArchiveBadFilename, ZipArchive.unpack(allocator, io, url, dest));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "dep", .{}));
+    }
 }

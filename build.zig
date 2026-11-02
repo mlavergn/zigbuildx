@@ -51,6 +51,8 @@ pub fn build(b: *std.Build) void {
     });
     const run_tests = b.addRunArtifact(tests);
     run_tests.has_side_effects = true;
+    // `Stage`'s tests hash packages with this `zig`; they skip without it, as under `make cross`.
+    run_tests.setEnvironmentVariable("ZIGBUILDX_ZIG", b.graph.zig_exe);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 }

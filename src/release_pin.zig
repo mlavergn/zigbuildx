@@ -54,12 +54,39 @@ pub const ReleasePin = struct {
         return url[hash + 1 ..];
     }
 
-    /// Reports whether a ref is a branch to follow: neither a release tag nor a commit.
+    /// Reports whether a ref is a branch to follow: neither a tag on the remote nor a commit.
     ///
     /// - `pinned`: A ref from a `.url`; "" is the default branch.
+    /// - `listing`: The remote's `git ls-remote --tags` lines, which name every tag, releases or not.
     /// - Returns: `true` for a branch.
-    pub fn isBranch(pinned: []const u8) bool {
-        return Self.releaseVersion(pinned) == null and !Self.isCommit(pinned);
+    pub fn isBranch(pinned: []const u8, listing: []const u8) bool {
+        return Self.releaseVersion(pinned) == null and !Self.isCommit(pinned) and !Self.hasTag(listing, pinned);
+    }
+
+    /// Reports whether a `git ls-remote --tags` listing names `tag`.
+    ///
+    /// - `listing`: `<sha>\trefs/tags/<tag>` lines, and `^{}` lines for annotated tags.
+    /// - `tag`: The tag.
+    /// - Returns: `true` when a line names it.
+    pub fn hasTag(listing: []const u8, tag: []const u8) bool {
+        if (tag.len == 0) return false;
+        var lines = std.mem.tokenizeScalar(u8, listing, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            const start = std.mem.find(u8, line, "\trefs/tags/") orelse continue;
+            const name = line[start + "\trefs/tags/".len ..];
+            if (std.mem.eql(u8, name, tag) or (std.mem.endsWith(u8, name, "^{}") and std.mem.eql(u8, name[0 .. name.len - "^{}".len], tag))) return true;
+        }
+        return false;
+    }
+
+    /// Reads the version a tag names, pre-releases included: `v` and a semantic version.
+    ///
+    /// - `tag`: A tag, such as `v5.2.0` or `v5.2.0-rc1`.
+    /// - Returns: The version, or null when `tag` names none.
+    pub fn tagVersion(tag: []const u8) ?std.SemanticVersion {
+        if (!std.mem.startsWith(u8, tag, "v")) return null;
+        return std.SemanticVersion.parse(tag[1..]) catch null;
     }
 
     /// Reads the version of a release tag: `v` and a semantic version, with no pre-release or build part.
@@ -141,10 +168,17 @@ test "ReleasePin reads the pinned commit and tells a branch from a tag or a comm
     try std.testing.expectEqualStrings("fba04ba852fc06317207bdc7119b58dc13638ac0", ReleasePin.commit("git+https://github.com/x/zigbuildx?ref=v3.6.0#fba04ba852fc06317207bdc7119b58dc13638ac0"));
     // `--save-exact` keeps `#<ref>`, which names no commit.
     try std.testing.expectEqualStrings("", ReleasePin.commit("git+https://github.com/x/zigbuildx#main"));
-    try std.testing.expect(ReleasePin.isBranch("main"));
-    try std.testing.expect(ReleasePin.isBranch(""));
-    try std.testing.expect(!ReleasePin.isBranch("v4.1.0"));
-    try std.testing.expect(!ReleasePin.isBranch("fba04ba852fc06317207bdc7119b58dc13638ac0"));
+    const listing = "aaa\trefs/tags/v4.1.0\nbbb\trefs/tags/v5.2.0-rc1\nccc\trefs/tags/nightly\nddd\trefs/tags/nightly^{}\n";
+    try std.testing.expect(ReleasePin.isBranch("main", listing));
+    try std.testing.expect(ReleasePin.isBranch("", listing));
+    try std.testing.expect(!ReleasePin.isBranch("v4.1.0", listing));
+    try std.testing.expect(!ReleasePin.isBranch("fba04ba852fc06317207bdc7119b58dc13638ac0", listing));
+    // A tag that is no release is still a tag, so it moves to the newest release.
+    try std.testing.expect(!ReleasePin.isBranch("v5.2.0-rc1", listing));
+    try std.testing.expect(!ReleasePin.isBranch("nightly", listing));
+    try std.testing.expectEqual(std.math.Order.gt, ReleasePin.tagVersion("v5.2.0-rc1").?.order(ReleasePin.releaseVersion("v5.1.0").?));
+    try std.testing.expectEqual(std.math.Order.lt, ReleasePin.tagVersion("v5.2.0-rc1").?.order(ReleasePin.releaseVersion("v5.2.0").?));
+    try std.testing.expectEqual(null, ReleasePin.tagVersion("nightly"));
     try std.testing.expect(ReleasePin.isCommit("fba04ba852fc06317207bdc7119b58dc13638ac0"));
     try std.testing.expect(!ReleasePin.isCommit("fba04ba"));
 }

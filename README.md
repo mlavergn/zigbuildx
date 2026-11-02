@@ -9,7 +9,7 @@ Nothing acts unless a `build.zig` calls it.
 
 | Extension | What it does |
 |---|---|
-| `Deps` | Clones missing sibling checkouts and keeps them up to date, builds them at their declared branch or tag in CI, unpacks source archives, gives pinned dependencies their own git worktree, and repins zigbuildx |
+| `Deps` | Clones missing sibling checkouts and keeps them up to date, stages them as Zig packages for distribution builds that read nothing outside the project, unpacks source archives, gives pinned dependencies their own git worktree, and repins zigbuildx |
 | `Git` | Runs `git` commands for the build |
 | `Xcode` | Finds an Apple platform's SDK (macOS, iOS, tvOS, visionOS, watchOS), sets a macOS deployment floor, links frameworks, assembles `.xcframework`s |
 | `Swift` | Builds a Swift dylib that a Zig package links against |
@@ -57,8 +57,10 @@ make validate
     `deps/` (`sync` only); `.checkout` names the shared checkout (default
     `../<name>`).
   - On a sibling (`../x`), `.branch` or `.tag` says what it is cloned at,
-    and what a CI build uses (see *CI builds*): a `.branch` is followed, a
-    `.tag` is left where it is. `.sha` is refused there.
+    and what a distribution build uses (see *Distribution builds*): a
+    `.branch` is followed, a `.tag` is left where it is. `.sha` is refused
+    there. A distribution build needs a
+    `.clone` or an `.archive` on every sibling.
 
 ```zig
 .{
@@ -66,8 +68,8 @@ make validate
     .dependencies = .{
         // zigbuildx itself, written by `zig fetch --save` or `zig build zigbuildx-pin`
         .zigbuildx = .{
-            .url = "git+https://github.com/mlavergn/zigbuildx?ref=v5.1.0#<commit>",
-            .hash = "zigbuildx-5.1.0-<hash>",
+            .url = "git+https://github.com/mlavergn/zigbuildx?ref=v6.0.0#<commit>",
+            .hash = "zigbuildx-6.0.0-<hash>",
         },
         // A sibling checkout, cloned when ../mylib is missing
         .mylib = .{ .path = "../mylib", .clone = "git@github.com:org/mylib.git" },
@@ -91,10 +93,11 @@ An `.archive` is not hash-checked, so point it at a source you trust over
 - **Environment:** `ANDROID_HOME` or `ANDROID_SDK_ROOT`, and
   `ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT`, each falling back to Android
   Studio's defaults.
-- **Build options:** `-Dci` (from `Deps`; default on when `CI` is set),
+- **Build options:** `-Ddist` (from `Deps`; see *Distribution builds*),
   `-Dmacos-min` (from `Xcode.standardTargetOptions`).
 - **Ignore `deps/`** in a project that pins dependencies, and keep it out of
-  `zig fmt` and linting. Git-ignore an `.archive`'s path too.
+  `zig fmt` and linting. Git-ignore an `.archive`'s path too, and `zig-pkg/`
+  and `build.zig.zon.orig`, which a distribution build writes.
 
 ## Usage
 
@@ -124,6 +127,7 @@ updated`): run it again.
 ```sh
 zig build deps            # list the worktrees: pin, commit, clean or dirty
 zig build zigbuildx-pin   # pin zigbuildx to its newest release (`make buildxpin`); a branch pin stays on its branch
+zig build dev             # after a distribution build (cloneMissing): put back build.zig.zon, to build against ../ again
 ```
 
 Target Apple platforms and link frameworks:
@@ -156,51 +160,104 @@ try android.configure(lib); // lib's target from zigbuildx.Android.resolveTarget
 const docs = zigbuildx.Docs.includePrivate(b, lib.getEmittedDocs());
 ```
 
-## CI builds
+## Distribution builds
 
-On a developer's machine, siblings are the developer's own checkouts. A CI
-build instead needs the same tree every time. Build with `-Dci` (on by
-default when the `CI` environment variable is set, as most CI services do)
-and every sibling, siblings of siblings included, is cloned at or moved to
+On a developer's machine, siblings are the developer's own checkouts at
+`../`. A distribution build instead needs the same tree every time. Build
+with `-Ddist`, and every sibling, siblings of siblings included, is built at
 the ref its manifest declares:
 
-| Declared | CI builds |
+| Declared | A distribution build uses |
 |---|---|
 | `.tag = "v2.1.0"` | that tag |
 | `.branch = "dev"` | the tip of `origin/dev` |
 | neither | the tip of the remote's default branch |
 
-A sibling with uncommitted changes, commits that are not pushed, or a
-branch with no upstream fails the build rather than being moved; build with
-`-Dci=false` to keep it. A failed fetch, or a ref the remote does not have,
-fails it too, as does a `.branch` worktree under `deps/` that cannot be
-brought to its branch's tip. If two manifests name different refs for one sibling, the
-first found (the root's first) wins, with a warning.
+If two manifests name different refs for one sibling, the first found (the
+root's first) wins, with a warning.
 
-Siblings are cloned beside the project (`../x`), so check the project out
-into a folder of its own inside the CI workspace, and give git the
-credentials for the private repositories:
+### Under `cloneMissing`: staged packages
+
+A distribution build reads nothing outside the project, and Zig never
+fetches a sibling:
+
+1. Each sibling is cloned with git into `.zig-cache/zigbuildx-dist/`, at its
+   ref, or unpacked from its `.archive`.
+2. Its commit is exported, its own siblings are written into its manifest by
+   hash, and it goes into the project's `zig-pkg/` under the hash Zig
+   computes for it.
+3. `build.zig.zon` is rewritten so each sibling is a `.url` + `.hash`; the
+   original is kept as `build.zig.zon.orig`. The run exits 1.
+4. The re-run builds every sibling from `zig-pkg/`.
 
 ```sh
-# workspace/app is the project; its siblings are cloned to workspace/<name>
-cd app
-zig build -Dci || zig build -Dci   # the first run exits 1 after cloning
-zig build -Dci test
+cd app                                 # the project alone; nothing beside it is needed
+zig build -Ddist || zig build -Ddist   # the first run exits 1 after staging
+zig build -Ddist test
 ```
+
+- **Private repositories** need only git's credentials: Zig resolves each
+  sibling by hash, and its `.url` is a label it never fetches. A private
+  dependency must therefore be a sibling: Zig fetches a `.url` dependency
+  itself, before `build()` runs. zigbuildx must be one Zig can fetch.
+- **Every sibling needs a `.clone` or an `.archive`.** A `.sha`, a cycle of
+  siblings, a ref the remote does not have, or a failed clone fails the build,
+  and the manifest is left as it was.
+- **Never commit the rewritten `build.zig.zon`.** `zig build dev` puts the
+  original back; the next `zig build` builds against `../` again. Running
+  `-Ddist` again on a rewritten manifest stages nothing and leaves
+  `build.zig.zon.orig` alone, and `zig build dev` with nothing to restore
+  says so and does nothing.
+- **Caching:** keep `.zig-cache/zigbuildx-dist/` between runs to fetch the
+  clones rather than clone them again.
+
+### Under `sync`: siblings at `../`
+
+Every sibling is cloned at or moved to its ref, beside the project (`../x`),
+so build from a folder of its own, with room beside it for the siblings:
+
+```sh
+# work/app is the project; its siblings are cloned to work/<name>
+cd app
+zig build -Ddist || zig build -Ddist   # the first run exits 1 after cloning
+zig build -Ddist test
+```
+
+A sibling with uncommitted changes, commits that are not pushed, or a
+branch with no upstream fails the build rather than being moved; build
+without `-Ddist` to keep it. A failed fetch, or a ref the remote does not
+have, fails it too, as does a `.branch` worktree under `deps/` that cannot
+be brought to its branch's tip.
+
+### Either way
 
 - **Credentials:** a deploy key or `GIT_SSH_COMMAND` for `git@` URLs, or
   `git config --global url."https://x-access-token:$TOKEN@github.com/".insteadOf "git@github.com:"`
   to fetch them over HTTPS with a token.
 - **Exit code:** Zig reports every configure failure as exit 1, so a run that
-  cloned or moved a sibling cannot be told apart from a failure by its code;
-  run it again, as above. A second failure is a real one.
-- **Every configure checks the remotes** in CI mode; nothing is cached.
-- **`CI` and the configure cache:** Zig does not track the environment. On a
-  machine that also builds without `CI`, pass `-Dci` explicitly.
+  staged, cloned or moved a sibling cannot be told apart from a failure by its
+  code; run it again, as above. A second failure is a real one.
+- **Every configure checks the remotes** in a distribution build; nothing is
+  cached.
 
-## Migrating from 5.0
+## Migrating from 5.x
 
-Nothing to change. 5.1 adds `-Dci` and accepts `.tag` on a sibling.
+- **5.1's `-Dci` is now `-Ddist`,** and no environment variable turns it on:
+  pass `-Ddist` where a build passed `-Dci` or relied on `CI` being set.
+- **Under `cloneMissing`, `-Ddist` stages the siblings** rather than cloning
+  them to `../x`, so they no longer need a folder beside the project. Every
+  sibling needs a `.clone` or an `.archive`; git-ignore `zig-pkg/` and
+  `build.zig.zon.orig`.
+- **`dev` is a step of `cloneMissing`:** rename a `dev` step of your own, as
+  Zig refuses two steps of one name.
+- **`sync` is otherwise unchanged:** under `-Ddist` it moves the siblings at
+  `../x` to their refs, as before.
+- **Fetches prune:** a branch deleted on the remote is dropped from a
+  checkout's `origin/…` refs, so it is reported gone rather than built stale.
+  Local branches and tags are never removed.
+- **`zigbuildx-pin` moves a pre-release pin** (`v5.2.0-rc1`) to the newest
+  release once one is newer, and refuses to run while a distribution build
+  has `build.zig.zon` rewritten (run `zig build dev` first).
 
 ## Migrating from 4.x
 

@@ -19,4 +19,6 @@ pub const Entry = struct {
     tag: ?[]const u8 = null,
     /// The branch a worktree or sibling follows (`.branch`).
     branch: ?[]const u8 = null,
+    /// Whether Zig fetches it only when a build asks for it (`.lazy = true`).
+    lazy: bool = false,
 };

@@ -13,14 +13,24 @@ const mod = @import("module.zig");
 /// `sync` does that too, and also gives each dependency whose `.path` is under
 /// `deps/` its own git worktree of the shared checkout, pinned by `.sha`,
 /// `.tag` or `.branch`.
+///
+/// With `-Ddist`, `cloneMissing` builds from nothing outside the consumer: `Stage`
+/// clones each sibling with git, stages it into Zig's package store, and
+/// rewrites `build.zig.zon` to name it by hash; `zig build dev` puts the
+/// original back. Under `sync`, `-Ddist` brings the siblings at `../x` to their
+/// refs instead.
 pub const Deps = struct {
     const Self = @This();
-    /// The `-D` option that turns CI mode on.
-    const ci_option = "ci";
+    /// The `-D` option that turns a distribution build on.
+    const dist_option = "dist";
     /// The step `sync` declares to list worktrees.
     const deps_step = "deps";
     /// The step that repins zigbuildx.
     const pin_step = "zigbuildx-pin";
+    /// The step `cloneMissing` declares to put back a manifest a distribution build rewrote.
+    const dev_step = "dev";
+    /// The comptime branches allowed per entry of the build runner's package table, enough to compare paths of any length.
+    const branches_per_package = 4096;
 
     /// Clones every missing cloneable dependency, transitive ones included, and exits 1; returns when none are missing.
     ///
@@ -40,12 +50,19 @@ pub const Deps = struct {
             log.err("cannot resolve the build root [{any}]", .{err});
             std.process.exit(1);
         };
-        if (present) Self.addPinStep(b);
+        if (present) {
+            Self.addPinStep(b);
+            Self.addDevStep(b);
+        }
+        const mode = Self.modeOf(b);
+        // A distribution build uses staged packages: Zig never fetches a sibling, and nothing at `../` is read.
+        // On the re-run no sibling is left, and what follows handles `.path`s inside the consumer.
+        if (mode == .dist) Self.stageSiblings(b, root);
         var run = mod.Sync.init(b.allocator, b.graph.io, root) catch |err| {
             log.err("cannot clone dependencies [{any}]", .{err});
             std.process.exit(1);
         };
-        run.mode = Self.modeOf(b);
+        run.mode = mode;
         // With everything present this queues the siblings, for the update, fills in
         // an empty checkout, and unpacks any archive whose URL changed.
         run.cloneSiblings() catch |err| {
@@ -146,6 +163,11 @@ pub const Deps = struct {
         const io = process_init.io;
         const root = try std.Io.Dir.cwd().realPathFileAlloc(io, args[1], allocator);
         const name = args[2];
+        // A pin written into the manifest a distribution build rewrote would be lost when `zig build dev` restores the original.
+        if (try mod.File.exists(io, try std.Io.Dir.path.join(allocator, &.{ root, mod.Stage.backup_name }))) {
+            log.err("build.zig.zon is rewritten for a distribution build ({s} holds the original); run zig build dev first", .{mod.Stage.backup_name});
+            return error.DepsFailed;
+        }
         const manifest_path = try std.Io.Dir.path.join(allocator, &.{ root, "build.zig.zon" });
         const source = try mod.File.readOptionalZ(allocator, io, manifest_path, .limited(mod.Manifest.max_bytes)) orelse {
             log.err("no build.zig.zon in {s}", .{root});
@@ -172,17 +194,18 @@ pub const Deps = struct {
         const current = mod.ReleasePin.ref(url);
         // The URL keeps its form: `?ref=<ref>#<commit>` from `zig fetch --save`, or `#<ref>` from `--save-exact`.
         const save = try allocator.print("{s}={s}", .{ if (std.mem.find(u8, url, "?ref=") == null) "--save-exact" else "--save", name });
-        if (mod.ReleasePin.isBranch(current)) {
+        // Every tag, so one that is no release (`v5.2.0-rc1`, `nightly`) is told from a branch.
+        const listing = mod.Git.remoteTags(allocator, io, root, repository) catch {
+            log.err("cannot list the tags of {s}", .{repository});
+            return error.DepsFailed;
+        };
+        if (mod.ReleasePin.isBranch(current, listing)) {
             // A branch is followed, never swapped for a tag: refresh its commit and hash.
             const target = if (current.len == 0) try allocator.print("git+{s}", .{repository}) else try allocator.print("git+{s}#{s}", .{ repository, current });
             try Self.zigFetch(io, args[3], root, save, target);
             log.info("refreshed {s} on {s}; the next zig build uses it", .{ name, if (current.len == 0) "its default branch" else current });
             return;
         }
-        const listing = mod.Git.remoteTags(allocator, io, root, repository) catch {
-            log.err("cannot list the tags of {s}", .{repository});
-            return error.DepsFailed;
-        };
         const release = mod.ReleasePin.newestRelease(listing) orelse {
             log.err("{s} has no release tag (vX.Y.Z)", .{repository});
             return error.DepsFailed;
@@ -195,8 +218,8 @@ pub const Deps = struct {
             }
             // The tag now names another commit (history rewritten), or the URL names none.
             if (pinned_commit.len > 0) log.info("{s} moved from {s} to {s}; re-pinning", .{ release.tag, mod.Sync.short(pinned_commit), mod.Sync.short(release.commit) });
-        } else if (mod.ReleasePin.releaseVersion(current)) |pinned| if (pinned.order(release.version) == .gt) {
-            // A pin ahead of every tag (a release not tagged yet) is never moved back.
+        } else if (mod.ReleasePin.tagVersion(current)) |pinned| if (pinned.order(release.version) == .gt) {
+            // A pin ahead of every release (a pre-release, or a release not tagged yet) is never moved back.
             log.warn("{s} is pinned to {s}, newer than {s}, the newest release tag; left as it is", .{ name, current, release.tag });
             return;
         };
@@ -233,6 +256,27 @@ pub const Deps = struct {
         var stdout = std.Io.File.stdout().writer(io, &buffer);
         try run.status(&stdout.interface);
         try stdout.interface.flush();
+    }
+
+    /// `zigbuildx restore <root>`: puts back the `build.zig.zon` a distribution build rewrote, so the next build uses the siblings at `../` again.
+    /// Runs as the `dev` step.
+    ///
+    /// - `process_init`: The process's allocator and IO.
+    /// - `args`: The command line after the program's path; `args[0]` is the command.
+    /// - Returns: `error.InvalidArguments` on a bad command line, or IO errors.
+    pub fn restore(process_init: std.process.Init, args: []const [:0]const u8) !void {
+        if (args.len != 2) {
+            log.err("usage: zigbuildx restore <root>", .{});
+            return error.InvalidArguments;
+        }
+        const allocator = process_init.arena.allocator();
+        const io = process_init.io;
+        const root = try std.Io.Dir.cwd().realPathFileAlloc(io, args[1], allocator);
+        if (try Self.restoreManifest(allocator, io, root)) {
+            log.info("restored build.zig.zon; run zig build to build against ../", .{});
+        } else {
+            log.info("nothing to restore: there is no {s}", .{mod.Stage.backup_name});
+        }
     }
 
     /// Reports whether every cloneable dependency is present.
@@ -312,7 +356,57 @@ pub const Deps = struct {
         top.dependOn(&run.step);
     }
 
-    /// Updates the siblings, or in CI mode brings them to their refs, and for `sync` the branch worktrees; exits when anything moved.
+    /// Declares the `dev` step, which puts back the `build.zig.zon` a distribution build rewrote.
+    ///
+    /// - `b`: The root package's build graph.
+    fn addDevStep(b: *std.Build) void {
+        const run = b.addRunArtifact(mod.ToolArtifact.add(b));
+        run.setName(Self.dev_step);
+        run.addArg("restore");
+        run.addDirectoryArg2(b.path("."), .{});
+        // It rewrites build.zig.zon: never cached.
+        run.has_side_effects = true;
+        b.step(Self.dev_step, "Put back the build.zig.zon a distribution build rewrote, to build against ../ again").dependOn(&run.step);
+    }
+
+    /// Stages the root's siblings for a distribution build; exits 1 for a re-run when the manifest was rewritten.
+    ///
+    /// - `b`: The root package's build graph.
+    /// - `root`: Its absolute root.
+    fn stageSiblings(b: *std.Build, root: []const u8) void {
+        var stage = mod.Stage.init(b.allocator, b.graph.io, root, b.graph.zig_exe) catch |err| {
+            log.err("cannot stage dependencies [{any}]", .{err});
+            std.process.exit(1);
+        };
+        stage.run() catch |err| {
+            stage.logFailure(err);
+            std.process.exit(1);
+        };
+        // The runner was compiled from the manifest as it was: only a re-run reads the rewritten one.
+        if (stage.rewrote) {
+            log.info("dependencies staged; re-run zig build", .{});
+            std.process.exit(1);
+        }
+    }
+
+    /// Puts `build.zig.zon.orig` back over `build.zig.zon` in `root`.
+    ///
+    /// - `allocator`: An arena for the paths.
+    /// - `io`: IO for the filesystem.
+    /// - `root`: The consumer's absolute root.
+    /// - Returns: `true` when there was a backup to put back; IO errors.
+    fn restoreManifest(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !bool {
+        const backup = try std.Io.Dir.path.join(allocator, &.{ root, mod.Stage.backup_name });
+        const manifest = try std.Io.Dir.path.join(allocator, &.{ root, "build.zig.zon" });
+        // A rename replaces the rewritten manifest in one step.
+        std.Io.Dir.cwd().rename(backup, std.Io.Dir.cwd(), manifest, io) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    /// Updates the siblings, or in a distribution build brings them to their refs, and for `sync` the branch worktrees; exits when anything moved.
     ///
     /// - `run`: The run, after `run` or `cloneSiblings`.
     /// - `worktrees`: Whether to update worktrees too (`sync`).
@@ -328,8 +422,8 @@ pub const Deps = struct {
                 log.err("cannot update dependencies [{any}]", .{err});
                 std.process.exit(1);
             },
-            // Unlike an update, a sibling CI mode cannot bring to its ref fails the build.
-            .ci => run.enforceSiblings() catch |err| {
+            // Unlike an update, a sibling a distribution build cannot bring to its ref fails the build.
+            .dist => run.enforceSiblings() catch |err| {
                 run.logFailure(err, "update");
                 std.process.exit(1);
             },
@@ -341,9 +435,9 @@ pub const Deps = struct {
         if (updated.failed > 0) switch (run.mode) {
             // Every build updates, so a skip or an offline fetch only warns: it must not stop the build.
             .develop => log.warn("{d} worktree dependencies were not updated; see the warnings above", .{updated.failed}),
-            // CI builds what the manifests declare or nothing, as for siblings.
-            .ci => {
-                log.err("{d} worktree dependencies could not be brought to their branch tips; see the warnings above, or build with -Dci=false", .{updated.failed});
+            // A distribution build builds what the manifests declare or nothing, as for siblings.
+            .dist => {
+                log.err("{d} worktree dependencies could not be brought to their branch tips; see the warnings above, or build without -Ddist", .{updated.failed});
                 std.process.exit(1);
             },
         };
@@ -353,40 +447,31 @@ pub const Deps = struct {
         }
     }
 
-    /// Reads `-Dci`, which defaults to on when the `CI` environment variable is set.
-    /// In CI mode the configure cache is poisoned, so every configure checks the remotes.
+    /// Reads `-Ddist`, which turns a distribution build on.
+    /// A distribution build poisons the configure cache, so every configure checks the remotes.
     ///
     /// - `b`: The root package's build graph.
-    /// - Returns: `.ci` or `.develop`.
+    /// - Returns: `.dist` or `.develop`.
     fn modeOf(b: *std.Build) mod.Mode {
-        const ci = b.option(bool, Self.ci_option, "Bring each sibling to the ref its manifest declares (default: on when CI is set)") orelse Self.isCiValue(b.graph.environ_map.get("CI"));
-        if (!ci) return .develop;
-        // Zig tracks neither the environment nor the remotes, so a cached configure would skip the check.
+        const dist = b.option(bool, Self.dist_option, "Build each sibling at the ref its manifest declares: cloneMissing stages them into Zig's package store, sync moves them at ../") orelse false;
+        if (!dist) return .develop;
+        // Zig does not track the remotes, so a cached configure would skip the check.
         b.graph.poisonCache();
-        return .ci;
+        return .dist;
     }
 
     /// Reports whether an earlier `cloneMissing` or `sync` ran in this build().
     ///
     /// - `b`: The root package's build graph.
-    /// - Returns: `true` once `-Dci` is declared, as both do.
+    /// - Returns: `true` once `-Ddist` is declared, as both do.
     fn ranBefore(b: *std.Build) bool {
-        return b.available_options_map.contains(Self.ci_option);
+        return b.available_options_map.contains(Self.dist_option);
     }
 
     /// Stops a build() that calls both `cloneMissing` and `sync`, which would panic on their second declarations.
     fn failMixed() noreturn {
         log.err("call Deps.cloneMissing or Deps.sync, not both: sync does everything cloneMissing does", .{});
         std.process.exit(1);
-    }
-
-    /// Reports whether a `CI` environment variable's value turns CI mode on.
-    ///
-    /// - `value`: The variable's value, or null when it is unset.
-    /// - Returns: `true` for any non-empty value but `0` and `false`.
-    fn isCiValue(value: ?[]const u8) bool {
-        const text = value orelse return false;
-        return text.len > 0 and !std.mem.eql(u8, text, "0") and !std.ascii.eqlIgnoreCase(text, "false");
     }
 
     /// Returns the absolute, resolved path of `b`'s package.
@@ -439,8 +524,11 @@ pub const Deps = struct {
     fn missingWorktree(comptime zon: anytype) ?[]const u8 {
         const root = @import("root");
         if (!@hasDecl(root, "dependencies")) return null;
+        const decl_names = @typeInfo(root.dependencies.packages).@"struct".decl_names;
+        // The default quota of 1000 runs out at a few dozen packages.
+        @setEvalBranchQuota(1000 + decl_names.len * Self.branches_per_package);
         // A `.path` package is keyed by its path from the root: a worktree is any key under `deps/`, transitive ones included.
-        for (@typeInfo(root.dependencies.packages).@"struct".decl_names) |decl_name| {
+        for (decl_names) |decl_name| {
             if (Self.isUnderDeps(decl_name) and !@hasDecl(@field(root.dependencies.packages, decl_name), "build_zig") and !Self.isRootArchive(zon, decl_name)) return decl_name;
         }
         return null;
@@ -461,15 +549,35 @@ pub const Deps = struct {
     fn missingSibling(comptime zon: anytype) ?[]const u8 {
         const root = @import("root");
         if (!@hasDecl(root, "dependencies")) return null;
-        for (@typeInfo(root.dependencies.packages).@"struct".decl_names) |decl_name| {
+        const decl_names = @typeInfo(root.dependencies.packages).@"struct".decl_names;
+        // The default quota of 1000 runs out at a dozen hashed packages, each compared along its whole key.
+        @setEvalBranchQuota(1000 + decl_names.len * Self.branches_per_package);
+        for (decl_names) |decl_name| {
             const package = @field(root.dependencies.packages, decl_name);
-            // A `.path` package's key is its `build_root`; a fetched one is keyed by hash and lives in a
-            // cache, so an unfetched lazy dependency is not mistaken for one.
-            const is_path = std.mem.eql(u8, package.build_root, decl_name);
+            // A present package, the usual case, is settled without comparing any paths.
+            if (@hasDecl(package, "build_zig") or Self.isUnderDeps(decl_name)) continue;
+            // A fetched package is keyed by its hash and lives in `zig-pkg/` or a cache, so an unfetched
+            // lazy dependency is not mistaken for a missing sibling.
+            if (Self.isFetched(package.build_root, decl_name)) continue;
             // The root's own archives are unpacked in the same build; a sibling's is unknown at comptime and costs a re-run.
-            if (is_path and !Self.isUnderDeps(decl_name) and !@hasDecl(package, "build_zig") and !Self.isRootArchive(zon, decl_name)) return decl_name;
+            if (!Self.isRootArchive(zon, decl_name)) return decl_name;
         }
         return null;
+    }
+
+    /// Reports whether an entry of the build runner's package table is a fetched package, not a `.path` one.
+    ///
+    /// - `build_root`: The entry's `build_root`: relative to the build's working directory, or absolute.
+    /// - `key`: The entry's key: a hash for a fetched package, a path for a `.path` one.
+    /// - Returns: `true` when the package sits at `zig-pkg/<key>` or a cache's `p/<key>`.
+    fn isFetched(build_root: []const u8, key: []const u8) bool {
+        // Not an equality test: a `.path` package's root is `<dir of the build>/<key>`, which is the
+        // key itself only when `zig build` runs in the root package's own directory.
+        if (!std.mem.endsWith(u8, build_root, key) or build_root.len == key.len) return false;
+        const parent = build_root[0 .. build_root.len - key.len];
+        if (!std.Io.Dir.path.isSep(parent[parent.len - 1])) return false;
+        const store = std.Io.Dir.path.basename(parent[0 .. parent.len - 1]);
+        return std.mem.eql(u8, store, "zig-pkg") or std.mem.eql(u8, store, "p");
     }
 
     /// Reports whether a key of the build runner's package table is a path under the root's `deps/`.
@@ -507,13 +615,30 @@ test "outside a build runner every dependency counts as present" {
     try std.testing.expect(Deps.worktreesPresent(test_zon));
 }
 
-test "isCiValue turns CI mode on for any non-empty value but 0 and false" {
-    try std.testing.expect(Deps.isCiValue("true"));
-    try std.testing.expect(Deps.isCiValue("1"));
-    try std.testing.expect(Deps.isCiValue("woodpecker"));
-    try std.testing.expect(!Deps.isCiValue(null));
-    try std.testing.expect(!Deps.isCiValue(""));
-    try std.testing.expect(!Deps.isCiValue("0"));
-    try std.testing.expect(!Deps.isCiValue("false"));
-    try std.testing.expect(!Deps.isCiValue("False"));
+test "isFetched tells a fetched package from a .path one, wherever zig build runs" {
+    const hash = "zigbuildx-6.0.0-9koPhJjSBAAdyvyqYS1GYMx";
+    try std.testing.expect(Deps.isFetched("zig-pkg/" ++ hash, hash));
+    try std.testing.expect(Deps.isFetched("/abs/app/zig-pkg/" ++ hash, hash));
+    try std.testing.expect(Deps.isFetched("/home/u/.cache/zig/p/" ++ hash, hash));
+    try std.testing.expect(!Deps.isFetched("../liba", "../liba"));
+    try std.testing.expect(!Deps.isFetched("/abs/app/../liba", "../liba"));
+    try std.testing.expect(!Deps.isFetched("vendor", "vendor"));
+    try std.testing.expect(!Deps.isFetched("/abs/app/vendor", "vendor"));
+}
+
+test "restoreManifest puts the backup back once, and reports when there is none" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    try tmp.dir.writeFile(io, .{ .sub_path = "build.zig.zon", .data = "rewritten" });
+    try std.testing.expect(!try Deps.restoreManifest(allocator, io, root));
+    try tmp.dir.writeFile(io, .{ .sub_path = mod.Stage.backup_name, .data = "original" });
+    try std.testing.expect(try Deps.restoreManifest(allocator, io, root));
+    try std.testing.expectEqualStrings("original", try tmp.dir.readFileAlloc(io, "build.zig.zon", allocator, .limited(64)));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, mod.Stage.backup_name, .{}));
+    try std.testing.expect(!try Deps.restoreManifest(allocator, io, root));
 }

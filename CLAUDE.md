@@ -57,6 +57,16 @@ zig fetch --save=zigbuildx ../zigbuildx   # from the scratch package
 - **Windows:** compile only, through `make cross`.
 - **Configure caching:** run `zig build` twice; the second skips `build()`
   (a `std.debug.print` in the scratch `build.zig` shows whether it ran).
+- **`Stage` tests** run `zig fetch` with the `zig` that `build.zig` passes as
+  `ZIGBUILDX_ZIG` (they skip without it, as `make cross` builds them), into a
+  scratch global cache kept at `.zig-cache/zigbuildx-test-global-cache`. Zig
+  0.17 spends about 30 s setting up a new global cache, so the first test run
+  after `make clean` is that much slower.
+- **A distribution build end to end:** a scratch consumer calling
+  `cloneMissing`, its siblings as bare repos (git clones them; Zig cannot
+  fetch a local path), and a lone clone of it built with `-Ddist` and an
+  empty `ZIG_GLOBAL_CACHE_DIR`
+  (seeded with `zig fetch ../zigbuildx`, which stands in for the public URL).
 
 ## Module layout
 
@@ -64,14 +74,17 @@ zig fetch --save=zigbuildx ../zigbuildx   # from the scratch package
 build.zig              the public surface: re-exports Deps, Git, Xcode, Swift,
                        Android, AndroidAbi and Docs; installs the host tool
 src/module.zig         the barrel the tests compile
-src/deps.zig           Deps: the entry points (clone, sync, update, pin)
+src/deps.zig           Deps: the entry points (clone, sync, update, pin, restore)
 src/sync.zig           Sync: one run over the manifests, siblings and worktrees
+src/stage.zig          Stage: a distribution build under cloneMissing, siblings staged into zig-pkg/
+src/source.zig         Source: a `.clone` or an `.archive`
+src/zon_edit.zig       ZonEdit: in-place `build.zig.zon` edits
 src/manifest.zig       Manifest: the parts of a `build.zig.zon` Deps reads
 src/entry.zig          Entry: one manifest dependency
 src/pin.zig            Pin: a worktree's SHA, tag or branch
 src/pin_kind.zig       PinKind: which of the three a pin is
 src/stamp.zig          Stamp: a worktree's `deps/.zigbuildx/*.rev` record
-src/mode.zig           Mode: develop or CI
+src/mode.zig           Mode: develop or dist
 src/updated.zig        Updated: what an update moved or skipped
 src/release_pin.zig    ReleasePin: `git+` URLs and release tags for `zigbuildx-pin`
 src/git.zig            Git: one thin wrapper per git command
@@ -85,6 +98,7 @@ src/file.zig           File: file-system primitives the others share
 src/tool.zig           Tool: the host tool's main and command dispatch
 src/tool_artifact.zig  ToolArtifact: finds the host tool for a consumer's build
 src/zip_builder.zig    ZipBuilder: in-memory zips for the tests
+src/test_tree.zig      TestTree: git repositories and a consumer, for the tests
 ```
 
 Consumers import this package's `build.zig` by dependency name, so only what
@@ -119,9 +133,9 @@ additions to ZIGSTYLE:
   errors there (`- Returns: IO errors.`). Why a line does something
   non-obvious, such as a Zig 0.17 workaround, is a `//` comment on that line.
 - **`// SAFETY:`** above every `undefined` field, saying what populates it.
-- **No `deinit` on a struct that owns nothing** (D.2.a): `Sync` allocates
-  from its caller's arena (the build's), so a `deinit` would be `_ = self;`
-  and a `defer` at every call site.
+- **No `deinit` on a struct that owns nothing** (D.2.a): `Sync` and `Stage`
+  allocate from their caller's arena (the build's), so a `deinit` would be
+  `_ = self;` and a `defer` at every call site.
 - **One-line parameter lists**, even past the usual width.
 - **Use `Run`'s `…Arg2` forms throughout.** Every path-argument method
   without `2` is deprecated in 0.17 except `addFileArg`, a plain wrapper of
@@ -137,10 +151,9 @@ additions to ZIGSTYLE:
   paths). Declare anything else: `b.dependOnFileMetadata` and friends where
   a path captures it, else `b.graph.poisonCache()`. `Xcode.resolveFor`
   tracks `SDKSettings.json`; `Android.resolve`, `Deps.sync` with
-  worktrees, and CI mode poison. Upstream is not tracked: in develop mode
-  `Deps` updates only when `build()` runs for some other reason. The
-  environment is not tracked either: `CI` turns CI mode on only when
-  `build()` runs, so a warm develop cache wins until `-Dci` is passed.
+  worktrees, and a distribution build poison. Upstream is not tracked: in
+  develop mode `Deps` updates only when `build()` runs for some other
+  reason.
 - **Work at build time goes in the host tool.** A Zig 0.17 step cannot run
   code of its own, and cache and install paths exist only when steps run.
   `src/tool.zig` is one program, `zigbuildx <command>`; each command is a
@@ -162,7 +175,13 @@ additions to ZIGSTYLE:
   could clone it. It runs for the root only. `missingSibling` scans the
   runner's package table (a `.path` package's key is its path) for one
   outside `deps/` with no `build_zig`, so the clone path compiles away in
-  the steady state. A lock, `<root>/.zig-cache/zigbuildx.lock`, is held from
+  the steady state. A fetched package is told apart by where it lives
+  (`isFetched`: `zig-pkg/<key>` or a cache's `p/<key>`), not by its
+  `build_root` equalling its key, which holds only when `zig build` runs in
+  the root's own directory. `missingSibling` tests `build_zig` first and
+  raises the comptime branch quota per package: comparing a dozen hashed
+  packages' paths, as a distribution build makes them, exceeds the default
+  1000. A lock, `<root>/.zig-cache/zigbuildx.lock`, is held from
   before the first clone, and again by `applyUpdate` while siblings and
   worktrees are updated or moved, so two builds never move one checkout.
 - **`.archive` (`ZipArchive`):** a zip unpacked at a `.path` wherever a
@@ -174,9 +193,12 @@ additions to ZIGSTYLE:
   `build.zig` marks it present in the runner's table. `.zigbuildx-archive`
   stamps the URL: a new URL replaces the directory, and a directory without
   the stamp is refused. It cannot be pinned, is never updated, and is not
-  hash-checked.
+  hash-checked. An entry name with a `:` is refused before anything is
+  written: `std.zip` stops `..` and a leading `/`, but not a Windows drive
+  (`C:\…`) or an NTFS stream, which Windows writes wherever they point.
 - **One entry point per `build()`:** `cloneMissing` and `sync` each declare
-  `-Dci` and `zigbuildx-pin`, which Zig panics on declaring twice. A second
+  `-Ddist` and `zigbuildx-pin`, which Zig panics on declaring twice;
+  `cloneMissing` also declares `dev`. A second
   call of the same one returns at once (`Deps.ranBefore`); mixing them
   fails with a message (`failMixed`), since `cloneMissing` clones `deps/`
   paths as plain checkouts, which `sync` then refuses for lacking a stamp.
@@ -189,7 +211,13 @@ additions to ZIGSTYLE:
   `deps/.zigbuildx/*.rev` stamps and runs no `git`. Each worktree's manifest
   is read in the same pass; a `../x` from `deps/mid` resolves to the root's
   `deps/x`, and the first declaration of a path wins. An unclaimed worktree
-  is removed when clean, else kept and listed. The return type is `noreturn`
+  is removed when clean, else kept and listed; its own worktrees
+  (`<orphan>/deps/<x>`) go first, and it stays while any of them does,
+  since `git worktree remove` would delete them and its git-ignored `deps/`
+  hides their work from its own status. Every claimed worktree's `deps/` is
+  scanned too, so one it stops declaring is an orphan. "Commits of its own"
+  are counted from the branch's tip as last fetched once that holds the
+  stamped commit (`workBase`), so commits pushed from a worktree are not. The return type is `noreturn`
   while a `deps/` package is missing, so a transitive top-level `@import` can
   wait; a worktree dependency must have a `build.zig`.
 - **The update (develop mode):** whenever `build()` runs, `Deps`
@@ -199,7 +227,12 @@ additions to ZIGSTYLE:
   dirty, or ahead of the tip as last fetched), so a skipped checkout never
   reaches the network. The rest are fetched at once (`Sync.fetchAll`: every
   `git fetch` child is started before any is waited for; a build runner is
-  single-threaded, so a `std.Io.Group` would run them one by one). `.sha`
+  single-threaded, so a `std.Io.Group` would run them one by one). Each
+  fetch names the remote whose refs are read next: `origin` for a `.branch`,
+  a distribution build, worktrees and `Stage`, the branch's own upstream
+  remote for `@{u}`.
+  `Git.fetch_args` adds `--prune`, so a branch deleted upstream is gone
+  rather than stale (tags fetched by `--tags` are never pruned). `.sha`
   and `.tag` worktrees and archives are never fetched. A skip or a failed
   fetch warns and never fails the build; anything moved exits 1.
 - **Sibling refs (`Sibling.ref`):** a `../x` may set `.branch` or `.tag`,
@@ -212,12 +245,60 @@ additions to ZIGSTYLE:
   moved: a sibling off its tag (checked against the local tag) is left, with
   a warning. Two manifests naming different refs for one sibling: the first
   found (root first) wins, with a warning, in either mode.
-- **CI mode (`-Dci`, `Sync.enforceSiblings`):** a complement to develop mode
-  for reproducible builds from the manifests' refs, with no commit tracking.
-  `Deps.modeOf`, called by both `cloneMissing` and `sync`, declares `-Dci`,
-  which defaults to on when `CI` is set to anything but empty, `0` or
-  `false` (`-Dci=false` overrides it), and poisons the configure cache so
-  every configure checks the remotes. `applyUpdate` then runs
+- **A distribution build (`-Ddist`):** a complement to develop mode for
+  reproducible builds from the manifests' refs, with no commit tracking.
+  `Deps.modeOf`, called by both `cloneMissing` and `sync`, declares `-Ddist`
+  (off unless passed; nothing in the environment turns it on), and poisons
+  the configure cache so every configure checks the remotes. `Mode` is
+  `develop` or `dist`; the entry point decides what `dist` does:
+  `cloneMissing` stages (next bullet), `sync` enforces (the one after).
+- **A distribution build under `cloneMissing` (`Stage`, `Deps.stageSiblings`):** the build
+  reads nothing outside the consumer, and Zig never fetches a sibling, so
+  private repositories need only git's credentials. `Stage` runs before
+  anything else, under the lock. Every `.path` that leaves the package
+  declaring it is a sibling to stage; the root's own inside paths are left to
+  what follows (`cloneSiblings` and `enforceSiblings`, as under `sync`).
+  Breadth first (`prepare`, so the root's declaration, then the nearer, wins,
+  with a warning): a `.clone` is cloned into
+  `.zig-cache/zigbuildx-dist/clones/<base>-<wyhash of URL>` (fetched on a
+  later run), its ref resolved (`refs/tags/<t>`, `refs/remotes/origin/<b>`,
+  or `origin/HEAD`), the commit exported (`Git.archive`, extracted with
+  `std.tar` in process); an `.archive` is unpacked by `ZipArchive`. Depth
+  first (`stage`; `State.visiting` refuses a cycle): each export's manifest
+  has its own siblings rewritten (`ZonEdit`), `zig fetch <dir>` hashes it,
+  and the export is renamed into `<root>/zig-pkg/<hash>/`. Zig resolves a
+  hash from `zig-pkg/` before any cache or URL; that is the only store
+  zigbuildx can be sure the build reads, since the configurer is not told
+  `--global-cache-dir`, `zig fetch` has no such flag, and its `--pkg-dir`
+  does not place a plain fetch. The `.url` written is a label
+  (`Stage.labelOf`: `git+<url>#<commit>`, an scp `.clone` as `git+ssh://`,
+  which Zig requires, a local path as `git+file://`): never fetched while the
+  hash is staged, and never fetchable for a package whose manifest was
+  rewritten, so staging runs on every fresh checkout. The root's manifest is
+  rewritten last, after `build.zig.zon.orig` (written only when something is
+  rewritten, so the re-run never overwrites it), and the run exits 1; the
+  re-run finds no sibling and `Stage` does nothing. Refused: a sibling with no
+  `.clone` or `.archive`, a `.sha`, both `.branch` and `.tag`, an invalid ref
+  (`Pin.isValidValue`), a sibling's pinned `.path` under its own `deps/` (a
+  `sync` worktree, which no export holds), the root as a dependency, and a
+  cycle. `zig build dev` runs `zigbuildx restore <root>` (`Deps.restore`),
+  which renames `.orig` back; with none it says so and succeeds. Going back
+  takes a second `zig build`: the run that restores was configured from the
+  staged packages. Only `cloneMissing` declares `dev`: `sync` never rewrites
+  the manifest.
+- **Why staging works this way (Zig 0.17, checked in scratch packages):**
+  Zig fetches every eager `.url` dependency before `build()` runs, so
+  zigbuildx can only get in front of `.path` siblings; a lazy `.url` staged
+  during `build()` is found by Zig's lazy fetch after it returns. A `.path`
+  that leaves a hashed package is an error (`dependency path outside
+  project`), so each staged sibling's own siblings must be rewritten to
+  `.url` + `.hash` before it is hashed, leaves first. `zig fetch --save`
+  keeps an existing `.path` entry, hence `ZonEdit`. A folder's hash covers
+  only what its `.paths` lists, so the export matters only for `.paths =
+  ""`; it is kept so a package is exactly its commit. Zig fetches
+  `git+http(s)` only: `git://`, `git+file` and `git+ssh` are refused, which
+  is harmless for a label whose hash is staged.
+- **A distribution build under `sync` (`Sync.enforceSiblings`):** `applyUpdate` runs
   `enforceSiblings` in place of `updateSiblings`: every sibling (siblings of
   siblings included) goes to its ref, `.branch` at `origin/<branch>` (on the
   branch), `.tag` detached, no ref the remote's default branch
@@ -237,7 +318,8 @@ additions to ZIGSTYLE:
   distinct exit code for "re-run" is impossible: 0.17's `zig build` turns
   any configure failure into a fatal exit 1
   (`lib/compiler/Maker.zig:1515`), and its own re-run loop covers only
-  hashed lazy packages, so CI runs `zig build -Dci || zig build -Dci`.
+  hashed lazy packages, so a distribution build runs
+  `zig build -Ddist || zig build -Ddist`.
   Clones land at `../x`, beside the project: `.path` is text, so a `deps/`
   layout would need `deps/x` manifests (the `sync` worktree route), which
   gives up live editing of `../x`.
@@ -252,10 +334,15 @@ additions to ZIGSTYLE:
   (named by `ToolArtifact.dependencyName`) and runs `zig fetch` in the root,
   keeping the URL's form (`?ref=<ref>#<commit>` with `--save`, `#<ref>` with
   `--save-exact`). A branch pin (`#main`) is refreshed on its branch, never
-  swapped for a tag. Otherwise it takes the newest `vX.Y.Z` from `git
-  ls-remote --tags` (an annotated tag's commit from its `^{}` line, so no
-  `--refs`) and re-pins when the tag or its commit differs, as after a
-  history rewrite. A pin newer than every tag is left alone.
+  swapped for a tag; a branch is a ref that is neither a commit nor a tag
+  the listing names, so a tag that is no release (`v5.2.0-rc1`, `nightly`)
+  moves to the newest release. Otherwise it takes the newest `vX.Y.Z` from
+  `git ls-remote --tags` (an annotated tag's commit from its `^{}` line, so
+  no `--refs`) and re-pins when the tag or its commit differs, as after a
+  history rewrite. A pin newer than every release, a pre-release included
+  (`ReleasePin.tagVersion`), is left alone. It refuses while
+  `build.zig.zon.orig` exists: a pin written into the manifest a
+  distribution build rewrote would be lost to `zig build dev`.
 - **`Xcode`:** `initFor(b, target)` resolves the SDK of the target's own
   platform on a Mac (`darwin.getSdk` maps every Apple OS and the simulator
   ABI) and does nothing for a non-Apple target, so callers need no checks;
@@ -313,7 +400,13 @@ additions to ZIGSTYLE:
   Before the push, `zig fetch .` here puts the same hash in the global cache
   for local builds. Consumers pin a tag with its commit (`?ref=v4.1.0#<commit>`),
   so a release that rewrites history breaks their URLs.
-- **Compatibility:** 5.1.1 needs no consumer change: it splits `deps.zig`
+- **Compatibility:** 6.0.0 renames 5.1's `-Dci` to `-Ddist`, which nothing
+  in the environment turns on. Under `cloneMissing` a distribution build
+  stages the siblings into `zig-pkg/` and rewrites `build.zig.zon` (kept as
+  `build.zig.zon.orig`), where 5.x cloned them to `../x`; every sibling then
+  needs a `.clone` or an `.archive`. `cloneMissing` declares a `dev` step, so
+  a consumer's own `dev` step must be renamed. `sync` is otherwise unchanged. 5.1.1
+  needs no consumer change: it splits `deps.zig`
   one struct per file, so `Sync`'s messages now log as `zigbuildx_sync`
   rather than `zigbuildx_deps`. 5.1.0 needs no consumer change: it adds `-Dci` and
   `.tag` on a sibling (refused before). Under `cloneMissing`, a root
@@ -355,11 +448,19 @@ reaches `std.debug.print` does not compile for Apple's other platforms.
 
 ## Not yet implemented
 
+- **Staging under `sync`:** a distribution build under `sync` still moves
+  the siblings at `../x`; staging its `deps/` worktrees by their pins is the
+  next step if wanted.
+- **Private lazy `.url` dependencies:** staging one during `build()` works
+  (see *Why staging works this way*); eager ones cannot be reached.
 - **ADB over TCP install step** (about 1,000–1,300 lines): the ADB protocol
   (push and shell) on `std.Io.net`, plus RSA signing of the auth token with
   `~/.android/adbkey` (`std.crypto.ff`; std can only verify RSA). Open: a
   test device, a missing key, and whether it belongs in its own package.
-- **Rejected:** a lock file of sibling commits for CI (CI mode builds the
-  declared refs instead); `.sha` on a `../x`; and a `--fork` per sibling, since
+- **Rejected:** a lock file of sibling commits (a distribution build builds
+  the declared refs instead); `.sha` on a `../x`; and a `--fork` per sibling, since
   Zig reads `--fork` only from the command line and matches only hashed
-  packages.
+  packages. For a distribution build under `cloneMissing`: a loopback git server for Zig
+  to fetch the private siblings from (staging needs none, and it would have
+  to outlive the configure that started it), and staging private `.url`
+  dependencies (Zig fetches an eager one before `build()` runs).

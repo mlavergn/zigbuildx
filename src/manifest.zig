@@ -70,6 +70,10 @@ pub const Manifest = struct {
             for (fields.names, 0..) |key, j| {
                 const text = switch (fields.vals.at(@intCast(j)).get(zoir)) {
                     .string_literal => |text| text,
+                    .true => {
+                        if (std.mem.eql(u8, key.get(zoir), "lazy")) entry.lazy = true;
+                        continue;
+                    },
                     else => continue,
                 };
                 inline for (.{ "url", "path", "clone", "archive", "checkout", "sha", "tag", "branch" }) |field| {

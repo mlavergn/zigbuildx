@@ -16,6 +16,10 @@ pub const WorktreeHead = union(enum) {
 /// a checkout or a worktree.
 pub const Git = struct {
     const Self = @This();
+    /// What every fetch passes. `--prune` drops branches deleted upstream, so a stale one is never
+    /// built (tags fetched by `--tags` are never pruned); `--force` lets a tag moved upstream follow
+    /// it, where `--tags` alone exits 1 ("would clobber existing tag").
+    const fetch_args = [_][]const u8{ "fetch", "--prune", "--tags", "--force", "--quiet" };
 
     /// Clones the repository at `url` into `dest`, at `ref` or the remote's default branch.
     ///
@@ -46,26 +50,32 @@ pub const Git = struct {
         return error.GitCloneFailed;
     }
 
-    /// Fetches branches and tags from the default remote, accepting tags moved upstream.
+    /// Fetches branches and tags from `remote`, accepting tags moved upstream and dropping branches deleted there.
     ///
     /// - `allocator`: Allocator for the child's output, freed before return.
     /// - `io`: IO the `git` child is spawned on.
     /// - `repo`: The checkout to fetch into.
+    /// - `remote`: The remote whose refs the caller reads, such as `origin`; null for the current branch's upstream remote.
     /// - Returns: `error.GitFailed` when `git` fails, or spawn errors.
-    pub fn fetch(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !void {
-        // `--force`: without it a tag moved upstream makes `--tags` exit 1 ("would clobber existing tag").
-        // The checkout's tag then follows upstream; a worktree pinned to it keeps its stamped commit.
-        try Self.runVoid(allocator, io, repo, &.{ "fetch", "--tags", "--force", "--quiet" });
+    pub fn fetch(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, remote: ?[]const u8) !void {
+        var argv: [Self.fetch_args.len + 1][]const u8 = undefined;
+        try Self.runVoid(allocator, io, repo, Self.fetchArgv(&argv, remote));
     }
 
     /// Starts the fetch `fetch` runs without waiting for it, so several can overlap.
     ///
     /// - `io`: IO the `git` child is spawned on.
     /// - `repo`: The checkout to fetch into.
+    /// - `remote`: The remote whose refs the caller reads, such as `origin`; null for the current branch's upstream remote.
     /// - Returns: The running child, for `finishFetch`; spawn errors.
-    pub fn startFetch(io: std.Io, repo: []const u8) !std.process.Child {
-        // The arguments `fetch` passes; git's own errors reach stderr, as `clone`'s do.
-        return std.process.spawn(io, .{ .argv = &.{ "git", "-C", repo, "fetch", "--tags", "--force", "--quiet" }, .stdin = .ignore, .stdout = .ignore });
+    pub fn startFetch(io: std.Io, repo: []const u8, remote: ?[]const u8) !std.process.Child {
+        var args: [Self.fetch_args.len + 1][]const u8 = undefined;
+        const fetch_argv = Self.fetchArgv(&args, remote);
+        var argv: [Self.fetch_args.len + 4][]const u8 = undefined;
+        argv[0..3].* = .{ "git", "-C", repo };
+        @memcpy(argv[3..][0..fetch_argv.len], fetch_argv);
+        // Git's own errors reach stderr, as `clone`'s do.
+        return std.process.spawn(io, .{ .argv = argv[0 .. 3 + fetch_argv.len], .stdin = .ignore, .stdout = .ignore });
     }
 
     /// Waits for a child that `startFetch` began.
@@ -315,6 +325,33 @@ pub const Git = struct {
         return true;
     }
 
+    /// Writes the tree of `commit` as a tar file at `output`: its tracked files, with no `.git`.
+    ///
+    /// - `allocator`: Allocator for git's output.
+    /// - `io`: IO the `git` child is spawned on.
+    /// - `repo`: The checkout.
+    /// - `commit`: The commit to export.
+    /// - `output`: The tar file to write.
+    /// - Returns: `error.GitFailed` when `git` fails, or spawn errors.
+    pub fn archive(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, commit: []const u8, output: []const u8) !void {
+        // `-o` writes the file directly, so a large tree never passes through a pipe; `--` ends the options.
+        const out_arg = try allocator.print("--output={s}", .{output});
+        defer allocator.free(out_arg);
+        try Self.runVoid(allocator, io, repo, &.{ "archive", "--format=tar", out_arg, commit, "--" });
+    }
+
+    /// Builds a fetch's arguments in `buffer`.
+    ///
+    /// - `buffer`: Room for `fetch_args` and a remote.
+    /// - `remote`: The remote, or null for the current branch's upstream remote.
+    /// - Returns: The arguments, a slice of `buffer`.
+    fn fetchArgv(buffer: *[Self.fetch_args.len + 1][]const u8, remote: ?[]const u8) []const []const u8 {
+        buffer[0..Self.fetch_args.len].* = Self.fetch_args;
+        const name = remote orelse return buffer[0..Self.fetch_args.len];
+        buffer[Self.fetch_args.len] = name;
+        return buffer[0 .. Self.fetch_args.len + 1];
+    }
+
     /// Runs `git -C repo args…` and discards its output.
     ///
     /// - `allocator`: Allocator for the child's output, freed before return.
@@ -529,7 +566,7 @@ test "checkoutTracking puts a repository with no commits on a fetched branch" {
     defer allocator.free(local);
     try repo.git(&.{ "git", "init", "--quiet", "--initial-branch=main", local });
     try repo.git(&.{ "git", "-C", local, "remote", "add", "origin", origin });
-    var child = try Git.startFetch(io, local);
+    var child = try Git.startFetch(io, local, null);
     try std.testing.expect(Git.finishFetch(io, &child));
     try Git.checkoutTracking(allocator, io, local, "main");
     try repo.tmp.dir.access(io, "local/one", .{});
@@ -569,7 +606,7 @@ test "fetch brings a new tag into a clone" {
     try repo.commit("origin", "two");
     try repo.git(&.{ "git", "-C", origin, "tag", "v2" });
     try std.testing.expectEqual(null, try Git.revParse(allocator, io, checkout, "refs/tags/v2"));
-    try Git.fetch(allocator, io, checkout);
+    try Git.fetch(allocator, io, checkout, null);
     const v2 = (try Git.revParse(allocator, io, checkout, "refs/tags/v2")).?;
     allocator.free(v2);
 }
@@ -586,7 +623,7 @@ test "fetch accepts a tag moved upstream" {
     try Git.clone(io, origin, checkout, null);
     try repo.commit("origin", "two");
     try repo.git(&.{ "git", "-C", origin, "tag", "--force", "v1" });
-    try Git.fetch(allocator, io, checkout);
+    try Git.fetch(allocator, io, checkout, null);
     const moved = (try Git.revParse(allocator, io, checkout, "refs/tags/v1")).?;
     defer allocator.free(moved);
     const head = (try Git.revParse(allocator, io, origin, "HEAD")).?;
