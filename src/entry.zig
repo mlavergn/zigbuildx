@@ -5,6 +5,8 @@ pub const Entry = struct {
     name: []const u8,
     /// Where a fetched dependency comes from; only `Deps.pin` reads it.
     url: ?[]const u8 = null,
+    /// A fetched dependency's package hash (`.hash`); only `Vendor` reads it.
+    hash: ?[]const u8 = null,
     /// Where a local dependency lives (`.path`).
     path: ?[]const u8 = null,
     /// The repository to clone an absent `.path` from (`.clone`).

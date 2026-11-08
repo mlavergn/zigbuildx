@@ -32,6 +32,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const test_filter = b.option([]const u8, "test-filter", "Run unit tests that match filter");
+    // An option, not an environment variable: Zig 0.17 reuses a cached configure, whose Run steps keep the environment they were configured with.
+    const vendor_check = b.option(bool, "vendor-check", "Also run the slow end-to-end test of zig build vendor (make vendor)") orelse false;
 
     // Installed, because an installed artifact is what `Dependency.artifact` finds
     // when an extension asks for the host tool (`src/tool_artifact.zig`).
@@ -53,6 +55,8 @@ pub fn build(b: *std.Build) void {
     run_tests.has_side_effects = true;
     // `Stage`'s tests hash packages with this `zig`; they skip without it, as under `make cross`.
     run_tests.setEnvironmentVariable("ZIGBUILDX_ZIG", b.graph.zig_exe);
+    // Set either way, so a value in the configuring shell never decides it.
+    run_tests.setEnvironmentVariable("ZIGBUILDX_VENDOR_CHECK", if (vendor_check) "1" else "0");
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 }

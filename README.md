@@ -9,7 +9,7 @@ Nothing acts unless a `build.zig` calls it.
 
 | Extension | What it does |
 |---|---|
-| `Deps` | Clones missing sibling checkouts and keeps them up to date, stages them as Zig packages for distribution builds that read nothing outside the project, unpacks source archives, gives pinned dependencies their own git worktree, and repins zigbuildx |
+| `Deps` | Clones missing sibling checkouts and keeps them up to date, stages them as Zig packages for distribution builds that read nothing outside the project, writes vendored source tarballs that build with no network, unpacks source archives, gives pinned dependencies their own git worktree, and repins zigbuildx |
 | `Git` | Runs `git` commands for the build |
 | `Xcode` | Finds an Apple platform's SDK (macOS, iOS, tvOS, visionOS, watchOS), sets a macOS deployment floor, links frameworks, assembles `.xcframework`s |
 | `Swift` | Builds a Swift dylib that a Zig package links against |
@@ -45,7 +45,8 @@ To work on zigbuildx itself:
 ```sh
 git clone git@github.com:mlavergn/zigbuildx.git
 cd zigbuildx
-make validate
+make validate   # the gate: format, lint, build, test, cross-compile
+make vendor     # the end-to-end check of zig build vendor (about a minute), before a release
 ```
 
 ## Configuration
@@ -68,8 +69,8 @@ make validate
     .dependencies = .{
         // zigbuildx itself, written by `zig fetch --save` or `zig build zigbuildx-pin`
         .zigbuildx = .{
-            .url = "git+https://github.com/mlavergn/zigbuildx?ref=v6.0.0#<commit>",
-            .hash = "zigbuildx-6.0.0-<hash>",
+            .url = "git+https://github.com/mlavergn/zigbuildx?ref=v6.1.0#<commit>",
+            .hash = "zigbuildx-6.1.0-<hash>",
         },
         // A sibling checkout, cloned when ../mylib is missing
         .mylib = .{ .path = "../mylib", .clone = "git@github.com:org/mylib.git" },
@@ -128,6 +129,7 @@ updated`): run it again.
 zig build deps            # list the worktrees: pin, commit, clean or dirty
 zig build zigbuildx-pin   # pin zigbuildx to its newest release (`make buildxpin`); a branch pin stays on its branch
 zig build dev             # after a distribution build (cloneMissing): put back build.zig.zon, to build against ../ again
+zig build vendor          # write a source tarball that builds with no network (cloneMissing; see *Vendored source tarballs*)
 ```
 
 Target Apple platforms and link frameworks:
@@ -240,10 +242,88 @@ be brought to its branch's tip.
 - **Every configure checks the remotes** in a distribution build; nothing is
   cached.
 
+## Vendored source tarballs
+
+A distribution build resolves the manifests' refs every time it runs. A
+vendored tarball is resolved once: the project and every package it reads,
+at the commits you last built, in one `.tar.gz` that builds with Zig 0.17
+and fetches nothing. It needs no git, no credentials and no network, and
+none of its siblings' repositories have to exist any more.
+
+| Route | Builds from | Network |
+|---|---|---|
+| develop (`zig build`) | your checkouts at `../x` | fetches and fast-forwards siblings |
+| distribution (`-Ddist`) | the manifests' refs on the remotes | on every configure |
+| vendored (`zig build vendor`) | your checkouts' `HEAD`s, frozen in one `.tar.gz` | none, to build the tarball or from it |
+
+```sh
+zig build vendor          # writes zig-out/vendor/<name>-<version>-<commit>.tar.gz
+```
+
+Run it in a project that calls `cloneMissing`, after a build in develop
+mode, so every sibling is checked out:
+
+1. The project's `HEAD` is exported. Its own `.path` dependencies inside
+   it (a `deps/x` checkout, an unpacked `.archive`) are added as they are.
+2. Each sibling, siblings of siblings included, is exported from its
+   checkout at `../x` at its `HEAD`: what you built is what ships. An
+   `.archive` sibling is copied as unpacked. A sibling needs no `.clone`.
+3. Each goes into the export's `zig-pkg/` under its hash, and the
+   manifests name them by hash, as a distribution build does. `zig build
+   --fetch=all` adds every `.url` dependency, lazy ones and zigbuildx
+   included, from Zig's global cache (Zig fetches one the cache lacks; no
+   git remote is read).
+4. A marker, `.zigbuildx-vendor`, records the Zig release, zigbuildx's
+   hash, the project's commit and each sibling's repository and commit.
+   A repository URL that carries credentials (`https://<token>@host/…`)
+   is recorded without them.
+5. The export is built with a global cache that holds no packages: a
+   package missing from `zig-pkg/` would have to be fetched, so the build
+   fails, and no tarball is written.
+6. The tarball has one top-level folder, `<name>-<version>-<commit>`, the
+   first 12 hex digits of the project's commit. Entries are sorted, with
+   the commit's time and owner 0, so the same commits give the same bytes
+   on the same kind of host.
+
+```sh
+tar xzf app-1.2.0-0123456789ab.tar.gz
+cd app-1.2.0-0123456789ab
+zig build                 # Zig 0.17; nothing is fetched, cloned or updated
+```
+
+- **Refused, all at once:** a project or sibling that is not a git
+  checkout of its own; uncommitted changes to tracked files in the
+  project, a sibling or a `deps/x` checkout (untracked files do not count,
+  and are left out); a sibling with a `.branch` that is not on that branch,
+  detached included; a sibling with a `.tag` that is not at it; a
+  `build.zig.zon` rewritten by a distribution build (run `zig build dev`
+  first). Also refused: a `.name` or `.version` that cannot name a file
+  (letters, digits and `._+-`, not starting with `.`; no `.version` gives
+  `0.0.0`), and anything in the tree that is not a file, a directory or a
+  link.
+- **Warned:** a `HEAD` (the project's or a sibling's) that no remote branch
+  holds, as last fetched. The tarball builds, but nobody else can fetch
+  that commit.
+- **Inside a vendored tree** zigbuildx does nothing: `cloneMissing`
+  returns at once, and `-Ddist`, `dev`, `zigbuildx-pin` and `vendor` each
+  fail with a message.
+- **Not included:** Zig itself, and anything outside the packages, such as
+  an SDK or an NDK.
+- **Time:** the proof builds the project. Its global cache,
+  `.zig-cache/zigbuildx-vendor/global-cache`, is kept between runs
+  (only its packages are emptied), so only the first run pays Zig's
+  half-minute cache setup.
+- **`sync`** does not declare `vendor` yet.
+
+## Migrating from 6.0
+
+- **`vendor` is a step of `cloneMissing`:** rename a `vendor` step of your
+  own, as Zig refuses two steps of one name. Nothing else changes.
+
 ## Migrating from 5.x
 
-- **5.1's `-Dci` is now `-Ddist`,** and no environment variable turns it on:
-  pass `-Ddist` where a build passed `-Dci` or relied on `CI` being set.
+- **A distribution build takes `-Ddist`,** and no environment variable turns
+  it on.
 - **Under `cloneMissing`, `-Ddist` stages the siblings** rather than cloning
   them to `../x`, so they no longer need a folder beside the project. Every
   sibling needs a `.clone` or an `.archive`; git-ignore `zig-pkg/` and

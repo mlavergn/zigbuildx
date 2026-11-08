@@ -12,10 +12,12 @@ pub const Manifest = struct {
     pub const max_bytes = 1 << 20;
     /// The package's `.name`.
     name: []const u8,
+    /// The package's `.version`; empty when it has none.
+    version: []const u8 = "",
     /// The package's `.dependencies`, in manifest order.
     entries: []const mod.Entry,
 
-    /// Parses a manifest's `.name` and `.dependencies`, ignoring every other field.
+    /// Parses a manifest's `.name`, `.version` and `.dependencies`, ignoring every other field.
     ///
     /// - `allocator`: Allocator for the result; use an arena, as nothing is freed individually.
     /// - `source`: The manifest text.
@@ -38,6 +40,11 @@ pub const Manifest = struct {
                 self.name = try allocator.dupe(u8, switch (value) {
                     .enum_literal => |name| name.get(&zoir),
                     .string_literal => |name| name,
+                    else => return error.InvalidManifest,
+                });
+            } else if (std.mem.eql(u8, key.get(&zoir), "version")) {
+                self.version = try allocator.dupe(u8, switch (value) {
+                    .string_literal => |version| version,
                     else => return error.InvalidManifest,
                 });
             } else if (std.mem.eql(u8, key.get(&zoir), "dependencies")) {
@@ -76,7 +83,7 @@ pub const Manifest = struct {
                     },
                     else => continue,
                 };
-                inline for (.{ "url", "path", "clone", "archive", "checkout", "sha", "tag", "branch" }) |field| {
+                inline for (.{ "url", "hash", "path", "clone", "archive", "checkout", "sha", "tag", "branch" }) |field| {
                     if (std.mem.eql(u8, key.get(zoir), field)) @field(entry, field) = try allocator.dupe(u8, text);
                 }
             }
@@ -88,7 +95,7 @@ pub const Manifest = struct {
 // -----------------------------------------------------------------------------
 // Unit Tests
 
-test "Manifest reads the name and dependencies and ignores other fields" {
+test "Manifest reads the name, version and dependencies and ignores other fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const manifest = try Manifest.parse(arena.allocator(),
@@ -104,6 +111,8 @@ test "Manifest reads the name and dependencies and ignores other fields" {
         \\}
     );
     try std.testing.expectEqualStrings("consumer", manifest.name);
+    try std.testing.expectEqualStrings("0.0.0", manifest.version);
+    try std.testing.expectEqualStrings("x", manifest.entries[1].hash.?);
     try std.testing.expectEqual(2, manifest.entries.len);
     try std.testing.expectEqualStrings("leaf", manifest.entries[0].name);
     try std.testing.expectEqualStrings("deps/leaf", manifest.entries[0].path.?);

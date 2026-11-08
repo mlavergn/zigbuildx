@@ -25,6 +25,7 @@ pub const Tool = struct {
         .{ .name = "docs-patch", .run = mod.Docs.command },
         .{ .name = "pin", .run = mod.Deps.pin },
         .{ .name = "restore", .run = mod.Deps.restore },
+        .{ .name = "vendor", .run = mod.Vendor.command },
     };
 
     /// The usage line, listing `commands` so it cannot drift from them.
@@ -71,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
 // Unit Tests
 
 test "every command is unique and listed in the usage line" {
-    try std.testing.expectEqualStrings("usage: zigbuildx <command> [args]; commands: deps, docs-patch, pin, restore", Tool.usage);
+    try std.testing.expectEqualStrings("usage: zigbuildx <command> [args]; commands: deps, docs-patch, pin, restore, vendor", Tool.usage);
     for (Tool.commands, 0..) |entry, i| {
         for (Tool.commands[i + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, entry.name, other.name));
     }

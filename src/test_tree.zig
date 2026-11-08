@@ -1,13 +1,15 @@
 const std = @import("std");
 const mod = @import("module.zig");
 
-/// A scratch tree for the tests of `Sync` and `Stage`: a consumer, origin repositories, and shared checkouts.
+/// A scratch tree for the tests of `Sync`, `Stage` and `Vendor`: a consumer, origin repositories, and shared checkouts.
 ///
 /// `<tmp>/origin/<name>` are the upstreams, each a Zig package tagged `v1`;
 /// `<tmp>/<name>` are the shared checkouts, cloned on demand through `.clone`;
 /// `<tmp>/consumer` is the root package.
 pub const TestTree = struct {
     const Self = @This();
+    /// The most `read` returns.
+    const max_read_bytes = 1 << 20;
     /// Backs everything the fixture allocates; freed by `deinit`.
     arena: std.heap.ArenaAllocator,
     /// IO for the filesystem and the children.
@@ -191,6 +193,44 @@ pub const TestTree = struct {
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = file, .data = name });
         try self.run(&.{ "git", "-C", dir, "add", "--all" });
         try self.run(&.{ "git", "-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", name });
+    }
+
+    /// Returns the `zig` executable the build passed for tests that run it.
+    ///
+    /// - `self`: The fixture.
+    /// - Returns: Its path; `error.SkipZigTest` when the build did not pass `ZIGBUILDX_ZIG`, as under `make cross`.
+    pub fn zig(self: *Self) ![]const u8 {
+        return std.testing.environ.getAlloc(self.allocator(), "ZIGBUILDX_ZIG") catch error.SkipZigTest;
+    }
+
+    /// Returns the scratch global cache the tests' `zig` children share, never the developer's own.
+    /// It is kept beside `std.testing`'s scratch directories: a new one costs Zig half a minute to set up.
+    ///
+    /// - `self`: The fixture.
+    /// - Returns: Its absolute path; IO errors.
+    pub fn globalCache(self: *Self) ![]const u8 {
+        const cache = try std.Io.Dir.cwd().realPathFileAlloc(self.io, ".zig-cache", self.allocator());
+        return std.Io.Dir.path.join(self.allocator(), &.{ cache, "zigbuildx-test-global-cache" });
+    }
+
+    /// Returns the test process's environment with `ZIG_GLOBAL_CACHE_DIR` set to `globalCache`.
+    ///
+    /// - `self`: The fixture.
+    /// - Returns: The environment, owned by the fixture; IO and allocation errors.
+    pub fn zigEnviron(self: *Self) !*std.process.Environ.Map {
+        const environ_map = try self.allocator().create(std.process.Environ.Map);
+        environ_map.* = try std.testing.environ.createMap(self.allocator());
+        try environ_map.put("ZIG_GLOBAL_CACHE_DIR", try self.globalCache());
+        return environ_map;
+    }
+
+    /// Reads a file of the scratch tree.
+    ///
+    /// - `self`: The fixture.
+    /// - `sub`: The file, relative to the scratch root.
+    /// - Returns: Its contents, owned by the fixture; IO errors.
+    pub fn read(self: *Self, sub: []const u8) ![]u8 {
+        return self.tmp.dir.readFileAlloc(self.io, sub, self.allocator(), .limited(Self.max_read_bytes));
     }
 
     /// Runs a command and expects it to succeed.

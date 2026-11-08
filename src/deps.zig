@@ -29,6 +29,8 @@ pub const Deps = struct {
     const pin_step = "zigbuildx-pin";
     /// The step `cloneMissing` declares to put back a manifest a distribution build rewrote.
     const dev_step = "dev";
+    /// The step `cloneMissing` declares to write a vendored source tarball.
+    const vendor_step = "vendor";
     /// The comptime branches allowed per entry of the build runner's package table, enough to compare paths of any length.
     const branches_per_package = 4096;
 
@@ -50,9 +52,24 @@ pub const Deps = struct {
             log.err("cannot resolve the build root [{any}]", .{err});
             std.process.exit(1);
         };
+        // A vendored tree holds every package already: nothing is cloned, updated or fetched.
+        const vendored = mod.Vendor.isVendored(b.allocator, b.graph.io, root) catch |err| {
+            log.err("cannot look for {s} [{any}]", .{ mod.Vendor.marker_name, err });
+            std.process.exit(1);
+        };
+        if (vendored) {
+            if (present) {
+                Self.declareVendored(b);
+                return;
+            } else {
+                log.err("this vendored tree lacks {s}; unpack the tarball again", .{comptime Self.missingSibling(zon) orelse "a .path dependency"});
+                std.process.exit(1);
+            }
+        }
         if (present) {
             Self.addPinStep(b);
             Self.addDevStep(b);
+            Self.addVendorStep(b);
         }
         const mode = Self.modeOf(b);
         // A distribution build uses staged packages: Zig never fetches a sibling, and nothing at `../` is read.
@@ -367,6 +384,39 @@ pub const Deps = struct {
         // It rewrites build.zig.zon: never cached.
         run.has_side_effects = true;
         b.step(Self.dev_step, "Put back the build.zig.zon a distribution build rewrote, to build against ../ again").dependOn(&run.step);
+    }
+
+    /// Declares the `vendor` step, which writes a self-contained source tarball of the root and every package it reads.
+    ///
+    /// - `b`: The root package's build graph.
+    fn addVendorStep(b: *std.Build) void {
+        const run = b.addRunArtifact(mod.ToolArtifact.add(b));
+        run.setName(Self.vendor_step);
+        run.addArg("vendor");
+        run.addDirectoryArg2(b.path("."), .{});
+        run.addArg(b.graph.zig_exe);
+        const out = run.addOutputDirectoryArg2("vendor", .{});
+        run.addArg(mod.ToolArtifact.dependencyName() orelse "-");
+        // It reads the checkouts' commits, which nothing tracks: never cached.
+        run.has_side_effects = true;
+        const install = b.addInstallDirectory(.{ .source_dir = out, .install_dir = .prefix, .install_subdir = "vendor" });
+        b.step(Self.vendor_step, "Write a source tarball of this package and every package it reads, which builds with no network").dependOn(&install.step);
+    }
+
+    /// Declares in a vendored tree the option and steps `cloneMissing` declares, each refusing; `-Ddist` stops the build.
+    ///
+    /// - `b`: The root package's build graph.
+    fn declareVendored(b: *std.Build) void {
+        // Declared, so `ranBefore` holds and a `-Ddist` is refused rather than reported as unknown.
+        const dist = b.option(bool, Self.dist_option, "Refused in a vendored tree, which builds what it holds") orelse false;
+        if (dist) {
+            log.err("this is a vendored tree ({s}): it builds what it holds, so -Ddist does not apply", .{mod.Vendor.marker_name});
+            std.process.exit(1);
+        }
+        inline for (.{ Self.pin_step, Self.dev_step, Self.vendor_step }) |name| {
+            const message = std.fmt.comptimePrint("{s}: this is a vendored tree ({s}), which builds what it holds; run it in the original checkout", .{ name, mod.Vendor.marker_name });
+            b.step(name, "Refused in a vendored tree").dependOn(&b.addFail(message).step);
+        }
     }
 
     /// Stages the root's siblings for a distribution build; exits 1 for a re-run when the manifest was rewritten.

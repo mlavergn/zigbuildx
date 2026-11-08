@@ -54,7 +54,6 @@ test "replaceDependency swaps one entry's value and keeps every other byte" {
     const allocator = std.testing.allocator;
     const source =
         \\.{
-        \\    .name = .app,
         \\    // the siblings
         \\    .dependencies = .{
         \\        .liba = .{ .path = "../liba", .clone = "git@host:org/liba.git" },
@@ -73,7 +72,6 @@ test "replaceDependency swaps one entry's value and keeps every other byte" {
     defer allocator.free(second);
     try std.testing.expectEqualStrings(
         \\.{
-        \\    .name = .app,
         \\    // the siblings
         \\    .dependencies = .{
         \\        .liba = .{ .url = "git+ssh://a#1", .hash = "a-1" },

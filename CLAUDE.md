@@ -38,6 +38,14 @@ imported from other projects' `build.zig` instead of copied into each one.
   `ZIG_DIRS`.
 - `make tag`: tags `v<.version>` and pushes it; `zigbuildx-pin` finds
   releases by that tag.
+- `make vendor`: the test "vendor end to end" in `src/vendor.zig`, which
+  skips unless `-Dvendor-check` is passed (an option, since a cached
+  configure keeps a Run step's environment). Through real `zig build`
+  runs it builds a scratch consumer (`../a` → `../b`, a lazy `.url`
+  dependency, zigbuildx from a copy of its `.paths`), checks the refusals,
+  vendors it, removes every origin and builds the unpacked tarball with no
+  packages. About a minute; not part of `validate`. Run it after changing
+  `Vendor` or `Stage`.
 
 Unit tests cannot cover how the build graph is wired, and `refAllDecls` does
 not analyze nested functions, so a typo in an unreferenced method compiles.
@@ -93,6 +101,7 @@ src/swift.zig          Swift: swiftc dylibs
 src/android.zig        Android: the NDK
 src/android_abi.zig    AndroidAbi: an ABI and its Zig target
 src/docs.zig           Docs: autodoc with private declarations
+src/vendor.zig         Vendor: `zig build vendor`, a self-contained source tarball
 src/zip_archive.zig    ZipArchive: `.archive` download and unpack
 src/file.zig           File: file-system primitives the others share
 src/tool.zig           Tool: the host tool's main and command dispatch
@@ -198,7 +207,7 @@ additions to ZIGSTYLE:
   (`C:\…`) or an NTFS stream, which Windows writes wherever they point.
 - **One entry point per `build()`:** `cloneMissing` and `sync` each declare
   `-Ddist` and `zigbuildx-pin`, which Zig panics on declaring twice;
-  `cloneMissing` also declares `dev`. A second
+  `cloneMissing` also declares `dev` and `vendor`. A second
   call of the same one returns at once (`Deps.ranBefore`); mixing them
   fails with a message (`failMixed`), since `cloneMissing` clones `deps/`
   paths as plain checkouts, which `sync` then refuses for lacking a stamp.
@@ -298,6 +307,61 @@ additions to ZIGSTYLE:
   ""`; it is kept so a package is exactly its commit. Zig fetches
   `git+http(s)` only: `git://`, `git+file` and `git+ssh` are refused, which
   is harmless for a label whose hash is staged.
+- **`zig build vendor` (`Vendor`, `Stage` with `local`):** a third route
+  beside develop and dist: one `.tar.gz` of the root and every package it
+  reads, at the commits last built, that builds with Zig 0.17 and fetches
+  nothing. Declared by `cloneMissing` only, as `zigbuildx vendor <root> <zig>
+  <out-dir> <zigbuildx-name>` into an output directory the step installs at
+  `<prefix>/vendor/`. It reads no git remote (only Zig fetches, a `.url`
+  dependency its global cache lacks) and touches no working tree, under
+  `.zig-cache/zigbuildx-vendor/vendor.lock`: the root's HEAD is exported to
+  `.zig-cache/zigbuildx-vendor/<top>/` (`.name` and `.version` must be plain
+  file-name text, since `<top>` is deleted and recreated), and
+  `Stage` runs with `local` (export each `../x` checkout's HEAD, or copy an
+  `.archive` unpack; no `.clone` needed), `target` (the export: its manifest
+  is rewritten and its `zig-pkg/` filled, while paths still resolve from
+  `root`), `backup = false`, and `exportInside` (the root's inside `.path`s:
+  a checkout's HEAD, else copied whole when the root's commit lacks it).
+  Every check runs before staging and all problems are reported together
+  (`Stage.problems`, `failAll`; the root's first, `checkRoot`): a root or
+  sibling that is not its own checkout (git would answer for an enclosing
+  repository), tracked changes (`Git.hasTrackedChanges`;
+  untracked files do not count and no export holds them), a `.branch`
+  sibling not on that branch (detached included), a `.tag` sibling not at
+  it, and a root with `build.zig.zon.orig`. A HEAD on no remote branch as
+  last fetched (`Git.isOnRemote`) warns. Then `zig build --fetch=all` in the
+  export (it fetches without running `build()`, lazy dependencies included,
+  into the export's `zig-pkg/`), the marker `.zigbuildx-vendor` (ZON: Zig
+  version, the root's zigbuildx `.hash`, the commit, each sibling's label;
+  a label names `origin` with its credentials removed,
+  `Stage.withoutCredentials`, since a token in a remote URL would ship),
+  and the proof: `zig build` in the export with a global cache whose `p/`
+  is emptied first and must still be empty after (packages live only in
+  `p/`; the rest of the cache is kept at `.zig-cache/zigbuildx-vendor/
+  global-cache` to skip Zig's 30 s setup). The tarball is
+  `<name>-<version>-<commit12>.tar.gz` with one top-level folder of that
+  name, entries sorted, mtime the commit time (`Git.commitTime`), owner 0,
+  modes 0o755/0o644 (`std.tar.Writer` over `std.compress.flate` gzip, whose
+  header has no time), so the same commits give the same bytes on one kind
+  of host (Windows has no executable bit). An entry that is not a file,
+  directory or link (a FIFO would block the read) is refused. In a tree
+  with the marker (`Vendor.isVendored`), `cloneMissing` declares `-Ddist`
+  and the steps `dev`, `zigbuildx-pin` and `vendor` as refusals
+  (`declareVendored`) and returns.
+- **Why vendoring works this way:** it ships what was built: local HEADs,
+  not the manifests' refs (a distribution build builds those), and commits,
+  not working trees, so uncommitted tracked work is refused rather than
+  shipped or silently dropped. An unpushed HEAD only warns, since the
+  tarball needs no remote. A `.branch` sibling must be on that branch;
+  detached at its tip is refused, as being on the branch is what `.branch`
+  declares. `vendor.lock` is a file apart from `zigbuildx.lock` because
+  `Stage.run` takes the root lock itself. The marker records the root's
+  zigbuildx `.hash` (which carries the version), since `src/` cannot read
+  zigbuildx's own `build.zig.zon`. Tar and gzip run in process, so no host
+  needs `tar` or `gzip`. A manifest without `.version` names the tarball
+  `0.0.0`. Checked in scratch packages: `--fetch=all` runs no `build()`,
+  and a `zig build` the host tool starts honours its own
+  `ZIG_GLOBAL_CACHE_DIR`, so the proof's cache is not the developer's.
 - **A distribution build under `sync` (`Sync.enforceSiblings`):** `applyUpdate` runs
   `enforceSiblings` in place of `updateSiblings`: every sibling (siblings of
   siblings included) goes to its ref, `.branch` at `origin/<branch>` (on the
@@ -400,15 +464,17 @@ additions to ZIGSTYLE:
   Before the push, `zig fetch .` here puts the same hash in the global cache
   for local builds. Consumers pin a tag with its commit (`?ref=v4.1.0#<commit>`),
   so a release that rewrites history breaks their URLs.
-- **Compatibility:** 6.0.0 renames 5.1's `-Dci` to `-Ddist`, which nothing
-  in the environment turns on. Under `cloneMissing` a distribution build
+- **Compatibility:** 6.0.0 adds `-Ddist`, which nothing in the
+  environment turns on. Under `cloneMissing` a distribution build
   stages the siblings into `zig-pkg/` and rewrites `build.zig.zon` (kept as
   `build.zig.zon.orig`), where 5.x cloned them to `../x`; every sibling then
   needs a `.clone` or an `.archive`. `cloneMissing` declares a `dev` step, so
-  a consumer's own `dev` step must be renamed. `sync` is otherwise unchanged. 5.1.1
+  a consumer's own `dev` step must be renamed. `sync` is otherwise unchanged.
+  6.1.0 adds `zig build vendor`: `cloneMissing` declares a `vendor` step, so
+  a consumer's own `vendor` step must be renamed; nothing else changes. 5.1.1
   needs no consumer change: it splits `deps.zig`
   one struct per file, so `Sync`'s messages now log as `zigbuildx_sync`
-  rather than `zigbuildx_deps`. 5.1.0 needs no consumer change: it adds `-Dci` and
+  rather than `zigbuildx_deps`. 5.1.0 needs no consumer change: it adds
   `.tag` on a sibling (refused before). Under `cloneMissing`, a root
   `deps/x` with a `.tag` is now cloned at the tag and warned about when off
   it, as a sibling's is; it used to be cloned on the default branch and
@@ -451,12 +517,18 @@ reaches `std.debug.print` does not compile for Apple's other platforms.
 - **Staging under `sync`:** a distribution build under `sync` still moves
   the siblings at `../x`; staging its `deps/` worktrees by their pins is the
   next step if wanted.
+- **`vendor` under `sync`:** `sync` does not declare it; vendoring its
+  `deps/` worktrees means exporting each at its pin, as `exportInside` does
+  for a `cloneMissing` checkout.
 - **Private lazy `.url` dependencies:** staging one during `build()` works
   (see *Why staging works this way*); eager ones cannot be reached.
 - **ADB over TCP install step** (about 1,000–1,300 lines): the ADB protocol
   (push and shell) on `std.Io.net`, plus RSA signing of the auth token with
   `~/.android/adbkey` (`std.crypto.ff`; std can only verify RSA). Open: a
   test device, a missing key, and whether it belongs in its own package.
+- **Rejected for `vendor`:** shipping a working tree's uncommitted changes
+  (a tarball is commits, so it can be rebuilt from them), formats other than
+  `.tar.gz`, and bundling the Zig toolchain (the marker names its version).
 - **Rejected:** a lock file of sibling commits (a distribution build builds
   the declared refs instead); `.sha` on a `../x`; and a `--fork` per sibling, since
   Zig reads `--fork` only from the command line and matches only hashed

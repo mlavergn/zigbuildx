@@ -30,6 +30,8 @@ pub const Stamp = @import("stamp.zig").Stamp;
 pub const ReleasePin = @import("release_pin.zig").ReleasePin;
 /// Stages siblings into Zig's package store for a distribution build.
 pub const Stage = @import("stage.zig").Stage;
+/// Writes a consumer's self-contained source tarball for `zig build vendor`.
+pub const Vendor = @import("vendor.zig").Vendor;
 /// Where an absent `.path` dependency comes from.
 pub const Source = @import("source.zig").Source;
 /// Edits a `build.zig.zon` in place, as text.

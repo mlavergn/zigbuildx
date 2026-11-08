@@ -12,7 +12,7 @@
 
 .DEFAULT_GOAL := all
 
-.PHONY: all validate build test cross tag clean
+.PHONY: all validate build test cross vendor tag clean
 
 # ---------------------------------------------
 # Configuration
@@ -65,6 +65,14 @@ cross:
 		$(ZIG) build-exe src/tool.zig -target $$t -femit-bin=zig-out/cross/zigbuildx-$$t || exit 1; \
 		echo "cross $$t ok"; \
 	done
+
+# Check `zig build vendor` end to end: the test in src/vendor.zig that builds,
+# vendors and rebuilds a scratch consumer through real `zig build` runs.
+#
+# Not part of validate: it takes a minute or more. Run it before a release
+# that touches Vendor or Stage.
+vendor:
+	$(ZIG) build test -Dvendor-check -Dtest-filter="vendor end to end" --summary all
 
 # ---------------------------------------------
 # Release

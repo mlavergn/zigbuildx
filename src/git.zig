@@ -244,6 +244,53 @@ pub const Git = struct {
         return out.len == 0;
     }
 
+    /// Reports whether the worktree has uncommitted changes to tracked files; untracked files do not count.
+    ///
+    /// - `allocator`: Allocator for the child's output, freed before return.
+    /// - `io`: IO the `git` child is spawned on.
+    /// - `repo`: The worktree to inspect.
+    /// - Returns: `true` when a tracked file is changed, staged or deleted; `error.GitFailed` when `git` fails, or spawn errors.
+    pub fn hasTrackedChanges(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !bool {
+        const out = try Self.run(allocator, io, repo, &.{ "status", "--porcelain", "--untracked-files=no" });
+        defer allocator.free(out);
+        return out.len > 0;
+    }
+
+    /// Reports whether HEAD is on a remote-tracking branch as last fetched, so a remote holds it.
+    ///
+    /// - `allocator`: Allocator for the child's output, freed before return.
+    /// - `io`: IO the `git` child is spawned on.
+    /// - `repo`: The checkout to inspect.
+    /// - Returns: `true` when some `refs/remotes/` branch contains HEAD; `error.GitFailed` when `git` fails, or spawn errors.
+    pub fn isOnRemote(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !bool {
+        const out = try Self.run(allocator, io, repo, &.{ "branch", "--remotes", "--contains", "HEAD" });
+        defer allocator.free(out);
+        return out.len > 0;
+    }
+
+    /// Reads the URL of the `origin` remote.
+    ///
+    /// - `allocator`: Allocator for the returned URL.
+    /// - `io`: IO the `git` child is spawned on.
+    /// - `repo`: The checkout to inspect.
+    /// - Returns: The URL, owned by the caller; `null` with no `origin`; `error.GitFailed` or spawn errors.
+    pub fn remoteUrl(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !?[]u8 {
+        // `config --get` exits 1 for a missing key, where `remote get-url` exits 2.
+        return Self.runOptional(allocator, io, repo, &.{ "config", "--get", "remote.origin.url" });
+    }
+
+    /// Reads the committer time of HEAD.
+    ///
+    /// - `allocator`: Allocator for the child's output, freed before return.
+    /// - `io`: IO the `git` child is spawned on.
+    /// - `repo`: The checkout to inspect.
+    /// - Returns: Seconds since the POSIX epoch; `error.GitFailed` when `git` fails or prints no number, or spawn errors.
+    pub fn commitTime(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) !u64 {
+        const out = try Self.run(allocator, io, repo, &.{ "log", "-1", "--format=%ct", "HEAD" });
+        defer allocator.free(out);
+        return std.fmt.parseInt(u64, out, 10) catch error.GitFailed;
+    }
+
     /// Reports whether HEAD has commits that `base` does not.
     ///
     /// - `allocator`: Allocator for the child's output, freed before return.
@@ -710,6 +757,38 @@ test "worktrees: add, inspect, move, remove" {
     try Git.checkoutBranch(allocator, io, branched, "me/main", null);
     try Git.branchDelete(allocator, io, origin, "me/other");
     try std.testing.expect(!try Git.branchExists(allocator, io, origin, "me/other"));
+}
+
+test "hasTrackedChanges ignores untracked files; isOnRemote, remoteUrl and commitTime read a clone" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TestRepo.init(allocator, io);
+    defer repo.deinit();
+    const origin = try repo.path("origin");
+    defer allocator.free(origin);
+    const checkout = try repo.path("checkout");
+    defer allocator.free(checkout);
+    try Git.clone(io, origin, checkout, null);
+
+    try std.testing.expect(!try Git.hasTrackedChanges(allocator, io, checkout));
+    try repo.tmp.dir.writeFile(io, .{ .sub_path = "checkout/untracked", .data = "x" });
+    try std.testing.expect(!try Git.hasTrackedChanges(allocator, io, checkout));
+    try std.testing.expect(!try Git.isClean(allocator, io, checkout));
+    try repo.tmp.dir.writeFile(io, .{ .sub_path = "checkout/one", .data = "changed" });
+    try std.testing.expect(try Git.hasTrackedChanges(allocator, io, checkout));
+    try repo.git(&.{ "git", "-C", checkout, "checkout", "--quiet", "--", "one" });
+
+    // A clone's HEAD is on `origin/main`; a commit of its own is on no remote branch, and origin has no remote.
+    try std.testing.expect(try Git.isOnRemote(allocator, io, checkout));
+    try repo.commit("checkout", "two");
+    try std.testing.expect(!try Git.isOnRemote(allocator, io, checkout));
+    try std.testing.expect(!try Git.isOnRemote(allocator, io, origin));
+
+    const url = (try Git.remoteUrl(allocator, io, checkout)).?;
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings(origin, url);
+    try std.testing.expectEqual(null, try Git.remoteUrl(allocator, io, origin));
+    try std.testing.expect(try Git.commitTime(allocator, io, checkout) > 1_000_000_000);
 }
 
 test "isIgnored follows .gitignore" {
