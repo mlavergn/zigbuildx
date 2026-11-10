@@ -606,13 +606,24 @@ pub const Deps = struct {
             const package = @field(root.dependencies.packages, decl_name);
             // A present package, the usual case, is settled without comparing any paths.
             if (@hasDecl(package, "build_zig") or Self.isUnderDeps(decl_name)) continue;
-            // A fetched package is keyed by its hash and lives in `zig-pkg/` or a cache, so an unfetched
-            // lazy dependency is not mistaken for a missing sibling.
+            // A lazy dependency not fetched yet has no `build_root` at all: it is fetched when a build asks
+            // for it, not missing. Checked before `build_root` is read, which would not compile.
+            if (Self.isUnfetched(package)) continue;
+            // A fetched package is keyed by its hash and lives in `zig-pkg/` or a cache, so it is not
+            // mistaken for a missing sibling.
             if (Self.isFetched(package.build_root, decl_name)) continue;
             // The root's own archives are unpacked in the same build; a sibling's is unknown at comptime and costs a re-run.
             if (!Self.isRootArchive(zon, decl_name)) return decl_name;
         }
         return null;
+    }
+
+    /// Reports whether an entry of the build runner's package table is a lazy dependency not fetched yet.
+    ///
+    /// - `package`: The entry; the runner gives it a `build_root` only once the package is on disk.
+    /// - Returns: `true` when it has none.
+    fn isUnfetched(comptime package: type) bool {
+        return !@hasDecl(package, "build_root");
     }
 
     /// Reports whether an entry of the build runner's package table is a fetched package, not a `.path` one.
@@ -674,6 +685,22 @@ test "isFetched tells a fetched package from a .path one, wherever zig build run
     try std.testing.expect(!Deps.isFetched("/abs/app/../liba", "../liba"));
     try std.testing.expect(!Deps.isFetched("vendor", "vendor"));
     try std.testing.expect(!Deps.isFetched("/abs/app/vendor", "vendor"));
+}
+
+test "isUnfetched tells a lazy dependency not fetched yet from one on disk" {
+    // Shaped as the build runner's package table writes them.
+    const Unfetched = struct {
+        /// The runner knows the package but has not fetched it.
+        pub const available = false;
+    };
+    const Fetched = struct {
+        /// The package is on disk.
+        pub const available = true;
+        /// Where it is.
+        pub const build_root = "zig-pkg/lazy-0.0.0";
+    };
+    try std.testing.expect(Deps.isUnfetched(Unfetched));
+    try std.testing.expect(!Deps.isUnfetched(Fetched));
 }
 
 test "restoreManifest puts the backup back once, and reports when there is none" {
