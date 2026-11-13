@@ -48,6 +48,12 @@ pub const Xcframework = @import("xcode.zig").Xcframework;
 pub const Swift = @import("swift.zig").Swift;
 /// What `Swift.addDylib` compiles.
 pub const SwiftDylib = @import("swift.zig").SwiftDylib;
+/// Installs a GUI executable as its platform expects: a macOS `.app`, a Linux desktop entry.
+pub const App = @import("app.zig").App;
+/// What `App.addBundle` assembles and `App.addInstall` installs.
+pub const AppBundle = @import("app.zig").AppBundle;
+/// A file placed in an app bundle under its own name.
+pub const AppFile = @import("app.zig").AppFile;
 /// Builds Android native libraries.
 pub const Android = @import("android.zig").Android;
 /// An Android ABI and its Zig target.

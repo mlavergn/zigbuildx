@@ -13,12 +13,14 @@ Nothing acts unless a `build.zig` calls it.
 | `Git` | Runs `git` commands for the build |
 | `Xcode` | Finds an Apple platform's SDK (macOS, iOS, tvOS, visionOS, watchOS), sets a macOS deployment floor, links frameworks, assembles `.xcframework`s |
 | `Swift` | Builds a Swift dylib that a Zig package links against |
+| `App` | Installs a GUI executable as its platform expects: a macOS `.app` bundle, or a Linux desktop entry and icon |
 | `Android` | Builds Android native libraries against the NDK |
 | `Docs` | Includes private declarations in Zig's generated documentation |
 
 ## Requirements
 
-- **Zig 0.17.** `build.zig` refuses any other minor release.
+- **Zig 0.17.1 or a later 0.17.** `build.zig` refuses 0.17.0 and any other
+  minor release.
 - **Hosts:** macOS (Apple Silicon), Linux (arm64, x86_64) and Windows (x86_64,
   arm64). Apple-only extensions do nothing elsewhere.
 - **Per extension:**
@@ -26,6 +28,7 @@ Nothing acts unless a `build.zig` calls it.
   - `Xcode`, `Swift`: Xcode or the Command Line Tools; Xcode with the
     platform for iOS, tvOS, visionOS or watchOS.
   - `Android`: the Android SDK's NDK.
+  - `App`: nothing; it runs no tool, so a macOS bundle builds on any host.
 
 ## Setup
 
@@ -147,6 +150,20 @@ each built and configured for its own target as above:
 ```zig
 const xcf = try zigbuildx.Xcode.addXcframework(b, .{ .name = "Hello", .libraries = &.{ ios, sim_arm64, sim_x86_64, macos }, .headers = b.path("include") });
 if (xcf) |dir| b.getInstallStep().dependOn(&b.addInstallDirectory(.{ .source_dir = dir, .install_dir = .prefix, .install_subdir = "Hello.xcframework" }).step);
+```
+
+Install a GUI executable: on macOS `Hello.app` at the top of the prefix
+(unsigned; `LSMinimumSystemVersion` is the `-Dmacos-min` floor, else 13.0), on
+Linux `bin/Hello` with `share/applications/Hello.desktop` and the icon,
+elsewhere the executable alone, under its artifact name. A version's `-rc1` or `+build` suffix is
+dropped from the plist. A bad name, identifier or version, or a bundle file
+name or `linux_subdir` that leaves its directory, fails the build:
+
+```zig
+const app: zigbuildx.AppBundle = .{ .name = "Hello", .identifier = "com.example.hello", .version = zon.version, .exe = exe, .icns = b.path("assets/Hello.icns"), .png = b.path("assets/Hello.png") };
+const install = zigbuildx.App.addInstall(b, app, null); // or pass zigbuildx.App.addBundle(b, app), the .app as a LazyPath
+b.step("app", "Install the app").dependOn(install);
+b.getInstallStep().dependOn(install);
 ```
 
 Swift, Android and docs:

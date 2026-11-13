@@ -18,6 +18,12 @@ pub const Git = mod.Git;
 pub const Xcode = mod.Xcode;
 /// Builds Swift dylibs and links modules against them; see `src/swift.zig`.
 pub const Swift = mod.Swift;
+/// Installs a GUI executable as its platform expects (a macOS `.app`, a Linux desktop entry); see `src/app.zig`.
+pub const App = mod.App;
+/// What `App.addBundle` assembles and `App.addInstall` installs; named, as both take the same one.
+pub const AppBundle = mod.AppBundle;
+/// A file `AppBundle` places in the bundle; named, for a list built outside the literal.
+pub const AppFile = mod.AppFile;
 /// Builds Android native libraries; see `src/android.zig`.
 pub const Android = mod.Android;
 /// An Android ABI and its Zig target; see `src/android.zig`.

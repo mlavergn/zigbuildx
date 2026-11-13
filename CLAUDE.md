@@ -17,7 +17,8 @@ imported from other projects' `build.zig` instead of copied into each one.
   `make cross` catches it.
 - **No dependencies.** `build.zig.zon` `.dependencies` stays empty.
 - **No packaging.** Building a `.pkg`, `.deb`, `.msi` or `.apk` is out of
-  scope; 4.0.0 removed `Pkg` and `Apk`.
+  scope; 4.0.0 removed `Pkg` and `Apk`. `App` only lays out an install (a
+  `.app`, a desktop entry); signing, `.dmg`s and notarization are a packager's.
 - **It is a base module.** Never name a project that depends on zigbuildx,
   in code, docs or examples: zigbuildx knows nothing about its consumers.
   Use generic names (`../mylib`, `../a`) in examples.
@@ -56,6 +57,13 @@ after every change (the hash pins the contents):
 zig fetch --save=zigbuildx ../zigbuildx   # from the scratch package
 ```
 
+- **`App`:** a scratch consumer with an `.icns`, a PNG and a resource (any
+  bytes do): on macOS `zig build`, then `plutil -lint` the plist, check the
+  executable bit, `codesign --force --sign -` and `codesign --verify --deep
+  --strict` (a fake dylib in `frameworks` cannot be signed; leave it out), and
+  `open -n`; `-Dmacos-min` reaches `LSMinimumSystemVersion`; a bad identifier
+  fails with its message; `-Dtarget=x86_64-linux-gnu` (with and without
+  `linux_subdir`) and `-Dtarget=x86_64-windows` show the other layouts.
 - **Android:** no SDK is installed, and none should be. Point `ANDROID_HOME`
   at a fake tree holding `ndk/<v>/toolchains/llvm/prebuilt/<host>/sysroot`;
   linking libc needs the real NDK, so check `configure` from the failing
@@ -80,7 +88,8 @@ zig fetch --save=zigbuildx ../zigbuildx   # from the scratch package
 
 ```
 build.zig              the public surface: re-exports Deps, Git, Xcode, Swift,
-                       Android, AndroidAbi and Docs; installs the host tool
+                       App, AppBundle, AppFile, Android, AndroidAbi and Docs;
+                       installs the host tool
 src/module.zig         the barrel the tests compile
 src/deps.zig           Deps: the entry points (clone, sync, update, pin, restore)
 src/sync.zig           Sync: one run over the manifests, siblings and worktrees
@@ -98,6 +107,7 @@ src/release_pin.zig    ReleasePin: `git+` URLs and release tags for `zigbuildx-p
 src/git.zig            Git: one thin wrapper per git command
 src/xcode.zig          Xcode: Apple SDKs, the macOS floor, frameworks, xcframeworks
 src/swift.zig          Swift: swiftc dylibs
+src/app.zig            App: a GUI executable's macOS `.app` or Linux desktop entry
 src/android.zig        Android: the NDK
 src/android_abi.zig    AndroidAbi: an ABI and its Zig target
 src/docs.zig           Docs: autodoc with private declarations
@@ -113,8 +123,8 @@ src/test_tree.zig      TestTree: git repositories and a consumer, for the tests
 Consumers import this package's `build.zig` by dependency name, so only what
 it re-exports is reachable; everything else in `module.zig` is internal.
 One struct per file (B.2.a): a type stays beside the primary struct only
-when that struct is its sole user (`Release`, `Command`, `Xcframework`),
-and anything two structs share gets a file of its own. A new sub-folder
+when that struct is its sole user (`Release`, `Command`, `Xcframework`,
+`AppBundle`), and anything two structs share gets a file of its own. A new sub-folder
 with several `.zig` files gets its own `module.zig` barrel.
 
 ## Architecture conventions
@@ -428,6 +438,31 @@ additions to ZIGSTYLE:
   as file arguments, so edits rebuild; rpaths for the build cache and
   `@executable_path/../lib` (a special rpath, since a path would be
   normalized); `-target` from the Zig target. Null off macOS.
+- **`App`:** `addBundle` assembles `<name>.app/Contents/{MacOS/<name>,
+  Info.plist, Resources/<name>.icns, Resources/*, Frameworks/*}` in a
+  `WriteFile` for a macOS target, from any host (null otherwise; frameworks
+  add the `@executable_path/../Frameworks` rpath). `addInstall` installs it at
+  `<prefix>/<name>.app`, where a packager looks for it; a Linux target gets
+  `bin/<name>`, `share/applications/<name>.desktop` and a 256×256
+  `share/icons/hicolor` PNG, under `linux_subdir` when set; anything else gets
+  the artifact alone. Unsigned: signing is the packager's. Both version keys are
+  `version` without a `-`/`+` suffix; `LSMinimumSystemVersion` is the target
+  query's `os_version_min` (`-Dmacos-min`), else 13.0, never the resolved
+  version, which is the host's on a native build. A bad name (empty, `.`,
+  `..`, or holding `/ \ " ` $ %` or a line break), identifier, version, a line
+  break in a desktop value, or a bundle file name or `linux_subdir` that leaves
+  its directory (`WriteFile` and installs join `..` as given) is one
+  `b.addFail` step that every step it would write through depends on (on
+  Linux the desktop entry's and icon's installs too), so the build fails only
+  when the app is built, and installs nothing. Zig 0.17.1's
+  `WriteFile` and `InstallDir` copies keep the executable bit. `AppBundle` is
+  re-exported because a consumer passes one value to both calls, `AppFile`
+  for a `frameworks` list built outside the literal. The frameworks rpath is
+  added once, even when the consumer added it too. The desktop entry's `Exec=`
+  is the bare executable (no `%f`/`%U`), quoted when the name holds a space or
+  another reserved character (the name check refuses what quotes would
+  escape); `Comment`'s `\` is escaped. Off macOS and Linux the executable
+  keeps its artifact name, not `name`.
 - **`Android`:** the SDK from `ANDROID_HOME`, `ANDROID_SDK_ROOT` or Android
   Studio's default, the NDK from `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT` or
   the newest under the SDK. `configure` adds a libc file and 16 KB pages;
@@ -464,7 +499,8 @@ additions to ZIGSTYLE:
   Before the push, `zig fetch .` here puts the same hash in the global cache
   for local builds. Consumers pin a tag with its commit (`?ref=v4.1.0#<commit>`),
   so a release that rewrites history breaks their URLs.
-- **Compatibility:** 6.0.0 adds `-Ddist`, which nothing in the
+- **Compatibility:** 6.4.0 adds `App`, `AppBundle` and `AppFile`; nothing else
+  changes. 6.2.1 requires Zig 0.17.1. 6.0.0 adds `-Ddist`, which nothing in the
   environment turns on. Under `cloneMissing` a distribution build
   stages the siblings into `zig-pkg/` and rewrites `build.zig.zon` (kept as
   `build.zig.zon.orig`), where 5.x cloned them to `../x`; every sibling then
@@ -526,6 +562,9 @@ reaches `std.debug.print` does not compile for Apple's other platforms.
   (push and shell) on `std.Io.net`, plus RSA signing of the auth token with
   `~/.android/adbkey` (`std.crypto.ff`; std can only verify RSA). Open: a
   test device, a missing key, and whether it belongs in its own package.
+- **Rejected for `App`:** signing (ad hoc included), `.dmg`s and
+  notarization (a packager's, under *No packaging*); a universal `lipo`
+  bundle; `Exec=` arguments; a `linux_subdir` for other targets.
 - **Rejected for `vendor`:** shipping a working tree's uncommitted changes
   (a tarball is commits, so it can be rebuilt from them), formats other than
   `.tar.gz`, and bundling the Zig toolchain (the marker names its version).
