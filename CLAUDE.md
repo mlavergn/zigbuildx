@@ -110,7 +110,8 @@ src/swift.zig          Swift: swiftc dylibs
 src/app.zig            App: a GUI executable's macOS `.app` or Linux desktop entry
 src/android.zig        Android: the NDK
 src/android_abi.zig    AndroidAbi: an ABI and its Zig target
-src/docs.zig           Docs: autodoc with private declarations
+src/docs.zig           Docs: autodoc with private declarations, and `addServe`
+src/docs_server.zig    DocsServer: the host tool's `docs-serve`, a loopback static server
 src/vendor.zig         Vendor: `zig build vendor`, a self-contained source tarball
 src/zip_archive.zig    ZipArchive: `.archive` download and unpack
 src/file.zig           File: file-system primitives the others share
@@ -471,6 +472,14 @@ additions to ZIGSTYLE:
 - **`Docs.includePrivate`:** the host tool's `docs-patch` copies the autodoc
   site and flips the two `include_private` call sites in `main.js`; each
   pattern must occur once, so a changed front end fails the build.
+- **`Docs.addServe`:** a `has_side_effects` Run of the host tool's
+  `docs-serve <dir> [port]` (`DocsServer`), since autodoc's front end fetches
+  `main.wasm` and `sources.tar`, which a `file://` page cannot. It binds
+  `127.0.0.1` (port 0 lets the OS pick), prints the URL, then opens it
+  (`open`, `xdg-open`, `cmd /c start`; a failure only warns) and serves until
+  interrupted: GET and HEAD, one response per connection, `application/wasm`
+  for `.wasm`. `sitePath` never percent-decodes a target and refuses an
+  absolute path, `..`, a backslash or a colon, so no request leaves the site.
 
 ## Project-state heads-ups
 
@@ -499,7 +508,8 @@ additions to ZIGSTYLE:
   Before the push, `zig fetch .` here puts the same hash in the global cache
   for local builds. Consumers pin a tag with its commit (`?ref=v4.1.0#<commit>`),
   so a release that rewrites history breaks their URLs.
-- **Compatibility:** 6.4.0 adds `App`, `AppBundle` and `AppFile`; nothing else
+- **Compatibility:** 6.5.0 adds `Docs.addServe`; nothing else changes. 6.4.0
+  adds `App`, `AppBundle` and `AppFile`; nothing else
   changes. 6.2.1 requires Zig 0.17.1. 6.0.0 adds `-Ddist`, which nothing in the
   environment turns on. Under `cloneMissing` a distribution build
   stages the siblings into `zig-pkg/` and rewrites `build.zig.zon` (kept as

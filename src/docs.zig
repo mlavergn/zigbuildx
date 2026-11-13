@@ -36,6 +36,23 @@ pub const Docs = struct {
         return run.addOutputDirectoryArg2("docs", .{});
     }
 
+    /// Returns a step that serves autodoc site `docs` on loopback, opening it in the browser, until interrupted.
+    ///
+    /// - `b`: The build graph.
+    /// - `docs`: A site, from `getEmittedDocs()` or `includePrivate`.
+    /// - `port`: The port, or 0 for one the OS picks.
+    /// - Returns: The step, for a consumer's `b.step("docs-serve", …)` to depend on.
+    pub fn addServe(b: *std.Build, docs: std.Build.LazyPath, port: u16) *std.Build.Step {
+        const run = b.addRunArtifact(mod.ToolArtifact.add(b));
+        run.setName("docs serve");
+        run.addArg("docs-serve");
+        run.addDirectoryArg2(docs, .{});
+        run.addArg(b.fmt("{d}", .{port}));
+        // It serves until stopped; never cached.
+        run.has_side_effects = true;
+        return &run.step;
+    }
+
     /// Returns `js` with each replacement applied; each pattern must occur exactly once.
     ///
     /// - `allocator`: Owns the result.

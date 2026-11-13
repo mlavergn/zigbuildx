@@ -60,6 +60,8 @@ pub const Android = @import("android.zig").Android;
 pub const AndroidAbi = @import("android_abi.zig").AndroidAbi;
 /// Extends Zig's generated documentation.
 pub const Docs = @import("docs.zig").Docs;
+/// Serves an autodoc site on loopback for `Docs.addServe`.
+pub const DocsServer = @import("docs_server.zig").DocsServer;
 /// Finds the host tool's artifact for a consumer's build graph.
 pub const ToolArtifact = @import("tool_artifact.zig").ToolArtifact;
 /// The host tool's command dispatch.

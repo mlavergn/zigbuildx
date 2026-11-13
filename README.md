@@ -15,7 +15,7 @@ Nothing acts unless a `build.zig` calls it.
 | `Swift` | Builds a Swift dylib that a Zig package links against |
 | `App` | Installs a GUI executable as its platform expects: a macOS `.app` bundle, or a Linux desktop entry and icon |
 | `Android` | Builds Android native libraries against the NDK |
-| `Docs` | Includes private declarations in Zig's generated documentation |
+| `Docs` | Includes private declarations in Zig's generated documentation, and serves a site locally with no `python3` |
 
 ## Requirements
 
@@ -177,7 +177,15 @@ try android.resolve();
 try android.configure(lib); // lib's target from zigbuildx.Android.resolveTarget(b, .arm64V8a, 30)
 
 const docs = zigbuildx.Docs.includePrivate(b, lib.getEmittedDocs());
+// Serve it on a free loopback port (or a fixed one), open the browser, block until Ctrl-C.
+b.step("docs-serve", "Serve the docs").dependOn(zigbuildx.Docs.addServe(b, docs, 0));
 ```
+
+`Docs.addServe` runs the host tool's `docs-serve`: GET and HEAD from the site's
+directory on `127.0.0.1`, one response per connection, `application/wasm` for
+`main.wasm`. Paths are never percent-decoded, and absolute paths, `..`,
+backslashes and drive letters are refused, so no request reaches outside the
+site.
 
 ## Distribution builds
 
