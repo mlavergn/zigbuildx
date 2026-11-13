@@ -8,8 +8,8 @@ zigbuildx is a library of Zig build system extensions: logic `std.Build` lacks,
 imported from other projects' `build.zig` instead of copied into each one.
 `README.md` covers setup and usage.
 
-- **Zig 0.17.0 only.** A `comptime` guard in `build.zig` refuses any other
-  minor release. Several extensions work around 0.17.0 defects (see
+- **Zig 0.17, 0.17.1 or later.** A `comptime` guard in `build.zig` refuses any
+  other minor release, and 0.17.0. Several extensions work around 0.17.0 defects (see
   *Workarounds*).
 - **It runs on every host.** The code executes inside other projects' build
   runners on macOS, Linux and Windows. Host-specific behaviour is a runtime
@@ -60,7 +60,7 @@ zig fetch --save=zigbuildx ../zigbuildx   # from the scratch package
   at a fake tree holding `ndk/<v>/toolchains/llvm/prebuilt/<host>/sysroot`;
   linking libc needs the real NDK, so check `configure` from the failing
   link command (`--libc`, `-z max-page-size=16384`).
-- **Linux:** podman with Debian (`xz-utils curl git`) and Zig 0.17.0's
+- **Linux:** podman with Debian (`xz-utils curl git`) and Zig 0.17.1's
   aarch64-linux tarball in `/opt`. The `xcrun` tests skip there.
 - **Windows:** compile only, through `make cross`.
 - **Configure caching:** run `zig build` twice; the second skips `build()`

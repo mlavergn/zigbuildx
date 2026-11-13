@@ -7,7 +7,7 @@ const builtin = @import("builtin");
 // an API mismatch reported from deep inside an extension.
 comptime {
     const zig = builtin.zig_version;
-    if (zig.major != 0 or zig.minor != 17) @compileError(std.fmt.comptimePrint("zigbuildx is for Zig 0.17.0; this is Zig {d}.{d}.{d}", .{ zig.major, zig.minor, zig.patch }));
+    if (zig.major != 0 or zig.minor != 17 or zig.patch < 1) @compileError(std.fmt.comptimePrint("zigbuildx is for Zig 0.17.1 or a later 0.17; this is Zig {d}.{d}.{d}", .{ zig.major, zig.minor, zig.patch }));
 }
 
 /// Clones sibling checkouts and keeps worktree dependencies pinned; see `src/deps.zig`.
