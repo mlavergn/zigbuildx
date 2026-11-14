@@ -24,6 +24,8 @@ pub const App = mod.App;
 pub const AppBundle = mod.AppBundle;
 /// A file `AppBundle` places in the bundle; named, for a list built outside the literal.
 pub const AppFile = mod.AppFile;
+/// What a Linux desktop entry's launcher may hand the app (`AppBundle.opens`); named, for a value chosen outside the literal.
+pub const AppOpens = mod.AppOpens;
 /// Builds Android native libraries; see `src/android.zig`.
 pub const Android = mod.Android;
 /// An Android ABI and its Zig target; see `src/android.zig`.

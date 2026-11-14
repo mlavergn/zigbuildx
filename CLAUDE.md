@@ -88,7 +88,8 @@ zig fetch --save=zigbuildx ../zigbuildx   # from the scratch package
 
 ```
 build.zig              the public surface: re-exports Deps, Git, Xcode, Swift,
-                       App, AppBundle, AppFile, Android, AndroidAbi and Docs;
+                       App, AppBundle, AppFile, AppOpens, Android, AndroidAbi
+                       and Docs;
                        installs the host tool
 src/module.zig         the barrel the tests compile
 src/deps.zig           Deps: the entry points (clone, sync, update, pin, restore)
@@ -451,18 +452,24 @@ additions to ZIGSTYLE:
   query's `os_version_min` (`-Dmacos-min`), else 13.0, never the resolved
   version, which is the host's on a native build. A bad name (empty, `.`,
   `..`, or holding `/ \ " ` $ %` or a line break), identifier, version, a line
-  break in a desktop value, or a bundle file name or `linux_subdir` that leaves
-  its directory (`WriteFile` and installs join `..` as given) is one
+  break in a desktop value, `mime_types` without `opens`, or a bundle file
+  name or `linux_subdir` that leaves its directory (`WriteFile` and installs join `..` as given) is one
   `b.addFail` step that every step it would write through depends on (on
   Linux the desktop entry's and icon's installs too), so the build fails only
   when the app is built, and installs nothing. Zig 0.17.1's
   `WriteFile` and `InstallDir` copies keep the executable bit. `AppBundle` is
   re-exported because a consumer passes one value to both calls, `AppFile`
-  for a `frameworks` list built outside the literal. The frameworks rpath is
+  for a `frameworks` list built outside the literal, `AppOpens` for an
+  `opens` chosen outside it. The frameworks rpath is
   added once, even when the consumer added it too. The desktop entry's `Exec=`
-  is the bare executable (no `%f`/`%U`), quoted when the name holds a space or
+  is the executable, then the field code of `opens` (` %f`, ` %F`, ` %u`,
+  ` %U`; none for the default `.nothing`, which by the Desktop Entry spec
+  says the app opens no files), the name quoted when the name holds a space or
   another reserved character (the name check refuses what quotes would
-  escape); `Comment`'s `\` is escaped. Off macOS and Linux the executable
+  escape); `Comment`'s `\` is escaped. `mime_types` is written as `MimeType=`
+  when set, since a file manager offers an app only for the types it lists;
+  set without `opens` it is refused, as the app would be offered files it is
+  never handed. Off macOS and Linux the executable
   keeps its artifact name, not `name`.
 - **`Android`:** the SDK from `ANDROID_HOME`, `ANDROID_SDK_ROOT` or Android
   Studio's default, the NDK from `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT` or
@@ -508,7 +515,10 @@ additions to ZIGSTYLE:
   Before the push, `zig fetch .` here puts the same hash in the global cache
   for local builds. Consumers pin a tag with its commit (`?ref=v4.1.0#<commit>`),
   so a release that rewrites history breaks their URLs.
-- **Compatibility:** 6.5.0 adds `Docs.addServe`; nothing else changes. 6.4.0
+- **Compatibility:** 6.6.0 adds `AppBundle.opens`, `AppBundle.mime_types`
+  and `AppOpens`, defaulting to the bare `Exec=` and no `MimeType=` of 6.4.0;
+  nothing else changes. 6.5.0 adds
+  `Docs.addServe`; nothing else changes. 6.4.0
   adds `App`, `AppBundle` and `AppFile`; nothing else
   changes. 6.2.1 requires Zig 0.17.1. 6.0.0 adds `-Ddist`, which nothing in the
   environment turns on. Under `cloneMissing` a distribution build
@@ -574,7 +584,8 @@ reaches `std.debug.print` does not compile for Apple's other platforms.
   test device, a missing key, and whether it belongs in its own package.
 - **Rejected for `App`:** signing (ad hoc included), `.dmg`s and
   notarization (a packager's, under *No packaging*); a universal `lipo`
-  bundle; `Exec=` arguments; a `linux_subdir` for other targets.
+  bundle; `Exec=` arguments other than the `opens` field code; a
+  `linux_subdir` for other targets.
 - **Rejected for `vendor`:** shipping a working tree's uncommitted changes
   (a tarball is commits, so it can be rebuilt from them), formats other than
   `.tar.gz`, and bundling the Zig toolchain (the marker names its version).

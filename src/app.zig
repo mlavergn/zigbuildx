@@ -9,6 +9,36 @@ pub const AppFile = struct {
     name: []const u8,
 };
 
+/// What a Linux desktop entry's launcher may hand the app on its command line:
+/// the `Exec` field code (`%f`, `%F`, `%u`, `%U`).
+pub const AppOpens = enum {
+    const Self = @This();
+    /// Nothing: the app opens no files (no field code).
+    nothing,
+    /// One local file or folder (`%f`).
+    file,
+    /// Any number of local files or folders (`%F`).
+    files,
+    /// One file or URL (`%u`).
+    url,
+    /// Any number of files or URLs (`%U`).
+    urls,
+
+    /// Returns the `Exec` field code, with the space before it.
+    ///
+    /// - `self`: What the app opens.
+    /// - Returns: ` %f`, ` %F`, ` %u` or ` %U`, or empty for `nothing`.
+    fn execSuffix(self: Self) []const u8 {
+        return switch (self) {
+            .nothing => "",
+            .file => " %f",
+            .files => " %F",
+            .url => " %u",
+            .urls => " %U",
+        };
+    }
+};
+
 /// What `App.addBundle` assembles and `App.addInstall` installs.
 pub const AppBundle = struct {
     const Self = @This();
@@ -36,6 +66,12 @@ pub const AppBundle = struct {
     comment: []const u8 = "",
     /// The desktop entry's `Categories`.
     categories: []const u8 = "Development;",
+    /// What the desktop entry's launcher hands the app: `.file` passes one
+    /// file (`Exec=<name> %f`).
+    opens: AppOpens = .nothing,
+    /// The desktop entry's `MimeType`, the types a file manager offers the app
+    /// for (`text/plain;inode/directory;`); empty for none. Needs `opens`.
+    mime_types: []const u8 = "",
     /// A directory under the prefix the Linux layout goes in (`Hello` gives
     /// `Hello/bin`, `Hello/share/…`); empty for the prefix itself.
     linux_subdir: []const u8 = "",
@@ -201,8 +237,11 @@ pub const App = struct {
         if (Self.bundleVersion(options.version) == null) {
             return try allocator.print("{s}: version \"{s}\" must be one to three numbers (1.2.3), optionally with a -pre-release or +build suffix", .{ options.name, options.version });
         }
-        for ([_][]const u8{ options.comment, options.categories }) |value| {
+        for ([_][]const u8{ options.comment, options.categories, options.mime_types }) |value| {
             if (std.mem.findAny(u8, value, "\r\n") != null) return try allocator.print("{s}: a desktop entry value holds a line break", .{options.name});
+        }
+        if (options.mime_types.len != 0 and options.opens == .nothing) {
+            return try allocator.print("{s}: mime_types needs opens, or the app is offered files it is never handed", .{options.name});
         }
         if (options.linux_subdir.len != 0 and !Self.isContainedPath(options.linux_subdir)) {
             return try allocator.print("{s}: linux_subdir \"{s}\" must be a relative path with no . or .. part", .{ options.name, options.linux_subdir });
@@ -340,9 +379,10 @@ pub const App = struct {
         }
         // Quoted when it holds a space or another reserved character; `problem` refuses what quotes would escape.
         const quote = if (std.mem.findAny(u8, options.name, Self.exec_reserved) != null) "\"" else "";
-        try text.print(allocator, "Exec={s}{s}{s}\n", .{ quote, options.name, quote });
+        try text.print(allocator, "Exec={s}{s}{s}{s}\n", .{ quote, options.name, quote, options.opens.execSuffix() });
         if (options.png != null) try text.print(allocator, "Icon={s}\n", .{options.name});
         try text.print(allocator, "StartupWMClass={s}\nTerminal=false\nCategories={s}\n", .{ options.name, options.categories });
+        if (options.mime_types.len != 0) try text.print(allocator, "MimeType={s}\n", .{options.mime_types});
         return text.toOwnedSlice(allocator);
     }
 
@@ -448,6 +488,20 @@ test "problem names the first bad option" {
     const comment = (try App.problem(allocator, bundle)).?;
     defer allocator.free(comment);
     try std.testing.expect(std.mem.find(u8, comment, "line break") != null);
+
+    bundle = testBundle();
+    bundle.mime_types = "text/plain;\ninode/directory;";
+    bundle.opens = .file;
+    const mime_break = (try App.problem(allocator, bundle)).?;
+    defer allocator.free(mime_break);
+    try std.testing.expect(std.mem.find(u8, mime_break, "line break") != null);
+
+    bundle.mime_types = "text/plain;";
+    try std.testing.expectEqual(null, try App.problem(allocator, bundle));
+    bundle.opens = .nothing;
+    const mime_unopened = (try App.problem(allocator, bundle)).?;
+    defer allocator.free(mime_unopened);
+    try std.testing.expect(std.mem.find(u8, mime_unopened, "mime_types needs opens") != null);
 }
 
 test "macosMin takes the explicit floor, never the resolved version" {
@@ -490,7 +544,7 @@ test "plistText names the icon and appends plist_extra inside the dictionary" {
     try std.testing.expect(std.mem.endsWith(u8, text, "    <key>LSUIElement</key><true/>\n</dict>\n</plist>\n"));
 }
 
-test "desktopText writes the entry, leaving out an empty comment and a missing icon" {
+test "desktopText writes the entry, leaving out an empty comment, a missing icon and no MIME types" {
     const allocator = std.testing.allocator;
     const bare = try App.desktopText(allocator, testBundle());
     defer allocator.free(bare);
@@ -509,6 +563,8 @@ test "desktopText writes the entry, leaving out an empty comment and a missing i
     bundle.comment = "Says hello";
     bundle.png = std.Build.LazyPath.zig_lib;
     bundle.categories = "Utility;";
+    bundle.opens = .file;
+    bundle.mime_types = "text/plain;inode/directory;";
     const full = try App.desktopText(allocator, bundle);
     defer allocator.free(full);
     try std.testing.expectEqualStrings(
@@ -516,13 +572,39 @@ test "desktopText writes the entry, leaving out an empty comment and a missing i
         \\Type=Application
         \\Name=Hello
         \\Comment=Says hello
-        \\Exec=Hello
+        \\Exec=Hello %f
         \\Icon=Hello
         \\StartupWMClass=Hello
         \\Terminal=false
         \\Categories=Utility;
+        \\MimeType=text/plain;inode/directory;
         \\
     , full);
+}
+
+test "desktopText gives Exec the field code of what the app opens" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { AppOpens, []const u8 }{
+        .{ .nothing, "\nExec=Hello\n" },
+        .{ .file, "\nExec=Hello %f\n" },
+        .{ .files, "\nExec=Hello %F\n" },
+        .{ .url, "\nExec=Hello %u\n" },
+        .{ .urls, "\nExec=Hello %U\n" },
+    };
+    for (cases) |case| {
+        var bundle = testBundle();
+        bundle.opens = case[0];
+        const text = try App.desktopText(allocator, bundle);
+        defer allocator.free(text);
+        try std.testing.expect(std.mem.find(u8, text, case[1]) != null);
+    }
+
+    var quoted = testBundle();
+    quoted.name = "Zig App";
+    quoted.opens = .file;
+    const text = try App.desktopText(allocator, quoted);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "\nExec=\"Zig App\" %f\n") != null);
 }
 
 test "linuxPath puts the layout under linux_subdir" {

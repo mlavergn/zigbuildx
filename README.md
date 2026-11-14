@@ -155,9 +155,14 @@ if (xcf) |dir| b.getInstallStep().dependOn(&b.addInstallDirectory(.{ .source_dir
 Install a GUI executable: on macOS `Hello.app` at the top of the prefix
 (unsigned; `LSMinimumSystemVersion` is the `-Dmacos-min` floor, else 13.0), on
 Linux `bin/Hello` with `share/applications/Hello.desktop` and the icon,
-elsewhere the executable alone, under its artifact name. A version's `-rc1` or `+build` suffix is
-dropped from the plist. A bad name, identifier or version, or a bundle file
-name or `linux_subdir` that leaves its directory, fails the build:
+elsewhere the executable alone, under its artifact name. `.opens` says what
+a Linux launcher may hand the app (`.file` writes `Exec=Hello %f`; the default
+`.nothing` writes no field code), and `.mime_types` the types a file manager
+offers it for (`"text/plain;inode/directory;"` for text files and folders),
+which needs `.opens`. A version's `-rc1` or `+build` suffix is
+dropped from the plist. A bad name, identifier or version, `.mime_types`
+without `.opens`, or a bundle file name or `linux_subdir` that leaves its
+directory, fails the build:
 
 ```zig
 const app: zigbuildx.AppBundle = .{ .name = "Hello", .identifier = "com.example.hello", .version = zon.version, .exe = exe, .icns = b.path("assets/Hello.icns"), .png = b.path("assets/Hello.png") };

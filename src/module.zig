@@ -54,6 +54,8 @@ pub const App = @import("app.zig").App;
 pub const AppBundle = @import("app.zig").AppBundle;
 /// A file placed in an app bundle under its own name.
 pub const AppFile = @import("app.zig").AppFile;
+/// What a Linux desktop entry's launcher may hand the app on its command line.
+pub const AppOpens = @import("app.zig").AppOpens;
 /// Builds Android native libraries.
 pub const Android = @import("android.zig").Android;
 /// An Android ABI and its Zig target.
