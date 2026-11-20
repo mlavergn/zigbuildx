@@ -31,8 +31,6 @@ pub const Deps = struct {
     const dev_step = "dev";
     /// The step `cloneMissing` declares to write a vendored source tarball.
     const vendor_step = "vendor";
-    /// The comptime branches allowed per entry of the build runner's package table, enough to compare paths of any length.
-    const branches_per_package = 4096;
 
     /// Clones every missing cloneable dependency, transitive ones included, and exits 1; returns when none are missing.
     ///
@@ -316,11 +314,19 @@ pub const Deps = struct {
         // The runner's generated table answers for the root package only.
         const root = @import("root");
         if (!@hasDecl(root, "dependencies")) return true;
-        for (root.dependencies.root_deps) |dep| {
-            if (std.mem.eql(u8, dep[0], name)) return @hasDecl(@field(root.dependencies.packages, dep[1]), "build_zig");
-        }
-        return true;
+        const found = comptime mod.PackageTable.findDependency(root.dependencies.root_deps, name);
+        const key = found orelse return true;
+        return @hasDecl(@field(root.dependencies.packages, key), "build_zig");
     }
+
+    /// Imports dependency `name`'s `build.zig` as `std.Build.lazyImport` does, but answers null for a `.path` dependency missing from disk.
+    /// Call it after `cloneMissing` or `sync`, which fetch the dependency; the re-run imports it.
+    ///
+    /// - `b`: The build graph.
+    /// - `asking_build_zig`: The `build.zig` asking, normally `@This()`.
+    /// - `name`: The dependency's field name in that package's `build.zig.zon`.
+    /// - Returns: Its `build.zig`; null while it is missing or not fetched yet.
+    pub const lazyImport = mod.LazyImport.lazyImport;
 
     /// Reports whether dependency `name` declares both a `.path` and a `.clone`.
     ///
@@ -576,7 +582,7 @@ pub const Deps = struct {
         if (!@hasDecl(root, "dependencies")) return null;
         const decl_names = @typeInfo(root.dependencies.packages).@"struct".decl_names;
         // The default quota of 1000 runs out at a few dozen packages.
-        @setEvalBranchQuota(1000 + decl_names.len * Self.branches_per_package);
+        @setEvalBranchQuota(1000 + decl_names.len * mod.PackageTable.branches_per_package);
         // A `.path` package is keyed by its path from the root: a worktree is any key under `deps/`, transitive ones included.
         for (decl_names) |decl_name| {
             if (Self.isUnderDeps(decl_name) and !@hasDecl(@field(root.dependencies.packages, decl_name), "build_zig") and !Self.isRootArchive(zon, decl_name)) return decl_name;
@@ -601,44 +607,21 @@ pub const Deps = struct {
         if (!@hasDecl(root, "dependencies")) return null;
         const decl_names = @typeInfo(root.dependencies.packages).@"struct".decl_names;
         // The default quota of 1000 runs out at a dozen hashed packages, each compared along its whole key.
-        @setEvalBranchQuota(1000 + decl_names.len * Self.branches_per_package);
+        @setEvalBranchQuota(1000 + decl_names.len * mod.PackageTable.branches_per_package);
         for (decl_names) |decl_name| {
             const package = @field(root.dependencies.packages, decl_name);
             // A present package, the usual case, is settled without comparing any paths.
             if (@hasDecl(package, "build_zig") or Self.isUnderDeps(decl_name)) continue;
             // A lazy dependency not fetched yet has no `build_root` at all: it is fetched when a build asks
             // for it, not missing. Checked before `build_root` is read, which would not compile.
-            if (Self.isUnfetched(package)) continue;
+            if (mod.PackageTable.isUnfetched(package)) continue;
             // A fetched package is keyed by its hash and lives in `zig-pkg/` or a cache, so it is not
             // mistaken for a missing sibling.
-            if (Self.isFetched(package.build_root, decl_name)) continue;
+            if (mod.PackageTable.isFetched(package.build_root, decl_name)) continue;
             // The root's own archives are unpacked in the same build; a sibling's is unknown at comptime and costs a re-run.
             if (!Self.isRootArchive(zon, decl_name)) return decl_name;
         }
         return null;
-    }
-
-    /// Reports whether an entry of the build runner's package table is a lazy dependency not fetched yet.
-    ///
-    /// - `package`: The entry; the runner gives it a `build_root` only once the package is on disk.
-    /// - Returns: `true` when it has none.
-    fn isUnfetched(comptime package: type) bool {
-        return !@hasDecl(package, "build_root");
-    }
-
-    /// Reports whether an entry of the build runner's package table is a fetched package, not a `.path` one.
-    ///
-    /// - `build_root`: The entry's `build_root`: relative to the build's working directory, or absolute.
-    /// - `key`: The entry's key: a hash for a fetched package, a path for a `.path` one.
-    /// - Returns: `true` when the package sits at `zig-pkg/<key>` or a cache's `p/<key>`.
-    fn isFetched(build_root: []const u8, key: []const u8) bool {
-        // Not an equality test: a `.path` package's root is `<dir of the build>/<key>`, which is the
-        // key itself only when `zig build` runs in the root package's own directory.
-        if (!std.mem.endsWith(u8, build_root, key) or build_root.len == key.len) return false;
-        const parent = build_root[0 .. build_root.len - key.len];
-        if (!std.Io.Dir.path.isSep(parent[parent.len - 1])) return false;
-        const store = std.Io.Dir.path.basename(parent[0 .. parent.len - 1]);
-        return std.mem.eql(u8, store, "zig-pkg") or std.mem.eql(u8, store, "p");
     }
 
     /// Reports whether a key of the build runner's package table is a path under the root's `deps/`.
@@ -674,35 +657,6 @@ test "outside a build runner every dependency counts as present" {
     try std.testing.expect(Deps.allPresent(test_zon));
     try std.testing.expect(Deps.allPresent(.{ .dependencies = .{} }));
     try std.testing.expect(Deps.worktreesPresent(test_zon));
-}
-
-test "isFetched tells a fetched package from a .path one, wherever zig build runs" {
-    const hash = "zigbuildx-6.0.0-9koPhJjSBAAdyvyqYS1GYMx";
-    try std.testing.expect(Deps.isFetched("zig-pkg/" ++ hash, hash));
-    try std.testing.expect(Deps.isFetched("/abs/app/zig-pkg/" ++ hash, hash));
-    try std.testing.expect(Deps.isFetched("/home/u/.cache/zig/p/" ++ hash, hash));
-    try std.testing.expect(!Deps.isFetched("../liba", "../liba"));
-    try std.testing.expect(!Deps.isFetched("/abs/app/../liba", "../liba"));
-    try std.testing.expect(!Deps.isFetched("vendor", "vendor"));
-    try std.testing.expect(!Deps.isFetched("/abs/app/vendor", "vendor"));
-}
-
-test "isUnfetched tells a lazy dependency not fetched yet from one on disk" {
-    // Shaped as the build runner's package table writes them.
-    const Unfetched = struct {
-        const Self = @This();
-        /// The runner knows the package but has not fetched it.
-        pub const available = false;
-    };
-    const Fetched = struct {
-        const Self = @This();
-        /// The package is on disk.
-        pub const available = true;
-        /// Where it is.
-        pub const build_root = "zig-pkg/lazy-0.0.0";
-    };
-    try std.testing.expect(Deps.isUnfetched(Unfetched));
-    try std.testing.expect(!Deps.isUnfetched(Fetched));
 }
 
 test "restoreManifest puts the backup back once, and reports when there is none" {

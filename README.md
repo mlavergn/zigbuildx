@@ -135,6 +135,22 @@ zig build dev             # after a distribution build (cloneMissing): put back 
 zig build vendor          # write a source tarball that builds with no network (cloneMissing; see *Vendored source tarballs*)
 ```
 
+Import a lazy `.path` sibling's `build.zig` with `Deps.lazyImport`, not
+`b.lazyImport`. Zig makes a missing `.path` dependency a compile error in
+`build.zig` (`dependency 'x' does not have a build.zig`), so `build()` never
+runs and `Deps` never gets to clone it. `Deps.lazyImport` answers null for
+it instead (and for a sibling directory without a `build.zig`, which Zig
+cannot tell from a missing one): `Deps` clones it, and the re-run imports
+it. In every other case it does just what `b.lazyImport` does, so a fetched
+package without a `build.zig` is still a compile error. Call it after
+`cloneMissing` or `sync`: an import placed before them that returns on null
+skips the clone, so the sibling never arrives:
+
+```zig
+zigbuildx.Deps.cloneMissing(b, @import("build.zig.zon"));
+const mylib_build = zigbuildx.Deps.lazyImport(b, @This(), "mylib") orelse return;
+```
+
 Target Apple platforms and link frameworks:
 
 ```zig

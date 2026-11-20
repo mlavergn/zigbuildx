@@ -108,6 +108,8 @@ src/deps/              dependencies, distribution builds and vendoring
   pin_kind.zig         PinKind: which of the three a pin is
   stamp.zig            Stamp: a worktree's `deps/.zigbuildx/*.rev` record
   mode.zig             Mode: develop or dist
+  package_table.zig    PackageTable: comptime reads of the runner's package table, by Deps and LazyImport
+  lazy_import.zig      LazyImport: Deps.lazyImport, null for a missing .path dependency
   updated.zig          Updated: what an update moved or skipped
   release_pin.zig      ReleasePin: `git+` URLs and release tags for `zigbuildx-pin`
   tool_artifact.zig    ToolArtifact: finds the host tool for a consumer's build, by `Deps`
@@ -215,7 +217,7 @@ additions to ZIGSTYLE:
   runner's package table (a `.path` package's key is its path) for one
   outside `deps/` with no `build_zig`, so the clone path compiles away in
   the steady state. A fetched package is told apart by where it lives
-  (`isFetched`: `zig-pkg/<key>` or a cache's `p/<key>`), not by its
+  (`PackageTable.isFetched`: `zig-pkg/<key>` or a cache's `p/<key>`), not by its
   `build_root` equalling its key, which holds only when `zig build` runs in
   the root's own directory. `missingSibling` tests `build_zig` first and
   raises the comptime branch quota per package: comparing a dozen hashed
@@ -523,7 +525,22 @@ additions to ZIGSTYLE:
   a step `has_side_effects`, or add each file with `addFileInput`.
 - **A `.path` dependency is a compile error while missing.** zigbuildx itself
   must be a `.url` + `.hash` dependency, and a top-level `@import` of a
-  missing dependency's `build.zig` needs `Deps.isPresent`.
+  missing dependency's `build.zig` needs `Deps.isPresent`. `b.lazyImport`
+  also fails on one: the runner marks a `.path` package available
+  whether or not it is on disk, so std reaches its `@compileError`.
+  `Deps.lazyImport` (`LazyImport`) checks the same table at comptime, through
+  `isMissingPath`, and answers null for a missing `.path` dependency: one
+  with neither a `build_zig` nor a fetched `build_root` (a sibling directory
+  without a `build.zig` included, as for `missingSibling`: the table cannot
+  tell it from a missing one), so a fetched package without a `build.zig`
+  keeps std's compile error. On that
+  path it repeats std's check that `asking_build_zig` is `b`'s, and it must
+  come after `cloneMissing` or `sync`: before them, an `orelse return` skips
+  the clone. `lazyImport` and `missingImport` are `inline`, because a
+  `?type` result makes an ordinary call comptime, where logging cannot
+  run. Its file is
+  exempt from zlint's `case-convention` (this zlint has no per-line
+  disable), so it holds nothing else.
 - **Name siblings `../x`, not `deps/x`.** A `.path` resolves as text, and its
   path is its identity: `../x` from any depth is one package, while `deps/x`
   under each declarer is a separate one, even through links to one checkout
@@ -533,7 +550,8 @@ additions to ZIGSTYLE:
   Before the push, `zig fetch .` here puts the same hash in the global cache
   for local builds. Consumers pin a tag with its commit (`?ref=v4.1.0#<commit>`),
   so a release that rewrites history breaks their URLs.
-- **Compatibility:** 7.0.0 needs no consumer change: it moves `src/` into
+- **Compatibility:** 7.1.0 adds `Deps.lazyImport`; nothing else changes.
+  7.0.0 needs no consumer change: it moves `src/` into
   folders. 6.6.0 adds `AppBundle.opens`, `AppBundle.mime_types`
   and `AppOpens`, defaulting to the bare `Exec=` and no `MimeType=` of 6.4.0;
   nothing else changes. 6.5.0 adds

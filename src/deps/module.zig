@@ -32,6 +32,10 @@ pub const Source = @import("source.zig").Source;
 pub const ZonEdit = @import("zon_edit.zig").ZonEdit;
 /// Downloads and unpacks a `.archive` dependency.
 pub const ZipArchive = @import("zip_archive.zig").ZipArchive;
+/// Reads the build runner's generated package table at comptime.
+pub const PackageTable = @import("package_table.zig").PackageTable;
+/// Imports a dependency's `build.zig`, null while a `.path` one is missing.
+pub const LazyImport = @import("lazy_import.zig").LazyImport;
 /// Finds the host tool's artifact for a consumer's build graph.
 pub const ToolArtifact = @import("tool_artifact.zig").ToolArtifact;
 
