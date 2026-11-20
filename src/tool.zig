@@ -21,12 +21,12 @@ pub const Tool = struct {
 
     /// Every command, by the name a step passes first.
     const commands = [_]Command{
-        .{ .name = "deps", .run = mod.Deps.command },
-        .{ .name = "docs-patch", .run = mod.Docs.command },
-        .{ .name = "docs-serve", .run = mod.DocsServer.command },
-        .{ .name = "pin", .run = mod.Deps.pin },
-        .{ .name = "restore", .run = mod.Deps.restore },
-        .{ .name = "vendor", .run = mod.Vendor.command },
+        .{ .name = "deps", .run = mod.deps.Deps.command },
+        .{ .name = "docs-patch", .run = mod.docs.Docs.command },
+        .{ .name = "docs-serve", .run = mod.docs.DocsServer.command },
+        .{ .name = "pin", .run = mod.deps.Deps.pin },
+        .{ .name = "restore", .run = mod.deps.Deps.restore },
+        .{ .name = "vendor", .run = mod.deps.Vendor.command },
     };
 
     /// The usage line, listing `commands` so it cannot drift from them.

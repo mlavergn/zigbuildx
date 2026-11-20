@@ -66,7 +66,7 @@ cross:
 		echo "cross $$t ok"; \
 	done
 
-# Check `zig build vendor` end to end: the test in src/vendor.zig that builds,
+# Check `zig build vendor` end to end: the test in src/deps/vendor.zig that builds,
 # vendors and rebuilds a scratch consumer through real `zig build` runs.
 #
 # Not part of validate: it takes a minute or more. Run it before a release

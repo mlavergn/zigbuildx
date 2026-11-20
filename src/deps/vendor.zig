@@ -123,7 +123,7 @@ pub const Vendor = struct {
     pub fn isVendored(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !bool {
         const marker = try std.Io.Dir.path.join(allocator, &.{ root, Self.marker_name });
         defer allocator.free(marker);
-        return mod.File.exists(io, marker);
+        return mod.core.File.exists(io, marker);
     }
 
     /// Writes the consumer's vendored tarball into `out_dir`, or refuses with every problem found.
@@ -136,13 +136,13 @@ pub const Vendor = struct {
         const lock = try std.Io.Dir.cwd().createFile(self.io, try std.Io.Dir.path.join(self.allocator, &.{ self.work, "vendor.lock" }), .{ .lock = .exclusive });
         defer lock.close(self.io);
         if (try Self.isVendored(self.allocator, self.io, self.root)) return self.fail("{s} is a vendored tree already", .{self.root});
-        if (try mod.File.exists(self.io, try self.rootPath(mod.Stage.backup_name))) {
+        if (try mod.core.File.exists(self.io, try self.rootPath(mod.Stage.backup_name))) {
             return self.fail("build.zig.zon is rewritten for a distribution build ({s} holds the original); run zig build dev first", .{mod.Stage.backup_name});
         }
-        if (!try mod.File.exists(self.io, try self.rootPath(".git"))) return self.fail("{s} is not a git checkout, so it has no commit to vendor", .{self.root});
-        const source = try mod.File.readOptionalZ(self.allocator, self.io, try self.rootPath("build.zig.zon"), .limited(mod.Manifest.max_bytes)) orelse return self.fail("no build.zig.zon in {s}", .{self.root});
+        if (!try mod.core.File.exists(self.io, try self.rootPath(".git"))) return self.fail("{s} is not a git checkout, so it has no commit to vendor", .{self.root});
+        const source = try mod.core.File.readOptionalZ(self.allocator, self.io, try self.rootPath("build.zig.zon"), .limited(mod.Manifest.max_bytes)) orelse return self.fail("no build.zig.zon in {s}", .{self.root});
         const manifest = mod.Manifest.parse(self.allocator, source) catch return self.fail("cannot parse the build.zig.zon of {s}", .{self.root});
-        const commit = try mod.Git.revParse(self.allocator, self.io, self.root, "HEAD") orelse return self.fail("{s} has no commits", .{self.root});
+        const commit = try mod.core.Git.revParse(self.allocator, self.io, self.root, "HEAD") orelse return self.fail("{s} has no commits", .{self.root});
         const version = if (manifest.version.len > 0) manifest.version else "0.0.0";
         // They name a directory that is deleted and recreated: a `/` or `..` would point it elsewhere.
         if (!Self.isPlainName(manifest.name) or !Self.isPlainName(version)) return self.fail("cannot name a tarball from .name \"{s}\" and .version \"{s}\"", .{ manifest.name, version });
@@ -165,7 +165,7 @@ pub const Vendor = struct {
         try self.fetchAll(export_dir);
         try self.mark(export_dir, manifest, commit, &stage);
         if (self.prove) try self.proveBuild(export_dir);
-        try self.writeTarball(export_dir, top, try mod.Git.commitTime(self.allocator, self.io, self.root));
+        try self.writeTarball(export_dir, top, try mod.core.Git.commitTime(self.allocator, self.io, self.root));
         try std.Io.Dir.cwd().deleteTree(self.io, export_dir);
     }
 
@@ -390,7 +390,7 @@ pub const Vendor = struct {
 /// - `build_zig`: Its `build.zig`.
 /// - `siblings`: The upstreams to clone at `<tmp>/<name>`.
 /// - Returns: IO and spawn errors.
-fn testConsumer(tree: *mod.TestTree, dependencies: []const u8, build_zig: []const u8, siblings: []const []const u8) !void {
+fn testConsumer(tree: *mod.testing.TestTree, dependencies: []const u8, build_zig: []const u8, siblings: []const []const u8) !void {
     for (siblings) |name| try tree.run(&.{ "git", "clone", "--quiet", try tree.path(try tree.allocator().print("origin/{s}", .{name})), try tree.path(name) });
     const dir = try tree.path("consumer");
     try tree.run(&.{ "git", "init", "--quiet", "--initial-branch=main", dir });
@@ -406,7 +406,7 @@ fn testConsumer(tree: *mod.TestTree, dependencies: []const u8, build_zig: []cons
 ///
 /// - `tree`: The fixture.
 /// - Returns: The run, not started, its proof off; `error.SkipZigTest` when the build did not pass `ZIGBUILDX_ZIG`.
-fn testVendor(tree: *mod.TestTree) !Vendor {
+fn testVendor(tree: *mod.testing.TestTree) !Vendor {
     var run = try Vendor.init(tree.allocator(), tree.io, try tree.path("consumer"), try tree.zig(), try tree.path("out"), try tree.zigEnviron());
     // The same one: tests run one at a time, and the proof only empties its packages, which the next fetch puts back.
     run.proof_cache = try tree.globalCache();
@@ -432,7 +432,7 @@ fn vendorFails(run: *Vendor) ![]const u8 {
 /// - `tarball`: The `.tar.gz`.
 /// - `sub`: The directory, relative to the scratch root.
 /// - Returns: IO, gzip and tar errors.
-fn extract(tree: *mod.TestTree, tarball: []const u8, sub: []const u8) !void {
+fn extract(tree: *mod.testing.TestTree, tarball: []const u8, sub: []const u8) !void {
     try tree.tmp.dir.createDirPath(tree.io, sub);
     var out = try tree.tmp.dir.openDir(tree.io, sub, .{});
     defer out.close(tree.io);
@@ -446,7 +446,7 @@ fn extract(tree: *mod.TestTree, tarball: []const u8, sub: []const u8) !void {
 }
 
 test "vendor writes the root, its inside checkouts and its siblings at their HEADs, the same bytes every run" {
-    var tree = try mod.TestTree.init();
+    var tree = try mod.testing.TestTree.init();
     defer tree.deinit();
     try tree.upstream("leaf", "");
     try tree.upstream("mid", ".leaf = .{ .path = \"../leaf\" },");
@@ -503,7 +503,7 @@ test "vendor writes the root, its inside checkouts and its siblings at their HEA
 }
 
 test "vendor refuses tracked changes and siblings off their refs, listing them all, and writes nothing" {
-    var tree = try mod.TestTree.init();
+    var tree = try mod.testing.TestTree.init();
     defer tree.deinit();
     try tree.upstream("onbranch", "");
     try tree.upstream("ontag", "");
@@ -538,7 +538,7 @@ test "vendor refuses tracked changes and siblings off their refs, listing them a
 }
 
 test "vendor proves the export builds with no packages but its own, and writes nothing when it does not" {
-    var tree = try mod.TestTree.init();
+    var tree = try mod.testing.TestTree.init();
     defer tree.deinit();
     try tree.upstream("lib", "");
     // Zig resolves every eager dependency before build() runs, so `lib` must be in `zig-pkg/` whether or not build() asks for it.
@@ -577,7 +577,7 @@ const Outcome = struct {
 /// - `argv`: The command.
 /// - `environ_map`: The child's environment.
 /// - Returns: What it did; spawn errors.
-fn runIn(tree: *mod.TestTree, sub: []const u8, argv: []const []const u8, environ_map: *const std.process.Environ.Map) !Outcome {
+fn runIn(tree: *mod.testing.TestTree, sub: []const u8, argv: []const []const u8, environ_map: *const std.process.Environ.Map) !Outcome {
     const result = try std.process.run(tree.allocator(), tree.io, .{ .argv = argv, .cwd = .{ .path = try tree.path(sub) }, .environ_map = environ_map });
     const ok = switch (result.term) {
         .exited => |code| code == 0,
@@ -595,7 +595,7 @@ fn runIn(tree: *mod.TestTree, sub: []const u8, argv: []const []const u8, environ
 /// - `build_zig`: Its `build.zig`.
 /// - `source`: Its `<name>.zig`.
 /// - Returns: IO and spawn errors.
-fn endToEndPackage(tree: *mod.TestTree, sub: []const u8, name: []const u8, dependencies: []const u8, build_zig: []const u8, source: []const u8) !void {
+fn endToEndPackage(tree: *mod.testing.TestTree, sub: []const u8, name: []const u8, dependencies: []const u8, build_zig: []const u8, source: []const u8) !void {
     const allocator = tree.allocator();
     try tree.run(&.{ "git", "init", "--quiet", "--initial-branch=main", try tree.path(sub) });
     // The fingerprint's checksum is the name's, as `zig build` checks it.
@@ -612,7 +612,7 @@ fn endToEndPackage(tree: *mod.TestTree, sub: []const u8, name: []const u8, depen
 /// - `zig`: The `zig` executable.
 /// - `environ_map`: The child's environment.
 /// - Returns: The last run's outcome; spawn errors.
-fn buildApp(tree: *mod.TestTree, zig: []const u8, environ_map: *const std.process.Environ.Map) !Outcome {
+fn buildApp(tree: *mod.testing.TestTree, zig: []const u8, environ_map: *const std.process.Environ.Map) !Outcome {
     var outcome = try runIn(tree, "app", &.{ zig, "build" }, environ_map);
     var runs: usize = 1;
     while (!outcome.ok and runs < app_build_runs and std.mem.find(u8, outcome.output, "re-run zig build") != null) : (runs += 1) {
@@ -628,7 +628,7 @@ fn buildApp(tree: *mod.TestTree, zig: []const u8, environ_map: *const std.proces
 /// - `environ_map`: The child's environment.
 /// - `message`: Part of the refusal.
 /// - Returns: `error.TestUnexpectedResult` when it succeeds or says something else; spawn errors.
-fn expectVendorRefused(tree: *mod.TestTree, zig: []const u8, environ_map: *const std.process.Environ.Map, message: []const u8) !void {
+fn expectVendorRefused(tree: *mod.testing.TestTree, zig: []const u8, environ_map: *const std.process.Environ.Map, message: []const u8) !void {
     const outcome = try runIn(tree, "app", &.{ zig, "build", "vendor" }, environ_map);
     try std.testing.expect(!outcome.ok);
     if (std.mem.find(u8, outcome.output, message) == null) {
@@ -641,7 +641,7 @@ fn expectVendorRefused(tree: *mod.TestTree, zig: []const u8, environ_map: *const
 // real `zig build` runs, which takes a minute or more, so it skips unless
 // `-Dvendor-check` sets ZIGBUILDX_VENDOR_CHECK to 1.
 test "vendor end to end: a consumer's tarball builds with every remote gone and no packages but its own" {
-    var tree = try mod.TestTree.init();
+    var tree = try mod.testing.TestTree.init();
     defer tree.deinit();
     const allocator = tree.allocator();
     const enabled = std.testing.environ.getAlloc(allocator, "ZIGBUILDX_VENDOR_CHECK") catch return error.SkipZigTest;
@@ -668,7 +668,7 @@ test "vendor end to end: a consumer's tarball builds with every remote gone and 
     const zigbuildx = try tree.path("origin/zigbuildx");
     try std.Io.Dir.cwd().createDirPath(tree.io, zigbuildx);
     inline for (.{ "build.zig", "build.zig.zon" }) |name| try std.Io.Dir.cwd().copyFile(name, std.Io.Dir.cwd(), try std.Io.Dir.path.join(allocator, &.{ zigbuildx, name }), tree.io, .{});
-    try mod.File.copyTree(allocator, tree.io, "src", try std.Io.Dir.path.join(allocator, &.{ zigbuildx, "src" }), &.{});
+    try mod.core.File.copyTree(allocator, tree.io, "src", try std.Io.Dir.path.join(allocator, &.{ zigbuildx, "src" }), &.{});
 
     try endToEndPackage(&tree, "origin/app", "app", try allocator.print(".a = .{{ .path = \"../a\", .clone = \"{s}\", .branch = \"main\" }},", .{try tree.path("origin/a")}),
         \\const std = @import("std");

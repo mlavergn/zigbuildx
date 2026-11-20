@@ -16,9 +16,10 @@ imported from other projects' `build.zig` instead of copied into each one.
   branch on `b.graph.host`, so a Windows-only mistake compiles on macOS;
   `make cross` catches it.
 - **No dependencies.** `build.zig.zon` `.dependencies` stays empty.
-- **No packaging.** Building a `.pkg`, `.deb`, `.msi` or `.apk` is out of
-  scope; 4.0.0 removed `Pkg` and `Apk`. `App` only lays out an install (a
-  `.app`, a desktop entry); signing, `.dmg`s and notarization are a packager's.
+- **The app, not the installer.** `App` makes the app, laid out as its
+  platform runs it (a `.app`, a desktop entry); the installer or container
+  around it (`.dmg`, `.pkg`, `.deb`, `.msi`, `.apk`), signing and
+  notarization are a separate packager's. 4.0.0 removed `Pkg` and `Apk`.
 - **It is a base module.** Never name a project that depends on zigbuildx,
   in code, docs or examples: zigbuildx knows nothing about its consumers.
   Use generic names (`../mylib`, `../a`) in examples.
@@ -39,7 +40,7 @@ imported from other projects' `build.zig` instead of copied into each one.
   `ZIG_DIRS`.
 - `make tag`: tags `v<.version>` and pushes it; `zigbuildx-pin` finds
   releases by that tag.
-- `make vendor`: the test "vendor end to end" in `src/vendor.zig`, which
+- `make vendor`: the test "vendor end to end" in `src/deps/vendor.zig`, which
   skips unless `-Dvendor-check` is passed (an option, since a cached
   configure keeps a Run step's environment). Through real `zig build`
   runs it builds a scratch consumer (`../a` → `../b`, a lazy `.url`
@@ -91,43 +92,60 @@ build.zig              the public surface: re-exports Deps, Git, Xcode, Swift,
                        App, AppBundle, AppFile, AppOpens, Android, AndroidAbi
                        and Docs;
                        installs the host tool
-src/module.zig         the barrel the tests compile
-src/deps.zig           Deps: the entry points (clone, sync, update, pin, restore)
-src/sync.zig           Sync: one run over the manifests, siblings and worktrees
-src/stage.zig          Stage: a distribution build under cloneMissing, siblings staged into zig-pkg/
-src/source.zig         Source: a `.clone` or an `.archive`
-src/zon_edit.zig       ZonEdit: in-place `build.zig.zon` edits
-src/manifest.zig       Manifest: the parts of a `build.zig.zon` Deps reads
-src/entry.zig          Entry: one manifest dependency
-src/pin.zig            Pin: a worktree's SHA, tag or branch
-src/pin_kind.zig       PinKind: which of the three a pin is
-src/stamp.zig          Stamp: a worktree's `deps/.zigbuildx/*.rev` record
-src/mode.zig           Mode: develop or dist
-src/updated.zig        Updated: what an update moved or skipped
-src/release_pin.zig    ReleasePin: `git+` URLs and release tags for `zigbuildx-pin`
-src/git.zig            Git: one thin wrapper per git command
-src/xcode.zig          Xcode: Apple SDKs, the macOS floor, frameworks, xcframeworks
-src/swift.zig          Swift: swiftc dylibs
-src/app.zig            App: a GUI executable's macOS `.app` or Linux desktop entry
-src/android.zig        Android: the NDK
-src/android_abi.zig    AndroidAbi: an ABI and its Zig target
-src/docs.zig           Docs: autodoc with private declarations, and `addServe`
-src/docs_server.zig    DocsServer: the host tool's `docs-serve`, a loopback static server
-src/vendor.zig         Vendor: `zig build vendor`, a self-contained source tarball
-src/zip_archive.zig    ZipArchive: `.archive` download and unpack
-src/file.zig           File: file-system primitives the others share
+src/module.zig         the barrel the tests compile: each folder as a namespace
 src/tool.zig           Tool: the host tool's main and command dispatch
-src/tool_artifact.zig  ToolArtifact: finds the host tool for a consumer's build
-src/zip_builder.zig    ZipBuilder: in-memory zips for the tests
-src/test_tree.zig      TestTree: git repositories and a consumer, for the tests
+src/deps/              dependencies, distribution builds and vendoring
+  deps.zig             Deps: the entry points (clone, sync, update, pin, restore)
+  sync.zig             Sync: one run over the manifests, siblings and worktrees
+  stage.zig            Stage: a distribution build under cloneMissing, siblings staged into zig-pkg/
+  vendor.zig           Vendor: `zig build vendor`, a self-contained source tarball
+  source.zig           Source: a `.clone` or an `.archive`
+  zip_archive.zig      ZipArchive: `.archive` download and unpack
+  zon_edit.zig         ZonEdit: in-place `build.zig.zon` edits
+  manifest.zig         Manifest: the parts of a `build.zig.zon` Deps reads
+  entry.zig            Entry: one manifest dependency
+  pin.zig              Pin: a worktree's SHA, tag or branch
+  pin_kind.zig         PinKind: which of the three a pin is
+  stamp.zig            Stamp: a worktree's `deps/.zigbuildx/*.rev` record
+  mode.zig             Mode: develop or dist
+  updated.zig          Updated: what an update moved or skipped
+  release_pin.zig      ReleasePin: `git+` URLs and release tags for `zigbuildx-pin`
+  tool_artifact.zig    ToolArtifact: finds the host tool for a consumer's build, by `Deps`
+src/platform/          target platforms' SDKs and toolchains, and the app
+  xcode.zig            Xcode: Apple SDKs, the macOS floor, frameworks, xcframeworks
+  swift.zig            Swift: swiftc dylibs
+  app.zig              App: a GUI executable's macOS `.app` or Linux desktop entry
+  android.zig          Android: the NDK
+  android_abi.zig      AndroidAbi: an ABI and its Zig target
+src/docs/
+  docs.zig             Docs: autodoc with private declarations, and `addServe`
+  docs_server.zig      DocsServer: the host tool's `docs-serve`, a loopback static server
+src/core/              generic helpers (see *Generic helpers stay generic*)
+  git.zig              Git: one thin wrapper per git command
+  file.zig             File: file-system primitives the others share
+src/testing/
+  test_tree.zig        TestTree: git repositories and a consumer, for the tests
+  zip_builder.zig      ZipBuilder: in-memory zips for the tests
 ```
 
 Consumers import this package's `build.zig` by dependency name, so only what
 it re-exports is reachable; everything else in `module.zig` is internal.
 One struct per file (B.2.a): a type stays beside the primary struct only
 when that struct is its sole user (`Release`, `Command`, `Xcframework`,
-`AppBundle`), and anything two structs share gets a file of its own. A new sub-folder
-with several `.zig` files gets its own `module.zig` barrel.
+`AppBundle`), and anything two structs share gets a file of its own.
+
+Each folder has a `module.zig` barrel (B.1.a), and every file imports its own
+folder's as `mod` (B.4.b), never another folder's or a sibling file. A
+folder's barrel re-exports its own types, so code reads `mod.Sync` beside
+`sync.zig`; under an `// Other folders` comment it re-exports, through
+`../module.zig`, the namespaces of the other folders its files use, so code
+reads `mod.core.Git` from `deps/`. `src/module.zig` holds the namespaces
+(`core`, `deps`, `platform`, `docs`, `testing`), so each type is documented
+once, in its own folder's barrel. `tool.zig` stays in `src/`: it is the host
+tool's root, and Zig refuses an import above a module root's directory. A new
+folder gets a barrel, an entry here, and a namespace in `src/module.zig`; a
+file that starts using another folder's type adds that folder's namespace to
+its barrel.
 
 ## Architecture conventions
 
@@ -515,7 +533,8 @@ additions to ZIGSTYLE:
   Before the push, `zig fetch .` here puts the same hash in the global cache
   for local builds. Consumers pin a tag with its commit (`?ref=v4.1.0#<commit>`),
   so a release that rewrites history breaks their URLs.
-- **Compatibility:** 6.6.0 adds `AppBundle.opens`, `AppBundle.mime_types`
+- **Compatibility:** 7.0.0 needs no consumer change: it moves `src/` into
+  folders. 6.6.0 adds `AppBundle.opens`, `AppBundle.mime_types`
   and `AppOpens`, defaulting to the bare `Exec=` and no `MimeType=` of 6.4.0;
   nothing else changes. 6.5.0 adds
   `Docs.addServe`; nothing else changes. 6.4.0
@@ -583,7 +602,7 @@ reaches `std.debug.print` does not compile for Apple's other platforms.
   `~/.android/adbkey` (`std.crypto.ff`; std can only verify RSA). Open: a
   test device, a missing key, and whether it belongs in its own package.
 - **Rejected for `App`:** signing (ad hoc included), `.dmg`s and
-  notarization (a packager's, under *No packaging*); a universal `lipo`
+  notarization (a packager's, under *The app, not the installer*); a universal `lipo`
   bundle; `Exec=` arguments other than the `opens` field code; a
   `linux_subdir` for other targets.
 - **Rejected for `vendor`:** shipping a working tree's uncommitted changes

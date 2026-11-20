@@ -56,7 +56,7 @@ pub const ZipArchive = struct {
     /// - Returns: The URL, or `null` when `dir` has no stamp; IO errors.
     pub fn source(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !?[]const u8 {
         const path = try std.Io.Dir.path.join(allocator, &.{ dir, stamp_name });
-        const text = try mod.File.readOptional(allocator, io, path, .limited(Self.max_stamp_bytes)) orelse return null;
+        const text = try mod.core.File.readOptional(allocator, io, path, .limited(Self.max_stamp_bytes)) orelse return null;
         return std.mem.trimEnd(u8, text, "\r\n");
     }
 
@@ -80,10 +80,10 @@ pub const ZipArchive = struct {
         try Self.download(allocator, io, url, zip_path);
         const top = try Self.extract(allocator, io, zip_path, files);
         const build_zig = try std.Io.Dir.path.join(allocator, &.{ top, "build.zig" });
-        if (!try mod.File.exists(io, build_zig)) try cwd.writeFile(io, .{ .sub_path = build_zig, .data = Self.stub_build_zig });
+        if (!try mod.core.File.exists(io, build_zig)) try cwd.writeFile(io, .{ .sub_path = build_zig, .data = Self.stub_build_zig });
         const stamp = try std.Io.Dir.path.join(allocator, &.{ top, stamp_name });
         try cwd.writeFile(io, .{ .sub_path = stamp, .data = try allocator.print("{s}\n", .{url}) });
-        try mod.File.createParentDir(io, dest);
+        try mod.core.File.createParentDir(io, dest);
         // The old directory moves into staging, deleted with it, and comes back if the new one cannot take its place.
         const previous = try std.Io.Dir.path.join(allocator, &.{ staging, "previous" });
         var replaced = true;
@@ -167,7 +167,7 @@ pub const ZipArchive = struct {
 /// - `entries`: (name, contents) pairs, with `/`-separated names.
 /// - Returns: The zip's `file://` URL; IO and zip errors.
 fn writeTestZip(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8, entries: []const [2][]const u8) ![]const u8 {
-    var zip = mod.ZipBuilder.init(allocator);
+    var zip = mod.testing.ZipBuilder.init(allocator);
     defer zip.deinit();
     for (entries) |entry| try zip.addStored(entry[0], entry[1]);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = try zip.finish() });

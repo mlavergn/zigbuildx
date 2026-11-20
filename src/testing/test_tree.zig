@@ -108,7 +108,7 @@ pub const TestTree = struct {
     ///
     /// - `self`: The fixture.
     /// - Returns: The finished run; its errors.
-    pub fn sync(self: *Self) !mod.Sync {
+    pub fn sync(self: *Self) !mod.deps.Sync {
         return self.syncIn(.develop);
     }
 
@@ -117,8 +117,8 @@ pub const TestTree = struct {
     /// - `self`: The fixture.
     /// - `mode`: How siblings are treated.
     /// - Returns: The finished run; its errors.
-    pub fn syncIn(self: *Self, mode: mod.Mode) !mod.Sync {
-        var run_ = try mod.Sync.init(self.allocator(), self.io, try self.path("consumer"));
+    pub fn syncIn(self: *Self, mode: mod.deps.Mode) !mod.deps.Sync {
+        var run_ = try mod.deps.Sync.init(self.allocator(), self.io, try self.path("consumer"));
         run_.mode = mode;
         try run_.run();
         return run_;
@@ -139,7 +139,7 @@ pub const TestTree = struct {
     /// - `self`: The fixture.
     /// - Returns: The message; `error.TestUnexpectedResult` when the sync succeeds.
     pub fn syncFails(self: *Self) ![]const u8 {
-        var run_ = try mod.Sync.init(self.allocator(), self.io, try self.path("consumer"));
+        var run_ = try mod.deps.Sync.init(self.allocator(), self.io, try self.path("consumer"));
         run_.run() catch |err| {
             try std.testing.expectEqual(error.DepsFailed, err);
             return run_.problem;
@@ -154,7 +154,7 @@ pub const TestTree = struct {
     /// - `rev_`: The revision.
     /// - Returns: The SHA; `error.TestUnexpectedResult` when it is not there.
     pub fn rev(self: *Self, sub: []const u8, rev_: []const u8) ![]const u8 {
-        return try mod.Git.revParse(self.allocator(), self.io, try self.path(sub), rev_) orelse error.TestUnexpectedResult;
+        return try mod.core.Git.revParse(self.allocator(), self.io, try self.path(sub), rev_) orelse error.TestUnexpectedResult;
     }
 
     /// Writes a zip of `entries` (name, contents) at `sub`.

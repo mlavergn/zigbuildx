@@ -10,28 +10,28 @@ comptime {
     if (zig.major != 0 or zig.minor != 17 or zig.patch < 1) @compileError(std.fmt.comptimePrint("zigbuildx is for Zig 0.17.1 or a later 0.17; this is Zig {d}.{d}.{d}", .{ zig.major, zig.minor, zig.patch }));
 }
 
-/// Clones sibling checkouts and keeps worktree dependencies pinned; see `src/deps.zig`.
-pub const Deps = mod.Deps;
-/// Runs `git` for the build; see `src/git.zig`.
-pub const Git = mod.Git;
-/// Locates an Apple platform's SDK and pins the macOS deployment floor; see `src/xcode.zig`.
-pub const Xcode = mod.Xcode;
-/// Builds Swift dylibs and links modules against them; see `src/swift.zig`.
-pub const Swift = mod.Swift;
-/// Installs a GUI executable as its platform expects (a macOS `.app`, a Linux desktop entry); see `src/app.zig`.
-pub const App = mod.App;
+/// Clones sibling checkouts and keeps worktree dependencies pinned; see `src/deps/deps.zig`.
+pub const Deps = mod.deps.Deps;
+/// Runs `git` for the build; see `src/core/git.zig`.
+pub const Git = mod.core.Git;
+/// Locates an Apple platform's SDK and pins the macOS deployment floor; see `src/platform/xcode.zig`.
+pub const Xcode = mod.platform.Xcode;
+/// Builds Swift dylibs and links modules against them; see `src/platform/swift.zig`.
+pub const Swift = mod.platform.Swift;
+/// Installs a GUI executable as its platform expects (a macOS `.app`, a Linux desktop entry); see `src/platform/app.zig`.
+pub const App = mod.platform.App;
 /// What `App.addBundle` assembles and `App.addInstall` installs; named, as both take the same one.
-pub const AppBundle = mod.AppBundle;
+pub const AppBundle = mod.platform.AppBundle;
 /// A file `AppBundle` places in the bundle; named, for a list built outside the literal.
-pub const AppFile = mod.AppFile;
+pub const AppFile = mod.platform.AppFile;
 /// What a Linux desktop entry's launcher may hand the app (`AppBundle.opens`); named, for a value chosen outside the literal.
-pub const AppOpens = mod.AppOpens;
-/// Builds Android native libraries; see `src/android.zig`.
-pub const Android = mod.Android;
-/// An Android ABI and its Zig target; see `src/android.zig`.
-pub const AndroidAbi = mod.AndroidAbi;
-/// Extends Zig's generated documentation; see `src/docs.zig`.
-pub const Docs = mod.Docs;
+pub const AppOpens = mod.platform.AppOpens;
+/// Builds Android native libraries; see `src/platform/android.zig`.
+pub const Android = mod.platform.Android;
+/// An Android ABI and its Zig target; see `src/platform/android_abi.zig`.
+pub const AndroidAbi = mod.platform.AndroidAbi;
+/// Extends Zig's generated documentation; see `src/docs/docs.zig`.
+pub const Docs = mod.docs.Docs;
 
 /// Declares zigbuildx's host tool and its own test step; a consumer never calls it.
 ///
@@ -44,8 +44,8 @@ pub fn build(b: *std.Build) void {
     const vendor_check = b.option(bool, "vendor-check", "Also run the slow end-to-end test of zig build vendor (make vendor)") orelse false;
 
     // Installed, because an installed artifact is what `Dependency.artifact` finds
-    // when an extension asks for the host tool (`src/tool_artifact.zig`).
-    b.installArtifact(b.addExecutable(.{ .name = mod.ToolArtifact.name, .root_module = b.createModule(.{
+    // when an extension asks for the host tool (`src/deps/tool_artifact.zig`).
+    b.installArtifact(b.addExecutable(.{ .name = mod.deps.ToolArtifact.name, .root_module = b.createModule(.{
         .root_source_file = b.path("src/tool.zig"),
         .target = b.graph.host,
         .optimize = .safe,

@@ -153,7 +153,8 @@ if (xcf) |dir| b.getInstallStep().dependOn(&b.addInstallDirectory(.{ .source_dir
 ```
 
 Install a GUI executable: on macOS `Hello.app` at the top of the prefix
-(unsigned; `LSMinimumSystemVersion` is the `-Dmacos-min` floor, else 13.0), on
+(unsigned: signing, and the `.dmg` or installer around the app, are a
+packager's; `LSMinimumSystemVersion` is the `-Dmacos-min` floor, else 13.0), on
 Linux `bin/Hello` with `share/applications/Hello.desktop` and the icon,
 elsewhere the executable alone, under its artifact name. `.opens` says what
 a Linux launcher may hand the app (`.file` writes `Exec=Hello %f`; the default

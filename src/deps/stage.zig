@@ -117,7 +117,7 @@ pub const Stage = struct {
         const lock = try mod.Sync.lockRoot(self.allocator, self.io, self.root);
         defer lock.close(self.io);
         const manifest_path = try std.Io.Dir.path.join(self.allocator, &.{ self.target, "build.zig.zon" });
-        const source = try mod.File.readOptionalZ(self.allocator, self.io, manifest_path, .limited(mod.Manifest.max_bytes)) orelse return self.fail("no build.zig.zon in {s}", .{self.target});
+        const source = try mod.core.File.readOptionalZ(self.allocator, self.io, manifest_path, .limited(mod.Manifest.max_bytes)) orelse return self.fail("no build.zig.zon in {s}", .{self.target});
         const manifest = mod.Manifest.parse(self.allocator, source) catch return self.fail("cannot parse {s}", .{manifest_path});
         // The root's own problems lead the list.
         if (self.local) try self.checkRoot(manifest.name);
@@ -192,7 +192,7 @@ pub const Stage = struct {
         // Also creates the tar's directory, beside `dest`.
         try cwd.createDirPath(self.io, dest);
         // Exactly the commit: an untracked file in the clone never reaches the package.
-        try mod.Git.archive(self.allocator, self.io, checkout, commit, tar_path);
+        try mod.core.Git.archive(self.allocator, self.io, checkout, commit, tar_path);
         var out = try cwd.openDir(self.io, dest, .{});
         defer out.close(self.io);
         var file = try cwd.openFile(self.io, tar_path, .{});
@@ -291,7 +291,7 @@ pub const Stage = struct {
         self.nodes.items[index].export_dir = export_dir;
         const manifest_path = try std.Io.Dir.path.join(self.allocator, &.{ export_dir, "build.zig.zon" });
         // A package without a manifest (an archive, often) has no siblings.
-        const source = try mod.File.readOptionalZ(self.allocator, self.io, manifest_path, .limited(mod.Manifest.max_bytes)) orelse return;
+        const source = try mod.core.File.readOptionalZ(self.allocator, self.io, manifest_path, .limited(mod.Manifest.max_bytes)) orelse return;
         const manifest = mod.Manifest.parse(self.allocator, source) catch return self.fail("cannot parse the build.zig.zon of {s}", .{node.rel});
         // `collect` grows `nodes`, so the edges are stored by index afterwards.
         const edges = try self.collect(manifest, node.dir);
@@ -313,17 +313,17 @@ pub const Stage = struct {
                 // only read (`rev-parse`, `archive`), never checked out, so siblings can share it.
                 const clone_key = try self.allocator.print("{s}-{x:0>16}", .{ base, std.hash.Wyhash.hash(0, clone) });
                 const checkout = try std.Io.Dir.path.join(self.allocator, &.{ self.work, "clones", clone_key });
-                if (try mod.File.exists(self.io, checkout)) {
-                    mod.Git.fetch(self.allocator, self.io, checkout, "origin") catch return self.fail("cannot fetch {s} for {s}", .{ clone, node.rel });
+                if (try mod.core.File.exists(self.io, checkout)) {
+                    mod.core.Git.fetch(self.allocator, self.io, checkout, "origin") catch return self.fail("cannot fetch {s} for {s}", .{ clone, node.rel });
                 } else {
-                    try mod.File.createParentDir(self.io, checkout);
-                    mod.Git.clone(self.io, clone, checkout, null) catch return self.fail("cannot clone {s} for {s}", .{ clone, node.rel });
+                    try mod.core.File.createParentDir(self.io, checkout);
+                    mod.core.Git.clone(self.io, clone, checkout, null) catch return self.fail("cannot clone {s} for {s}", .{ clone, node.rel });
                 }
                 const rev = if (node.ref) |ref| switch (ref.kind) {
                     .tag => try self.allocator.print("refs/tags/{s}", .{ref.value}),
                     else => try self.allocator.print("refs/remotes/origin/{s}", .{ref.value}),
                 } else "refs/remotes/origin/HEAD";
-                const commit = try mod.Git.revParse(self.allocator, self.io, checkout, rev) orelse {
+                const commit = try mod.core.Git.revParse(self.allocator, self.io, checkout, rev) orelse {
                     return self.fail("{s} has no {s} for {s}", .{ clone, if (node.ref) |ref| try self.allocator.print("{t} {s}", .{ ref.kind, ref.value }) else "default branch", node.rel });
                 };
                 try self.exportCommit(checkout, commit, export_dir);
@@ -345,16 +345,16 @@ pub const Stage = struct {
     /// - Returns: `true` when exported, `false` when a problem was recorded; IO and git errors.
     fn exportLocal(self: *Self, index: usize, export_dir: []const u8) !bool {
         const node = self.nodes.items[index];
-        if (!try mod.File.exists(self.io, node.dir)) return self.refuse("{s} is missing; run zig build first, which clones it", .{node.rel});
+        if (!try mod.core.File.exists(self.io, node.dir)) return self.refuse("{s} is missing; run zig build first, which clones it", .{node.rel});
         if (node.source != null and node.source.? == .archive) {
             // Unpacked by an earlier build: no git, nothing to check.
-            try mod.File.copyTree(self.allocator, self.io, node.dir, export_dir, &.{".git"});
+            try mod.core.File.copyTree(self.allocator, self.io, node.dir, export_dir, &.{".git"});
             return true;
         }
         const commit = try self.exportCheckout(node.dir, node.rel, node.declared_by, node.ref, export_dir) orelse return false;
         self.nodes.items[index].commit = commit;
         // A remote's URL may carry a token (`https://<token>@host/…`), which the tarball would ship.
-        const origin = if (try mod.Git.remoteUrl(self.allocator, self.io, node.dir)) |url| try Self.withoutCredentials(self.allocator, url) else null;
+        const origin = if (try mod.core.Git.remoteUrl(self.allocator, self.io, node.dir)) |url| try Self.withoutCredentials(self.allocator, url) else null;
         self.nodes.items[index].repository = origin orelse if (node.source) |source| source.clone else node.dir;
         return true;
     }
@@ -373,18 +373,18 @@ pub const Stage = struct {
             // From the resolved path: `x/../../<root>/deps/y` stays in the root, but joined as written it leaves `target`.
             const rel = try std.Io.Dir.path.relativeAlloc(self.allocator, self.root, null, self.root, dir);
             const dest = try std.Io.Dir.path.join(self.allocator, &.{ self.target, rel });
-            if (!try mod.File.exists(self.io, dir)) {
-                if (!try mod.File.exists(self.io, dest)) _ = try self.refuse("{s} is missing; run zig build first, which fetches it", .{path});
+            if (!try mod.core.File.exists(self.io, dir)) {
+                if (!try mod.core.File.exists(self.io, dest)) _ = try self.refuse("{s} is missing; run zig build first, which fetches it", .{path});
                 continue;
             }
             const dot_git = try std.Io.Dir.path.join(self.allocator, &.{ dir, ".git" });
-            if (entry.archive == null and try mod.File.exists(self.io, dot_git)) {
+            if (entry.archive == null and try mod.core.File.exists(self.io, dot_git)) {
                 const ref = try self.refOf(manifest.name, entry);
                 try std.Io.Dir.cwd().deleteTree(self.io, dest);
                 _ = try self.exportCheckout(dir, path, manifest.name, ref, dest);
-            } else if (!try mod.File.exists(self.io, dest)) {
+            } else if (!try mod.core.File.exists(self.io, dest)) {
                 // Untracked by the root (an unpacked archive, a git-ignored folder): copied whole.
-                try mod.File.copyTree(self.allocator, self.io, dir, dest, &.{".git"});
+                try mod.core.File.copyTree(self.allocator, self.io, dir, dest, &.{".git"});
             }
         }
     }
@@ -401,15 +401,15 @@ pub const Stage = struct {
     fn exportCheckout(self: *Self, dir: []const u8, rel: []const u8, declared_by: []const u8, ref: ?mod.Pin, dest: []const u8) !?[]const u8 {
         // Without its own `.git`, git would answer for whatever repository encloses it.
         const dot_git = try std.Io.Dir.path.join(self.allocator, &.{ dir, ".git" });
-        if (!try mod.File.exists(self.io, dot_git)) {
+        if (!try mod.core.File.exists(self.io, dot_git)) {
             _ = try self.refuse("{s} is not a git checkout, so it has no commit to vendor", .{rel});
             return null;
         }
         const count = self.problems.items.len;
-        if (try mod.Git.hasTrackedChanges(self.allocator, self.io, dir)) _ = try self.refuse("{s} has uncommitted changes to tracked files", .{rel});
+        if (try mod.core.Git.hasTrackedChanges(self.allocator, self.io, dir)) _ = try self.refuse("{s} has uncommitted changes to tracked files", .{rel});
         if (ref) |pin| if (try self.offRef(dir, rel, declared_by, pin)) |problem| try self.problems.append(self.allocator, problem);
         if (self.problems.items.len > count) return null;
-        const commit = try mod.Git.revParse(self.allocator, self.io, dir, "HEAD") orelse {
+        const commit = try mod.core.Git.revParse(self.allocator, self.io, dir, "HEAD") orelse {
             _ = try self.refuse("{s} has no commits", .{rel});
             return null;
         };
@@ -426,12 +426,12 @@ pub const Stage = struct {
     fn checkRoot(self: *Self, name: []const u8) !void {
         // Without its own `.git`, git would answer for whatever repository encloses it.
         const dot_git = try std.Io.Dir.path.join(self.allocator, &.{ self.root, ".git" });
-        if (!try mod.File.exists(self.io, dot_git)) {
+        if (!try mod.core.File.exists(self.io, dot_git)) {
             _ = try self.refuse("{s} is not a git checkout, so it has no commit to vendor", .{name});
             return;
         }
-        if (try mod.Git.hasTrackedChanges(self.allocator, self.io, self.root)) _ = try self.refuse("{s} has uncommitted changes to tracked files", .{name});
-        const commit = try mod.Git.revParse(self.allocator, self.io, self.root, "HEAD") orelse return;
+        if (try mod.core.Git.hasTrackedChanges(self.allocator, self.io, self.root)) _ = try self.refuse("{s} has uncommitted changes to tracked files", .{name});
+        const commit = try mod.core.Git.revParse(self.allocator, self.io, self.root, "HEAD") orelse return;
         try self.warnUnpushed(self.root, name, commit);
     }
 
@@ -443,7 +443,7 @@ pub const Stage = struct {
     /// - `commit`: Its HEAD.
     /// - Returns: Git errors.
     fn warnUnpushed(self: *const Self, dir: []const u8, rel: []const u8, commit: []const u8) !void {
-        if (try mod.Git.isOnRemote(self.allocator, self.io, dir)) return;
+        if (try mod.core.Git.isOnRemote(self.allocator, self.io, dir)) return;
         log.warn("{s} is at {s}, which no remote branch holds (as last fetched); the tarball builds, but nobody else can fetch that commit", .{ rel, mod.Sync.short(commit) });
     }
 
@@ -459,16 +459,16 @@ pub const Stage = struct {
         switch (ref.kind) {
             .branch => {
                 // On the branch itself: detached at its tip is refused too, as develop mode never leaves it so.
-                const branch = try mod.Git.currentBranch(self.allocator, self.io, dir);
+                const branch = try mod.core.Git.currentBranch(self.allocator, self.io, dir);
                 if (branch != null and std.mem.eql(u8, branch.?, ref.value)) return null;
                 const where = if (branch) |name| try self.allocator.print("on {s}", .{name}) else "detached";
                 return try self.allocator.print("{s} is {s}, but {s} declares .branch = \"{s}\"", .{ rel, where, declared_by, ref.value });
             },
             .tag => {
-                const tag = try mod.Git.revParse(self.allocator, self.io, dir, try self.allocator.print("refs/tags/{s}", .{ref.value})) orelse {
+                const tag = try mod.core.Git.revParse(self.allocator, self.io, dir, try self.allocator.print("refs/tags/{s}", .{ref.value})) orelse {
                     return try self.allocator.print("{s} has no tag {s}, which {s} declares", .{ rel, ref.value, declared_by });
                 };
-                const head = try mod.Git.revParse(self.allocator, self.io, dir, "HEAD");
+                const head = try mod.core.Git.revParse(self.allocator, self.io, dir, "HEAD");
                 if (head != null and std.mem.eql(u8, tag, head.?)) return null;
                 return try self.allocator.print("{s} is not at tag {s}, which {s} declares", .{ rel, ref.value, declared_by });
             },
@@ -494,17 +494,17 @@ pub const Stage = struct {
         const node = self.nodes.items[index];
         if (edges.len > 0) {
             const manifest_path = try std.Io.Dir.path.join(self.allocator, &.{ node.export_dir, "build.zig.zon" });
-            const source = (try mod.File.readOptionalZ(self.allocator, self.io, manifest_path, .limited(mod.Manifest.max_bytes))).?;
+            const source = (try mod.core.File.readOptionalZ(self.allocator, self.io, manifest_path, .limited(mod.Manifest.max_bytes))).?;
             try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = manifest_path, .data = try self.rewrite(source, edges) });
         }
         const hash = try self.hashOf(node.export_dir, node.rel);
         // Zig resolves a hash from the consumer's `zig-pkg/` before any cache or URL, so a staged
         // sibling needs neither the network nor the global cache `zig fetch` wrote to.
         const package = try std.Io.Dir.path.join(self.allocator, &.{ self.target, "zig-pkg", hash });
-        if (try mod.File.exists(self.io, package)) {
+        if (try mod.core.File.exists(self.io, package)) {
             try std.Io.Dir.cwd().deleteTree(self.io, node.export_dir);
         } else {
-            try mod.File.createParentDir(self.io, package);
+            try mod.core.File.createParentDir(self.io, package);
             try std.Io.Dir.cwd().rename(node.export_dir, std.Io.Dir.cwd(), package, self.io);
         }
         const url = if (node.source != null and node.source.? == .archive) node.source.?.archive else try Self.labelOf(self.allocator, node.repository, node.commit);
@@ -685,7 +685,7 @@ test "labelOf turns every .clone form into a git+ URL Zig accepts" {
 ///
 /// - `tree`: The fixture.
 /// - Returns: The run, not started; `error.SkipZigTest` when the build did not pass `ZIGBUILDX_ZIG`.
-fn testStage(tree: *mod.TestTree) !Stage {
+fn testStage(tree: *mod.testing.TestTree) !Stage {
     var run = try Stage.init(tree.allocator(), tree.io, try tree.path("consumer"), try tree.zig());
     run.environ_map = try tree.zigEnviron();
     return run;
@@ -695,7 +695,7 @@ fn testStage(tree: *mod.TestTree) !Stage {
 ///
 /// - `tree`: The fixture.
 /// - Returns: The message; `error.TestUnexpectedResult` when the stage succeeds.
-fn stageFails(tree: *mod.TestTree) ![]const u8 {
+fn stageFails(tree: *mod.testing.TestTree) ![]const u8 {
     var run = try testStage(tree);
     run.run() catch |err| {
         try std.testing.expectEqual(error.DepsFailed, err);
@@ -705,7 +705,7 @@ fn stageFails(tree: *mod.TestTree) ![]const u8 {
 }
 
 test "stage stages siblings leaves first, each once, and rewrites the root to name them by hash" {
-    var tree = try mod.TestTree.init();
+    var tree = try mod.testing.TestTree.init();
     defer tree.deinit();
     try tree.upstream("leaf", "");
     try tree.upstream("mid", try tree.siblingWith("leaf", ".tag = \"v1\","));
@@ -747,7 +747,7 @@ test "stage stages siblings leaves first, each once, and rewrites the root to na
 }
 
 test "stage stages an archive sibling under its URL" {
-    var tree = try mod.TestTree.init();
+    var tree = try mod.testing.TestTree.init();
     defer tree.deinit();
     const url = try tree.zip("zips/vendored.zip", &.{.{ "vendored-1.0/src/a.c", "int a;\n" }});
     try tree.consumer(try tree.allocator().print(".vendored = .{{ .path = \"../vendored\", .archive = \"{s}\" }},", .{url}));
@@ -761,7 +761,7 @@ test "stage stages an archive sibling under its URL" {
 }
 
 test "stage refuses what it cannot stage and leaves the manifest as it was" {
-    var tree = try mod.TestTree.init();
+    var tree = try mod.testing.TestTree.init();
     defer tree.deinit();
     try tree.upstream("a", try tree.sibling("b"));
     try tree.upstream("b", try tree.sibling("a"));
@@ -782,7 +782,7 @@ test "stage refuses what it cannot stage and leaves the manifest as it was" {
 }
 
 test "stage keeps one repository at two refs apart, and a lazy sibling lazy" {
-    var tree = try mod.TestTree.init();
+    var tree = try mod.testing.TestTree.init();
     defer tree.deinit();
     try tree.upstream("lib", "");
     const origin = try tree.path("origin/lib");
@@ -809,7 +809,7 @@ test "stage keeps one repository at two refs apart, and a lazy sibling lazy" {
 }
 
 test "a local stage exports each checkout's HEAD, not its remote's branch, into a target apart from the root" {
-    var tree = try mod.TestTree.init();
+    var tree = try mod.testing.TestTree.init();
     defer tree.deinit();
     try tree.upstream("lib", "");
     try tree.run(&.{ "git", "clone", "--quiet", try tree.path("origin/lib"), try tree.path("lib") });

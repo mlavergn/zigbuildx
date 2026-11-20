@@ -29,7 +29,7 @@ pub const Docs = struct {
     /// - Returns: The patched site's directory, for `b.addInstallDirectory`.
     pub fn includePrivate(b: *std.Build, docs: std.Build.LazyPath) std.Build.LazyPath {
         // Zig's autodoc renders public declarations only; the host tool copies the site, patching `main.js`.
-        const run = b.addRunArtifact(mod.ToolArtifact.add(b));
+        const run = b.addRunArtifact(mod.deps.ToolArtifact.add(b));
         run.setName("docs include private");
         run.addArg("docs-patch");
         run.addDirectoryArg2(docs, .{});
@@ -43,7 +43,7 @@ pub const Docs = struct {
     /// - `port`: The port, or 0 for one the OS picks.
     /// - Returns: The step, for a consumer's `b.step("docs-serve", …)` to depend on.
     pub fn addServe(b: *std.Build, docs: std.Build.LazyPath, port: u16) *std.Build.Step {
-        const run = b.addRunArtifact(mod.ToolArtifact.add(b));
+        const run = b.addRunArtifact(mod.deps.ToolArtifact.add(b));
         run.setName("docs serve");
         run.addArg("docs-serve");
         run.addDirectoryArg2(docs, .{});

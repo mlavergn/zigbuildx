@@ -181,12 +181,12 @@ pub const Deps = struct {
         const root = try std.Io.Dir.cwd().realPathFileAlloc(io, args[1], allocator);
         const name = args[2];
         // A pin written into the manifest a distribution build rewrote would be lost when `zig build dev` restores the original.
-        if (try mod.File.exists(io, try std.Io.Dir.path.join(allocator, &.{ root, mod.Stage.backup_name }))) {
+        if (try mod.core.File.exists(io, try std.Io.Dir.path.join(allocator, &.{ root, mod.Stage.backup_name }))) {
             log.err("build.zig.zon is rewritten for a distribution build ({s} holds the original); run zig build dev first", .{mod.Stage.backup_name});
             return error.DepsFailed;
         }
         const manifest_path = try std.Io.Dir.path.join(allocator, &.{ root, "build.zig.zon" });
-        const source = try mod.File.readOptionalZ(allocator, io, manifest_path, .limited(mod.Manifest.max_bytes)) orelse {
+        const source = try mod.core.File.readOptionalZ(allocator, io, manifest_path, .limited(mod.Manifest.max_bytes)) orelse {
             log.err("no build.zig.zon in {s}", .{root});
             return error.DepsFailed;
         };
@@ -212,7 +212,7 @@ pub const Deps = struct {
         // The URL keeps its form: `?ref=<ref>#<commit>` from `zig fetch --save`, or `#<ref>` from `--save-exact`.
         const save = try allocator.print("{s}={s}", .{ if (std.mem.find(u8, url, "?ref=") == null) "--save-exact" else "--save", name });
         // Every tag, so one that is no release (`v5.2.0-rc1`, `nightly`) is told from a branch.
-        const listing = mod.Git.remoteTags(allocator, io, root, repository) catch {
+        const listing = mod.core.Git.remoteTags(allocator, io, root, repository) catch {
             log.err("cannot list the tags of {s}", .{repository});
             return error.DepsFailed;
         };
@@ -541,7 +541,7 @@ pub const Deps = struct {
     fn appearedOnDisk(b: *std.Build, root: []const u8, missing: ?[]const u8) bool {
         const path = missing orelse return false;
         const build_zig = std.Io.Dir.path.join(b.allocator, &.{ root, path, "build.zig" }) catch return false;
-        return mod.File.exists(b.graph.io, build_zig) catch false;
+        return mod.core.File.exists(b.graph.io, build_zig) catch false;
     }
 
     /// Reports whether `path` is the `.path` of one of the root's `.archive` dependencies.
@@ -690,10 +690,12 @@ test "isFetched tells a fetched package from a .path one, wherever zig build run
 test "isUnfetched tells a lazy dependency not fetched yet from one on disk" {
     // Shaped as the build runner's package table writes them.
     const Unfetched = struct {
+        const Self = @This();
         /// The runner knows the package but has not fetched it.
         pub const available = false;
     };
     const Fetched = struct {
+        const Self = @This();
         /// The package is on disk.
         pub const available = true;
         /// Where it is.
